@@ -62,3 +62,8 @@ set(SAMPLING_KERNEL_TEST_SRC
     sampling/samplingPenaltyTest.cpp sampling/samplingUtilsTest.cu)
 
 add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
+
+add_gtest(groupRmsNormKernelTest groupRmsNormKernelTest.cpp)
+target_link_libraries(
+  groupRmsNormKernelTest PRIVATE torch torch_cuda c10 c10_cuda
+                                 ${CUDA_LIBRARIES} ${CUDA_CUDA_LIB})

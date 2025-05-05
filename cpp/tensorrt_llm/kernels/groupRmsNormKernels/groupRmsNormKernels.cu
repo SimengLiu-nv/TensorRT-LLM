@@ -541,6 +541,247 @@ __global__ void GroupRMSNormKernelLargeBatch(
 #endif
 }
 
+template <typename DType, typename PackedType, int n, bool EnableWeights>
+__global__ void GroupRMSNormKernelV3(GroupRMSParams<n> params, int block_spilter, int batch_per_block,
+    int warps_per_batch, int second_input_size, int rounds_0, int rounds_1)
+{
+    constexpr uint32_t warp_size = 32;
+    const uint32_t warp_idx = threadIdx.y;
+    const uint32_t lane_idx = threadIdx.x;
+    const uint32_t batch_idx_0 = blockIdx.x; // Maps to batch size
+    const uint32_t batch_idx_1 = (blockIdx.x - block_spilter) * batch_per_block + warp_idx / warps_per_batch;
+    static constexpr int kPackedSize = sizeof(PackedType) / sizeof(DType);
+
+    alignas(128) __shared__ float smem_rsqrts[32];
+    // To be used by the second input only
+    // alignas(128) __shared__ uint32_t smem_batch_mask[32];
+    if (warp_idx == 0)
+    {
+        smem_rsqrts[lane_idx] = 0.0f;
+        // smem_batch_mask[lane_idx] = 0;
+    }
+
+    const uint32_t round_offset = warp_size * kPackedSize;
+
+    float sum_sq = 0.0f;
+
+    // Cache for prefetching
+    PackedType input_cache;
+    PackedType weight_cache;
+
+    PackedType const* __restrict__ weight_ptr = nullptr;
+
+    bool process_input_0 = blockIdx.x < block_spilter;
+    bool process_input_1 = blockIdx.x >= block_spilter && warp_idx < (warps_per_batch * batch_per_block);
+    uint32_t block_offset = 0;
+    uint32_t input_dim = 0;
+    uint32_t block_local_batch_idx = 0;
+    uint32_t batch_local_warp_idx = 0;
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
+
+    // Get input pointers
+    PackedType const* __restrict__ input_ptr_0 = params.inputs[0];
+    PackedType* __restrict__ output_ptr_0 = params.outputs[0];
+    PackedType const* __restrict__ input_ptr_1 = params.inputs[1];
+    PackedType* __restrict__ output_ptr_1 = params.outputs[1];
+
+    if (process_input_0)
+    {
+        block_offset = batch_idx_0 * params.input_strides[0];
+        input_dim = params.input_last_dims[0];
+        uint32_t idx = block_offset + warp_idx * round_offset * rounds_0 + lane_idx * kPackedSize;
+
+        // // debug prints
+        // if (warp_idx == 0 && lane_idx == 0)
+        // {
+        //     printf("batch_idx_0: %u, block_offset: %u, input_dim: %u, idx: %u\n", batch_idx_0, block_offset,
+        //     input_dim, idx);
+        // }
+
+        if (idx < block_offset + input_dim)
+        {
+            input_cache = input_ptr_0[idx / kPackedSize];
+#pragma unroll
+            for (uint32_t j = 0; j < kPackedSize; j++)
+            {
+                float val = static_cast<float>(reinterpret_cast<DType*>(&input_cache)[j]);
+                sum_sq += val * val;
+            }
+        }
+        if (__builtin_expect(rounds_0 > 1, 0))
+        {
+            for (uint32_t i = 1; i < rounds_0; i++)
+            {
+                uint32_t idx
+                    = block_offset + warp_idx * round_offset * rounds_0 + i * round_offset + lane_idx * kPackedSize;
+                if (idx < block_offset + input_dim)
+                {
+                    PackedType packed_data = input_ptr_0[idx / kPackedSize];
+#pragma unroll
+                    for (uint32_t j = 0; j < kPackedSize; j++)
+                    {
+                        float val = static_cast<float>(reinterpret_cast<DType*>(&packed_data)[j]);
+                        sum_sq += val * val;
+                    }
+                }
+            }
+        }
+        smem_rsqrts[warp_idx] = tensorrt_llm::common::warpReduceSum(sum_sq);
+        // // debug prints
+        // if (warp_idx == 0 && lane_idx == 0)
+        // {
+        //     printf("input_0 warp_reduction: smem_rsqrts[warp_idx]: %f\n", smem_rsqrts[warp_idx]);
+        // }
+        __syncthreads();
+
+        if (warp_idx == 0)
+        {
+            smem_rsqrts[0] = tensorrt_llm::common::warpReduceSum(smem_rsqrts[lane_idx]);
+            smem_rsqrts[0] = rsqrtf(smem_rsqrts[0] / input_dim + params.eps);
+        }
+    }
+    else if (process_input_1)
+    {
+        block_offset = batch_idx_1 * params.input_strides[1];
+        input_dim = params.input_last_dims[1];
+        block_local_batch_idx = warp_idx / warps_per_batch;
+        batch_local_warp_idx = warp_idx % warps_per_batch;
+        uint32_t idx = block_offset + batch_local_warp_idx * round_offset * rounds_1 + lane_idx * kPackedSize;
+        // // debug prints
+        // if (batch_local_warp_idx == 0 && lane_idx == 0)
+        // {
+        //     printf("block_idx: %u, warp_idx: %u, batch_idx_1: %u, block_offset: %u, input_dim: %u, idx: %u\n",
+        //     blockIdx.x, warp_idx, batch_idx_1, block_offset, input_dim, idx);
+        // }
+
+        if (idx < second_input_size && idx < block_offset + input_dim)
+        {
+            input_cache = input_ptr_1[idx / kPackedSize];
+#pragma unroll
+            for (uint32_t j = 0; j < kPackedSize; j++)
+            {
+                float val = static_cast<float>(reinterpret_cast<DType*>(&input_cache)[j]);
+                sum_sq += val * val;
+            }
+        }
+
+        if (__builtin_expect(rounds_1 > 1, 0))
+        {
+            for (uint32_t i = 1; i < rounds_1; i++)
+            {
+                uint32_t idx = block_offset + batch_local_warp_idx * round_offset * rounds_1 + i * round_offset
+                    + lane_idx * kPackedSize;
+                if (idx < second_input_size && idx < block_offset + input_dim)
+                {
+                    PackedType packed_data = input_ptr_1[idx / kPackedSize];
+#pragma unroll
+                    for (uint32_t j = 0; j < kPackedSize; j++)
+                    {
+                        float val = static_cast<float>(reinterpret_cast<DType*>(&packed_data)[j]);
+                        sum_sq += val * val;
+                    }
+                }
+            }
+        }
+        // debug prints
+        // if (batch_local_warp_idx == 0 && lane_idx == 0)
+        // {
+        //     printf("input_1 warp_idx = %u, block_local_batch_idx = %u, sum_sq = %f, warp_reduction:
+        //     smem_rsqrts[block_local_batch_idx]: %f\n", warp_idx, block_local_batch_idx, sum_sq,
+        //     smem_rsqrts[block_local_batch_idx]);
+        // }
+        // smem_batch_mask[warp_idx] = block_local_batch_idx;
+        atomicAdd(&smem_rsqrts[block_local_batch_idx], tensorrt_llm::common::warpReduceSum(sum_sq));
+    }
+
+    // Synchronize to ensure completion of batch reduction
+    __syncthreads();
+
+    if (process_input_0)
+    {
+        float batch_rsqrt = smem_rsqrts[0];
+        uint32_t idx = block_offset + warp_idx * round_offset * rounds_0 + lane_idx * kPackedSize;
+        if (idx < block_offset + input_dim)
+        {
+            PackedType packed_output;
+#pragma unroll
+            for (uint32_t j = 0; j < kPackedSize; j++)
+            {
+                reinterpret_cast<DType*>(&packed_output)[j]
+                    = static_cast<DType>(static_cast<float>(reinterpret_cast<DType*>(&input_cache)[j]) * batch_rsqrt);
+            }
+            output_ptr_0[idx / kPackedSize] = packed_output;
+        }
+        if (__builtin_expect(rounds_0 > 1, 0))
+        {
+            for (uint32_t i = 1; i < rounds_0; i++)
+            {
+                uint32_t idx
+                    = block_offset + warp_idx * round_offset * rounds_0 + i * round_offset + lane_idx * kPackedSize;
+                if (idx < block_offset + input_dim)
+                {
+                    PackedType packed_data = input_ptr_0[idx / kPackedSize];
+                    PackedType packed_output;
+#pragma unroll
+                    for (uint32_t j = 0; j < kPackedSize; j++)
+                    {
+                        reinterpret_cast<DType*>(&packed_output)[j] = static_cast<DType>(
+                            static_cast<float>(reinterpret_cast<DType*>(&packed_data)[j]) * batch_rsqrt);
+                    }
+                    output_ptr_0[idx / kPackedSize] = packed_output;
+                }
+            }
+        }
+    }
+    else if (process_input_1)
+    {
+        float batch_rsqrt = rsqrtf(smem_rsqrts[block_local_batch_idx] / input_dim + params.eps);
+        uint32_t idx = block_offset + batch_local_warp_idx * round_offset * rounds_1 + lane_idx * kPackedSize;
+        // debug prints
+        // if (batch_local_warp_idx == 0 && lane_idx == 0)
+        // {
+        //     printf("input_1 block_idx = %u, warp_idx = %u, block_local_batch_idx = %u, block_reduction:
+        //     smem_rsqrts[block_local_batch_idx]: %f\n", blockIdx.x, warp_idx, block_local_batch_idx,
+        //     smem_rsqrts[block_local_batch_idx]);
+        // }
+        if (idx < second_input_size && idx < block_offset + input_dim)
+        {
+            PackedType packed_output;
+#pragma unroll
+            for (uint32_t j = 0; j < kPackedSize; j++)
+            {
+                reinterpret_cast<DType*>(&packed_output)[j]
+                    = static_cast<DType>(static_cast<float>(reinterpret_cast<DType*>(&input_cache)[j]) * batch_rsqrt);
+            }
+            output_ptr_1[idx / kPackedSize] = packed_output;
+        }
+
+        if (__builtin_expect(rounds_1 > 1, 0))
+        {
+            for (uint32_t i = 1; i < rounds_1; i++)
+            {
+                uint32_t idx = block_offset + batch_local_warp_idx * round_offset * rounds_1 + i * round_offset
+                    + lane_idx * kPackedSize;
+                if (idx < second_input_size && idx < block_offset + input_dim)
+                {
+                    PackedType packed_data = input_ptr_1[idx / kPackedSize];
+                    PackedType packed_output;
+#pragma unroll
+                    for (uint32_t j = 0; j < kPackedSize; j++)
+                    {
+                        reinterpret_cast<DType*>(&packed_output)[j] = static_cast<DType>(
+                            static_cast<float>(reinterpret_cast<DType*>(&packed_data)[j]) * batch_rsqrt);
+                    }
+                    output_ptr_1[idx / kPackedSize] = packed_output;
+                }
+            }
+        }
+    }
+}
+
 template <typename DType, int n, bool EnableWeights>
 void GroupRMSNormBaseKernel(GroupRMSParams<n> params)
 {
@@ -703,6 +944,72 @@ void GroupRMSNormKernelLargeBatchLauncher(GroupRMSParams<n> params)
     template void GroupRMSNormKernelLargeBatchLauncher<n>(GroupRMSParams<n> params);
 
 INSTANTIATE_GROUP_RMS_NORM_LARGE_BATCH(2)
+
+template <typename DType, int n, bool EnableWeights>
+void GroupRMSNormKernelV3(GroupRMSParams<n> params)
+{
+    constexpr uint32_t kPackedSize = sizeof(float4) / sizeof(DType);
+    uint32_t input_chunk_per_warp = 32 * kPackedSize;
+    for (uint32_t i = 0; i < params.num_inputs; i++)
+    {
+        TLLM_CHECK_WITH_INFO(
+            params.input_last_dims[i] % 32 == 0, "The last dimension of input must be divisible by 32.");
+        TLLM_CHECK_WITH_INFO(params.input_last_dims[i] % kPackedSize == 0,
+            "Input[%u] dimension %u is not divisible by %u (128b / sizeof(dype)). Finer granularity is not "
+            "supported yet.",
+            i, params.input_last_dims[i], kPackedSize);
+    }
+    uint32_t num_warps_to_launch = params.input_last_dims[0] / input_chunk_per_warp;
+    uint32_t block_spilter = params.batch_size;
+    uint32_t warps_per_batch = params.input_last_dims[1] / input_chunk_per_warp;
+    uint32_t batch_per_block = num_warps_to_launch / warps_per_batch;
+    uint32_t block_size_for_second_input = (params.batch_size + batch_per_block - 1) / batch_per_block;
+
+    dim3 grid_dim(params.batch_size + block_size_for_second_input);
+    dim3 block_dim(32, num_warps_to_launch);
+
+    cudaLaunchConfig_t cfg;
+    cudaLaunchAttribute attribute[1];
+    cfg.gridDim = grid_dim;
+    cfg.blockDim = block_dim;
+    printf("grid_dim: %u, block_dim: %u\n", grid_dim.x, block_dim.y);
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = params.stream;
+    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    cfg.attrs = attribute;
+    cfg.numAttrs = 1;
+
+    // Choose kernel based on whether weights are enabled
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg, GroupRMSNormKernelV3<DType, float4, n, EnableWeights>, params,
+        block_spilter, batch_per_block, warps_per_batch, params.input_last_dims[1] * params.batch_size, 0, 0));
+}
+
+template <int n>
+void GroupRMSNormKernelV3Launcher(GroupRMSParams<n> params)
+{
+#define GROUP_RMS_NORM_V3_DISPATCH(DTYPE)                                                                              \
+    if (params.enable_weights)                                                                                         \
+    {                                                                                                                  \
+        return GroupRMSNormKernelV3<DTYPE, n, true>(params);                                                           \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        return GroupRMSNormKernelV3<DTYPE, n, false>(params);                                                          \
+    }
+
+    switch (params.dtype)
+    {
+    case nvinfer1::DataType::kHALF: GROUP_RMS_NORM_V3_DISPATCH(half); break;
+    case nvinfer1::DataType::kBF16: GROUP_RMS_NORM_V3_DISPATCH(__nv_bfloat16); break;
+    case nvinfer1::DataType::kFLOAT: GROUP_RMS_NORM_V3_DISPATCH(float); break;
+    default: TLLM_CHECK_WITH_INFO(false, "Unsupported data type for GroupRMSNorm");
+    }
+}
+
+#define INSTANTIATE_GROUP_RMS_NORM_V3(n) template void GroupRMSNormKernelV3Launcher<n>(GroupRMSParams<n> params);
+
+INSTANTIATE_GROUP_RMS_NORM_V3(2)
 
 int getComputeCapabilityMajor()
 {

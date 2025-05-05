@@ -71,6 +71,9 @@ template <int n>
 void GroupRMSNormKernelLargeBatchLauncher(GroupRMSParams<n> params);
 
 template <int n>
+void GroupRMSNormKernelV3Launcher(GroupRMSParams<n> params);
+
+template <int n>
 void GroupRMSNormKernelLauncherWithHeuristic(GroupRMSParams<n> params);
 
 } // namespace tensorrt_llm::kernels::group_rms_norm
