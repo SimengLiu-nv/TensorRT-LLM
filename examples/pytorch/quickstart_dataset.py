@@ -1,5 +1,7 @@
 import argparse
 import json
+import time
+import random
 
 from datasets import load_dataset
 
@@ -13,6 +15,7 @@ example_prompts = [
     "system: You are a friendly chatbot who always responds in the style of a pirate\nuser: Compose an engaging travel blog post about a recent trip to Hawaii, highlighting cultural experiences and must-see attractions.\nassistant:"
 ]
 
+random.seed(42)
 
 class DatasetBase:
 
@@ -64,17 +67,8 @@ class MTBenchDataset(DatasetBase):
                     data for data in dataset[i]['conversation_a']
                     if data['role'] == 'user'
                 ])
+        random.shuffle(user_messages)
         return user_messages[:size]
-
-    def convert_to_chat_format(self, messages):
-        formatted_text = ""
-        for message in self.system_prompt + messages:
-            role = message.get('role', '')
-            content = message.get('content', '')
-            if role is not None and content is not None:
-                formatted_text += f"{role}:{content}\n"
-        formatted_text += "assistant:"
-        return formatted_text
 
 
 class AADataset(DatasetBase):
@@ -96,16 +90,13 @@ class AADataset(DatasetBase):
             "role": "user",
             "content": json.loads(item).get('user_prompt')
         }] for item in data]
+        
+        if size is None:
+            return data
+        
+        random.shuffle(data)
         return data[:size]
 
-    def convert_to_chat_format(self, messages):
-        formatted_text = ""
-        for message in self.system_prompt + messages:
-            role = message.get('role', '')
-            content = message.get('content', '')
-            formatted_text += f"{role}:{content}\n"
-        formatted_text += "assistant:"
-        return formatted_text
 
 
 class MagpieDataset(DatasetBase):
@@ -129,35 +120,31 @@ class MagpieDataset(DatasetBase):
                 match conv.get('from'):
                     case 'human':
                         processed_conversations.append({
-                            "role":
-                            "user",
-                            "content":
-                            conv.get('value')
+                            "role":"user",
+                            "content":conv.get('value')
                         })
                         turn += 1
                     case 'gpt':
-                        processed_conversations.append({
-                            "role":
-                            "assistant",
-                            "content":
-                            conv.get('value')
-                        })
+                        pass
                     case _:
                         raise ValueError(f"Unknown role: {conv}")
 
             conversations.append(processed_conversations)
             turns.append(turn)
 
-        # import pdb; pdb.set_trace()
-
         if size is None:
             size = full_size
         if size > full_size:
             size = full_size
 
-        self.max_turn = max(turns[:size])
+        # Shuffle the conversations
+        random.shuffle(conversations)
 
-        print(f"Max turn: {self.max_turn}")
+        self.max_turn = max(turns[:size])
+        
+        print("Debug magpie load dataset:", conversations[:1])
+
+        print(f"Max turn: {self.max_turn}, size: {size}")
         return conversations[:size]
 
 
@@ -214,7 +201,7 @@ def add_llm_args(parser):
     parser.add_argument('--enable_attention_dp',
                         default=False,
                         action='store_true')
-    parser.add_argument('--enable_trtllm_decoder',
+    parser.add_argument('--enable_trtllm_sampler',
                         default=False,
                         action='store_true')
     parser.add_argument('--tp_size', type=int, default=1)
@@ -265,6 +252,8 @@ def add_llm_args(parser):
     parser.add_argument('--spec_decode_nextn', type=int, default=1)
     parser.add_argument('--eagle_model_dir', type=str, default=None)
     parser.add_argument('--max_matching_ngram_size', type=int, default=5)
+    parser.add_argument('--save_file_path', type=str, default="")
+    parser.add_argument('--load_file_path', type=str, default="")
 
     # Relaxed acceptance
     parser.add_argument('--use_relaxed_acceptance_for_thinking',
@@ -285,6 +274,7 @@ def parse_arguments():
 
 
 def setup_llm(args):
+    print(f"disable_overlap_scheduler: {args.disable_overlap_scheduler}")
     pytorch_config = PyTorchConfig(
         disable_overlap_scheduler=args.disable_overlap_scheduler,
         kv_cache_dtype=args.kv_cache_dtype,
@@ -296,7 +286,7 @@ def setup_llm(args):
         torch_compile_enabled=args.use_torch_compile,
         torch_compile_piecewise_cuda_graph=args.use_piecewise_cuda_graph,
         moe_backend=args.moe_backend,
-        enable_trtllm_decoder=args.enable_trtllm_decoder)
+        enable_trtllm_sampler=args.enable_trtllm_sampler)
 
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=not args.disable_kv_cache_reuse,
@@ -324,6 +314,8 @@ def setup_llm(args):
             is_keep_all=True,
             is_use_oldest=True,
             is_public_pool=True,
+            save_file_path=args.save_file_path,
+            load_file_path=args.load_file_path,
         )
     else:
         spec_config = None
@@ -361,7 +353,11 @@ def main():
     if not args.dataset:
         print("No dataset provided, using example prompts")
         model_prompts = example_prompts
+        
+        start_time = time.time()
         outputs = llm.generate(model_prompts, sampling_params)
+        end_time = time.time()
+        print(f"Generation time: {end_time - start_time:.4f} seconds")
 
         for i, output in enumerate(outputs):
             print(
@@ -381,6 +377,7 @@ def main():
     # data_items = batch x conversation
     # conversation = turn x message
     data_items = dataset.load_dataset(args.dataset_size)
+    print(f"Loaded {len(data_items)} data items")
     current_turn = 1
     assistant_outputs = [[] for _ in range(len(data_items))]
     model_prompts = []
@@ -402,7 +399,12 @@ def main():
                 assemble_messages)
 
             model_prompts.append(tokenized_prompts)
+            
+        start_time = time.time()
         outputs = llm.generate(model_prompts, sampling_params)
+        end_time = time.time()
+        print(f"Generation time for turn {current_turn}: {end_time - start_time:.4f} seconds")
+        
         model_prompts = []
         for i, output in enumerate(outputs):
             prompt = output.prompt
@@ -414,10 +416,10 @@ def main():
 
         current_turn += 1
 
-    if args.print_iter_log:
-        stats = llm.get_stats()
-        for stat in stats:
-            print(stat)
+    # if args.print_iter_log:
+    #     stats = llm.get_stats()
+    #     for stat in stats:
+    #         print(stat)
 
 
 if __name__ == '__main__':

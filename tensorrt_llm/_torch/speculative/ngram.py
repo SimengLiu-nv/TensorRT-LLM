@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import List
+import pickle
 
 from ordered_set import OrderedSet
 
@@ -26,6 +27,8 @@ class NGramConfig(SpecConfig):
     is_keep_all: bool = True
     is_use_oldest: bool = True
     is_public_pool: bool = True
+    save_file_path: str = ""
+    load_file_path: str = ""
 
     def __post_init__(self) -> None:
         self.spec_dec_mode = SpeculativeDecodingMode.from_string(
@@ -85,6 +88,9 @@ class NGramPoolManager(BaseResourceManager):
         self.is_public_pool = config.is_public_pool
         self.pool = {}
         self.start_index = {}
+        if len(config.load_file_path) > 0:
+            self.load_pool(config.load_file_path)
+            print(f"Loaded pool from {config.load_file_path}, size = {len(self.pool)}")
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         # Update pool and provide draft tokens for the requests
@@ -125,7 +131,10 @@ class NGramPoolManager(BaseResourceManager):
         pass
 
     def shutdown(self):
-        pass
+        print(f"Shutting down NGramPoolManager, save_file_path = {self.save_file_path}")
+        if len(self.save_file_path) > 0:
+            self.save_pool(self.save_file_path)
+            print(f"Saved pool to {self.save_file_path}, size = {len(self.pool)}")
 
     def get_max_resource_count(self) -> int:
         return self.max_num_requests
@@ -208,3 +217,22 @@ class NGramPoolManager(BaseResourceManager):
             (self.prompt_lookup_num_tokens + self.max_matching_ngram_size - 1))
 
         return draft_tokens
+
+    def save_pool(self, file_path: str):
+        """
+        Save the current state of the NGramPoolManager to a file.
+
+        :param file_path: Path to the file where the state will be saved.
+        """
+        with open(file_path, 'wb') as file:
+            pickle.dump({'pool': self.pool}, file)
+
+    def load_pool(self, file_path: str):
+        """
+        Load the state of the NGramPoolManager from a file.
+
+        :param file_path: Path to the file from which the state will be loaded.
+        """
+        with open(file_path, 'rb') as file:
+            state = pickle.load(file)
+            self.pool = state['pool']

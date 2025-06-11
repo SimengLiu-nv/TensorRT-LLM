@@ -569,10 +569,10 @@ class PyExecutor:
             req_stat.stage = req.stage
             req_stats.append(req_stat)
 
-        for req in list(self.request_queue.queue):
-            req_stat = get_queued_req_stats(req)
-            req.stage = RequestStage.QUEUED
-            req_stats.append(req_stat)
+        # for req in list(self.request_queue.queue):
+        #     req_stat = get_queued_req_stats(req)
+        #     req.stage = RequestStage.QUEUED
+        #     req_stats.append(req_stat)
 
         for req in finished_requests:
             req_stat = get_req_stats(req)
@@ -914,6 +914,9 @@ class PyExecutor:
                     self.resource_manager.prepare_resources(scheduled_batch)
                     if self.draft_model_engine is not None:
                         self._prepare_draft_tokens(scheduled_batch)
+                        
+                    ## Log ngram stats
+                    self._log_ngram_stats(scheduled_batch)
 
                     if has_ngram_iter_stats:
                         self._insert_ngram_iter_stats(scheduled_batch,
@@ -1706,6 +1709,14 @@ class PyExecutor:
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
+            
+    def _log_ngram_stats(self, scheduled_requests: ScheduledRequests):
+        for request in scheduled_requests.generation_requests:
+            num_draft_tokens = 0 if request.py_last_draft_tokens is None else len(
+                [token for token in request.py_last_draft_tokens if token is not request.py_end_id])
+            num_accepted_tokens = getattr(request,
+                                          "py_num_accepted_draft_tokens", 0)
+            print(f"[Iter {self.model_engine.iter_counter}][Request {request.py_request_id}] #draft:{num_draft_tokens} #accepted:{num_accepted_tokens}")
 
     def _insert_ngram_iter_stats(
         self, scheduled_requests: ScheduledRequests, iter_stats: IterationStats
