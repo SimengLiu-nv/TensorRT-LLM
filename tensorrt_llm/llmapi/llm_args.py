@@ -265,6 +265,8 @@ class NGramDecodingConfig(DecodingBaseConfig):
     is_keep_all: bool = True
     is_use_oldest: bool = True
     is_public_pool: bool = True
+    save_file_path: str = ""
+    load_file_path: str = ""
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1215,6 +1217,8 @@ class BaseLlmArgs(BaseModel):
                     is_keep_all=self.speculative_config.is_keep_all,
                     is_use_oldest=self.speculative_config.is_use_oldest,
                     is_public_pool=self.speculative_config.is_public_pool,
+                    save_file_path=self.speculative_config.save_file_path,
+                    load_file_path=self.speculative_config.load_file_path,
                 )
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 from tensorrt_llm._torch.speculative import MTPConfig

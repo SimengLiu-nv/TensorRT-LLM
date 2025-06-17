@@ -77,6 +77,8 @@ class NGramPoolManager(BaseResourceManager):
     """
 
     def __init__(self, config: NGramConfig, max_num_requests: int):
+        
+        print(f"NGramPoolManager init, config = {config}")
 
         self.max_num_requests = max_num_requests
         self.max_num_draft_tokens = config.max_draft_tokens
@@ -86,6 +88,7 @@ class NGramPoolManager(BaseResourceManager):
         self.is_keep_all = config.is_keep_all
         self.is_use_oldest = config.is_use_oldest  # TODO: remove this if updating strategy is supported
         self.is_public_pool = config.is_public_pool
+        self.config = config
         self.pool = {}
         self.start_index = {}
         if len(config.load_file_path) > 0:
@@ -131,10 +134,11 @@ class NGramPoolManager(BaseResourceManager):
         pass
 
     def shutdown(self):
-        print(f"Shutting down NGramPoolManager, save_file_path = {self.save_file_path}")
-        if len(self.save_file_path) > 0:
-            self.save_pool(self.save_file_path)
-            print(f"Saved pool to {self.save_file_path}, size = {len(self.pool)}")
+        if len(self.pool) > 0:
+            print(f"Shutting down NGramPoolManager, save_file_path = {self.config.save_file_path}")
+            if len(self.config.save_file_path) > 0:
+                self.save_pool(self.config.save_file_path)
+                print(f"Saved pool to {self.config.save_file_path}, size = {len(self.pool)}")
 
     def get_max_resource_count(self) -> int:
         return self.max_num_requests

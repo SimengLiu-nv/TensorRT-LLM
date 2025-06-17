@@ -319,6 +319,8 @@ def setup_llm(args):
         )
     else:
         spec_config = None
+        
+    print(f"Spec config: {spec_config}")
 
     llm = LLM(model=args.model_dir,
               max_seq_len=args.max_seq_len,
