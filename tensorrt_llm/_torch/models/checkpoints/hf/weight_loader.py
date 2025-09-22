@@ -43,9 +43,12 @@ class HfWeightLoader(BaseWeightLoader):
             num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
             enable_prefetch = prefetch_size < psutil.virtual_memory(
             ).available * 0.9 and num_layers == 0
+            
+            print(f"[DEBUG] prefetch_size: {prefetch_size}")
+            enable_prefetch = False
             if enable_prefetch:
                 logger.info(
-                    f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
+                    f"Prefetching {prefetch_size / (1024**3):.2f} GB checkpoint files."
                 )
                 self.prefetch_files(weight_files)
                 # Ensure that all local ranks have finished prefetching before loading weights
@@ -56,6 +59,7 @@ class HfWeightLoader(BaseWeightLoader):
                 "Loading safetensors weights in parallel")
 
         weight_files = glob.glob(f"{checkpoint_dir}/*.bin")
+        logger.info(f"[DEBUG] checkpoint_dir: {checkpoint_dir}")
         if not weight_files:
             weight_files = glob.glob(f"{checkpoint_dir}/*.pth")
 
@@ -80,6 +84,8 @@ class HfWeightLoader(BaseWeightLoader):
             Dictionary containing all loaded weights
         """
         weights = {}
+        
+        # print(f"[DEBUG] weight_files: {weight_files}")
         pbar = tqdm.tqdm(total=len(weight_files), desc=description)
 
         # Note that the function is called with a tuple of arguments, hence we need to wrap the arguments in a tuple via [(w,) for w in weight_files]
@@ -87,7 +93,6 @@ class HfWeightLoader(BaseWeightLoader):
         run_concurrently(load_func, [(w, ) for w in weight_files],
                          reduce_func=weights.update,
                          pbar=pbar)
-
         return weights
 
     @staticmethod

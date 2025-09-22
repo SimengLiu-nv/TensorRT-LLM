@@ -103,6 +103,9 @@ class LMHead(Linear):
         return output
 
     def load_weights(self, weights: List[Dict]):
+        # print(f"[DEBUG][LMHead] Loading weights for embedding")
+        # print(f"[DEBUG][LMHead] weights: {weights}, device: {weights[0]['weight'].device}")
+        # print(f"[DEBUG][LMHead] self.weight.data: {self.weight.data}")
         original_weight = None
         if self.tp_mode == TensorParallelMode.COLUMN:
             if self.tp_rank == self.tp_size - 1 and self.padding_size > 0:

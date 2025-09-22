@@ -834,6 +834,7 @@ class _TrtLLM(BaseLLM):
         if self.args.kv_cache_config is not None:
             self._executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
                 self.args.kv_cache_config)
+        print(f'[DEBUG] _build_model self.args.kv_cache_config: {self.args.kv_cache_config}; self._executor_config.kv_cache_config: {self._executor_config.kv_cache_config}')
         if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
             # Disable KV cache reuse for deterministic mode
             self._executor_config.kv_cache_config.enable_block_reuse = False

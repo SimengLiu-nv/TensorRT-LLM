@@ -154,7 +154,7 @@ def update_executor_config(
     executor_config.speculative_config = speculative_config
     executor_config.mm_encoder_only = mm_encoder_only
 
-    logger.info(f"{executor_config.pytorch_backend_config}")
+    logger.info(f"update_executor_config:: {executor_config.pytorch_backend_config}")
 
     build_config = build_config or BuildConfig()
     # TODO: move to pure-Python KvCacheConfig, and remove dependency on build_config.

@@ -146,6 +146,7 @@ class BaseWeightMapper(ABC):
             if k.startswith(prefix):
                 new_k = k[len(prefix) + 1:]
                 result[new_k] = v
+                # print(f'[DEBUG] filter_weights: k: {k}, v: {v}, new_k: {new_k}')
         return result
 
     @property

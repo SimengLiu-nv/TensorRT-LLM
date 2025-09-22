@@ -47,6 +47,12 @@ class KvCacheCreator:
                  draft_model_engine: Optional[PyTorchModelEngine],
                  mapping: Mapping, net_max_seq_len: int,
                  kv_connector_manager: Optional[KvCacheConnectorManager]):
+
+        import traceback
+        from pprint import pprint
+        stack_trace = traceback.format_stack()
+        # print(f'[DEBUG] KvCacheCreator stack_trace: ')
+        # pprint(stack_trace)
         self._executor_config = executor_config
         self._model_engine = model_engine
         self._draft_model_engine = draft_model_engine
@@ -55,6 +61,7 @@ class KvCacheCreator:
         self._dummy_reqs = self._create_dummy_context_requests(net_max_seq_len -
                                                                1)
         self._kv_connector_manager = kv_connector_manager
+        self._unified_memory = False
 
     @staticmethod
     def _get_cache_size_per_token(model_config: ModelConfig,
@@ -96,6 +103,13 @@ class KvCacheCreator:
         return mem_per_token
 
     def _get_free_gpu_memory_fraction(self) -> float:
+        print(f'[DEBUG] _get_free_gpu_memory_fraction: {self._executor_config.kv_cache_config}')
+        print(f'[DEBUG] _get_free_gpu_memory_fraction.free_gpu_memory_fraction: {self._executor_config.kv_cache_config.free_gpu_memory_fraction}')
+        from pprint import pprint
+        import traceback
+        stack_trace = traceback.format_stack()
+        # print(f'[DEBUG] _get_free_gpu_memory_fraction stack_trace: ')
+        # pprint(stack_trace)
         fraction = self._executor_config.kv_cache_config.free_gpu_memory_fraction
         if fraction is None:
             fraction = 0.9
@@ -112,7 +126,7 @@ class KvCacheCreator:
                 draft_model_config, mapping)
         return kv_size_per_token
 
-    def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
+    def _cal_max_memory(self, peak_memory, used_system_memory, total_gpu_memory, fraction,
                         allocated_bytes: int) -> int:
         """
         Calculate the max KV cache capacity.
@@ -120,14 +134,26 @@ class KvCacheCreator:
         NOTE: `allocated_bytes` is the total KV-cache memory that must be pre-allocated during the estimation phase (for both the main and draft models) so the estimation run can complete successfully. When computing `available_kv_mem`, add this amount back in.
         """
         kv_size_per_token = self._get_kv_size_per_token()
+        free_GPU_memory = total_gpu_memory - peak_memory + allocated_bytes
+        free_system_memory = total_gpu_memory - used_system_memory
+        
+        available_mem = free_system_memory if self._unified_memory else free_GPU_memory
 
-        available_kv_mem = (total_gpu_memory - peak_memory +
-                            allocated_bytes) * fraction
-        logger.info(
-            f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
-            f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
-            f"fraction is set {fraction}, kv size is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
-            f", tmp kv_mem { (allocated_bytes) / (GB):.2f} GiB")
+        available_kv_mem = available_mem * fraction
+        
+        if self._unified_memory:
+            logger.info(
+                f"Peak system memory during memory usage profiling (torch + non-torch including CPU): {peak_memory / (GB):.2f} GiB, "
+                f"Free system memory: {(free_system_memory) / (GB):.2f} GiB, "
+                f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
+                f"fraction is set {fraction}, kv size is {kv_size_per_token}. system total memory {total_gpu_memory / (GB):.2f} GiB, "
+                f", tmp kv_mem { (allocated_bytes) / (GB):.2f} GiB")
+        else:
+            logger.info(
+                f"Peak GPU memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
+                f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
+                f"fraction is set {fraction}, kv size is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
+                f", tmp kv_mem { (allocated_bytes) / (GB):.2f} GiB")
         return int(available_kv_mem)
 
     def _create_dummy_context_requests(
@@ -219,45 +245,78 @@ class KvCacheCreator:
         end, total_gpu_memory = torch.cuda.mem_get_info()
         total_used_bytes = total_gpu_memory - end
         model_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        logger.info(
-            f"Memory used after loading model weights (inside torch) in memory usage profiling: {model_bytes / (GB):.2f} GiB"
-        )
-        logger.info(
-            f"Memory used after loading model weights (outside torch) in memory usage profiling: {((total_used_bytes - model_bytes) if total_used_bytes > model_bytes else 0) / (GB):.2f} GiB"
-        )
+        import psutil
+        mem = psutil.virtual_memory()
+        print(f'[DEBUG] mem.used: {mem.used / (1024**3):.2f}, mem.total: {mem.total / (1024**3):.2f}')
+        print(f'[DEBUG] total_gpu_memory: {total_gpu_memory / (1024**3):.2f}; end: {end / (1024**3):.2f}; total_used_bytes: {total_used_bytes / (1024**3):.2f}; model_bytes: {model_bytes / (1024**3):.2f}')
 
+        self._unified_memory = False
+        if (mem.total - total_gpu_memory) / mem.used   < 0.01:
+            self._unified_memory = True
+        if not self._unified_memory:
+            logger.info(
+                f"GPU Memory used after loading model weights (inside torch) in memory usage profiling: {model_bytes / (GB):.2f} GiB"
+            )
+            logger.info(
+                f"GPU Memory used after loading model weights (outside torch) in memory usage profiling: {((total_used_bytes - model_bytes) if total_used_bytes > model_bytes else 0) / (GB):.2f} GiB"
+            )
+        else:
+            logger.info(f'Detect unified memory. Current used system memory: {mem.used / (1024**3):.2f}/{mem.total / (1024**3):.2f} GiB')
+            logger.info(
+                f"GPU Memory used after loading model weights (inside torch) in memory usage profiling: {model_bytes / (GB):.2f} GiB"
+            )
+            logger.info(
+                f"System memory footprint after loading model weights (outside torch) in memory usage profiling: {((total_used_bytes - model_bytes) if total_used_bytes > model_bytes else 0) / (GB):.2f} GiB"
+            )
+            
+            
+        import inspect
+        print(f'[DEBUG] configure_kv_cache_capacity {inspect.currentframe().f_lineno} ')
         py_executor.set_gather_responses(True)
+        print(f'[DEBUG] configure_kv_cache_capacity {inspect.currentframe().f_lineno} ')
         origin_iter_stats = py_executor.enable_iter_perf_stats
         py_executor.enable_iter_perf_stats = False
         req_ids = []
+        print(f'[DEBUG] configure_kv_cache_capacity {inspect.currentframe().f_lineno} ')
         if py_executor.dist.mapping.rank == 0:
+            print(f'[DEBUG] configure_kv_cache_capacity {inspect.currentframe().f_lineno} ')
             req_ids = py_executor.enqueue_requests(self._dummy_reqs)
+            
+        print(f'[DEBUG] configure_kv_cache_capacity {inspect.currentframe().f_lineno} ')
         req_ids = py_executor.dist.broadcast(req_ids, root=0)
+        print(f'[DEBUG] configure_kv_cache_capacity {inspect.currentframe().f_lineno} ')
         py_executor.is_warmup = True
+        print(f'[DEBUG] configure_kv_cache_capacity {inspect.currentframe().f_lineno} ')
         py_executor.start_worker()
+        print(f'[DEBUG] configure_kv_cache_capacity {inspect.currentframe().f_lineno} ')
         try:
             responses = py_executor.await_responses(req_ids)
+            print(f'[DEBUG] configure_kv_cache_capacity {inspect.currentframe().f_lineno} ')
             for response_or_list in responses:
                 response_list = [response_or_list] if isinstance(
                     response_or_list, ExecutorResponse) else response_or_list
                 for response in response_list:
                     if response.has_error():
                         raise RuntimeError(response.error_msg)
-
+            print(f'[DEBUG] configure_kv_cache_capacity {inspect.currentframe().f_lineno} ')
             torch_peak_memory = torch.cuda.memory_stats(
             )["allocated_bytes.all.peak"]
-
+            print(f'[DEBUG] configure_kv_cache_capacity {inspect.currentframe().f_lineno} ')
             # Clear the caching allocator before measuring the current memory usage
             torch.cuda.empty_cache()
             end, total_gpu_memory = torch.cuda.mem_get_info()
             torch_used_bytes = torch.cuda.memory_stats(
             )["allocated_bytes.all.current"]
+            print(f'[DEBUG] configure_kv_cache_capacity {inspect.currentframe().f_lineno} ')
         finally:
+            print(f'[DEBUG] configure_kv_cache_capacity {inspect.currentframe().f_lineno} ')
             py_executor.is_warmup = False
             py_executor.shutdown()
             py_executor.enable_iter_perf_stats = origin_iter_stats
+            print(f'[DEBUG] configure_kv_cache_capacity {inspect.currentframe().f_lineno} ')
             py_executor.set_gather_responses(False)
 
+        print(f'[DEBUG] configure_kv_cache_capacity {inspect.currentframe().f_lineno} ')
         total_used_bytes = total_gpu_memory - end
         activation_bytes = torch_peak_memory - model_bytes
         extra_cost = max(total_used_bytes - torch_used_bytes, 0)
@@ -282,6 +341,7 @@ class KvCacheCreator:
 
         # calculate max memory from peak memory and free gpu memory fraction
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
+                                                   mem.used,
                                                    total_gpu_memory, fraction,
                                                    allocated_bytes)
 

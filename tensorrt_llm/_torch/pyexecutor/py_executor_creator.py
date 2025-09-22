@@ -221,9 +221,15 @@ def create_py_executor(
     parallel_config: Optional[ParallelConfig] = None,
 ) -> PyExecutor:
 
+# kv_cache_config=KvCacheConfig(enable_block_reuse=True, max_tokens=None, max_attention_window=None, sink_token_length=None, free_gpu_memory_fraction=0.2, 
+#   host_cache_size=None, onboard_blocks=True, cross_kv_cache_fraction=None, secondary_offload_min_priority=None, event_buffer_max_size=0, 
+#   attention_dp_events_gather_period_ms=5, enable_partial_reuse=True, copy_on_partial_reuse=True, use_uvm=False, max_gpu_total_bytes=0, 
+#   dtype='auto', mamba_ssm_cache_dtype='auto') 
+    print(f'[DEBUG] create_py_executor:: llm_args: {llm_args}')
     executor_config = llm_args.get_executor_config(checkpoint_dir, tokenizer)
     executor_config.logits_post_processor_config = logits_post_processor_config
     executor_config.parallel_config = parallel_config
+    print(f'[DEBUG] create_py_executor:: executor_config.kv_cache_config.free_gpu_memory_fraction: {executor_config.kv_cache_config.free_gpu_memory_fraction}')
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
 
@@ -334,6 +340,7 @@ def create_py_executor(
     executor_config.max_num_tokens = model_engine.max_num_tokens
 
     config = model_engine.model.model_config.pretrained_config
+    
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             executor_config.tokens_per_block = 64

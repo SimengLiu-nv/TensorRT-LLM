@@ -215,14 +215,20 @@ def initialize_dummy_weights(
 
 def get_rank_model_storage(model):
     total_bytes = 0
+    total_parameters = 0
     for _, param in model.named_parameters():
         if param.device.type == 'cuda' and param.device.index == torch.cuda.current_device(
         ):
             total_bytes += param.element_size() * param.nelement()
+            
+    print(f"[DEBUG] get_rank_model_storage: total parameters, size {total_bytes // (1024**3)} GB")
+    total_parameters = total_bytes
     for _, buf in model.named_buffers():
         if buf.device.type == 'cuda' and buf.device.index == torch.cuda.current_device(
         ):
             total_bytes += buf.element_size() * buf.nelement()
+            
+    print(f"[DEBUG] get_rank_model_storage: total buffers, size {(total_bytes - total_parameters) // (1024**3)} GB")
     return total_bytes
 
 
@@ -978,6 +984,7 @@ class PyTorchModelEngine(ModelEngine):
                     model = AutoModelForCausalLM.from_config(config_copy)
 
                 memo = dict()
+                place_holder = torch.empty((1, 1), device='cuda')
 
                 def init_meta_tensor(t: torch.Tensor):
                     if t.device != torch.device('meta'):
@@ -985,8 +992,13 @@ class PyTorchModelEngine(ModelEngine):
                     if t not in memo:
                         memo[t] = torch.empty_like(t, device='cuda')
                     return memo[t]
-
+                
+                
                 model._apply(init_meta_tensor)
+                # print(f"[DEBUG] Applying init_meta_tensor to model, total {len(memo.keys())} tensors")
+                # for t in memo:
+                #     print(f"[DEBUG] t: {t}")
+
                 config = config_copy
 
             except Exception:
@@ -1000,12 +1012,23 @@ class PyTorchModelEngine(ModelEngine):
             logger.info(
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
+            print(f"[DEBUG] load_format: {load_format} hasattr(model, 'llm_checkpoint_dir') {hasattr(model, 'llm_checkpoint_dir')}")
+            print(f"[DEBUG] model.llm_checkpoint_dir: {model.llm_checkpoint_dir if hasattr(model, 'llm_checkpoint_dir') else 'None'}")
+            print(f"[DEBUG] checkpoint_dir: {checkpoint_dir}")
+            
             if load_format == LoadFormat.AUTO:
+                # import pdb; pdb.set_trace()
                 if hasattr(model, 'llm_checkpoint_dir'):
                     weights = checkpoint_loader.load_weights(
                         model.llm_checkpoint_dir)
                 else:
                     weights = checkpoint_loader.load_weights(checkpoint_dir)
+                    
+                import psutil
+                import time
+                mem = psutil.virtual_memory()
+                print(f"[DEBUG][{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"Used: {mem.used // (1024**2)} MB")
 
                 weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)

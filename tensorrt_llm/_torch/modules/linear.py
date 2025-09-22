@@ -104,6 +104,11 @@ def load_weight_shard(
 
 
 def copy_weight(dst: Parameter, src: torch.Tensor):
+    import traceback
+    stack_trace = traceback.format_stack()
+    from pprint import pprint
+    # print(f"[DEBUG] copy_weight: ")
+    # pprint(stack_trace)
     # TODO check that is it a reasonable change or not
     if dst.dtype != src.dtype:
         src = src.to(dst.dtype)
@@ -117,6 +122,8 @@ def load_weights_vanilla_helper(module: Linear,
                                 bias_transform=lambda x: x):
     assert len(weights) == 1
     device = torch.device('cuda')
+    
+    # print(f"[DEBUG] load_weights_vanilla_helper: weights[0].keys(): {weights[0].keys()}, weights[0]['weight']: {weights[0]['weight']}, device: {weights[0]['weight'].device}")
 
     weight = load_weight_shard(weights[0]['weight'], module.tp_size,
                                module.tp_rank, module.tp_mode, device)
@@ -231,6 +238,8 @@ class LinearMethodBase(ABC):
         """
         Load weights from the checkpoint.
         """
+        # print(f"[DEBUG][LinearMethodBase] Loading weights for {module.__class__.__name__}")
+        # print(f"[DEBUG][LinearMethodBase] weight_mode: {weight_mode}")
         if weight_mode == WeightMode.VANILLA:
             self.load_weights_vanilla(module, weights)
         elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
@@ -763,6 +772,13 @@ class NVFP4LinearMethod(LinearMethodBase):
         elif isinstance(input, tuple):
             act_fp4, act_sf = input
         else:
+            # print(f'[DEBUG] NVFP4LinearMethod input: {input}')
+            # print(f'[DEBUG] NVFP4LinearMethod module.input_scale: {module.input_scale}')
+            # print(f'[DEBUG] NVFP4LinearMethod module.scaling_vector_size: {module.scaling_vector_size}')
+            # print(f'[DEBUG] NVFP4LinearMethod module.weight: {module.weight}')
+            # print(f'[DEBUG] NVFP4LinearMethod module.weight_scale: {module.weight_scale}')
+            # print(f'[DEBUG] NVFP4LinearMethod module.alpha: {module.alpha}')
+            # print(f'[DEBUG] NVFP4LinearMethod module.dtype: {module.dtype}')
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
                 input, module.input_scale, module.scaling_vector_size, False)
 

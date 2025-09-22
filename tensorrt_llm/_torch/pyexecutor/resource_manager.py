@@ -552,6 +552,12 @@ class KVCacheManager(BaseResourceManager):
                                  mapping: Mapping,
                                  dtype: DataType,
                                  kv_factor: int = 2):
+        import traceback
+        from pprint import pprint
+        stack_trace = traceback.format_stack()
+        # print(f'[DEBUG] calculate_max_num_blocks stack_trace: ')
+        # pprint(stack_trace)
+        print(f'[DEBUG] kv_cache_config: {kv_cache_config}')
         free_mem_fraction = (kv_cache_config.free_gpu_memory_fraction
                              if kv_cache_config.free_gpu_memory_fraction
                              is not None else 0.9)
@@ -570,6 +576,8 @@ class KVCacheManager(BaseResourceManager):
                 cache_size_per_token,
                 quant_vector_size=16,
                 scaling_factor_dtype=DataType.FP8)
+            
+        print(f'[DEBUG] cache_size_bytes_per_token: {cache_size_bytes_per_token}')
 
         free_mem, total_mem = torch.cuda.mem_get_info()
 
@@ -580,9 +588,11 @@ class KVCacheManager(BaseResourceManager):
         if kv_cache_config.max_tokens is not None:
             # If user also specified a free gpu memory fraction, take the min
             if kv_cache_config.free_gpu_memory_fraction is not None:
+                print(f'[DEBUG] max_tokens: {max_tokens}, kv_cache_config.max_tokens: {kv_cache_config.max_tokens}')
                 max_tokens = min(kv_cache_config.max_tokens, max_tokens)
                 logger.warning(
                     f'Both free_gpu_memory_fraction and max_tokens are set (to {free_mem_fraction} and {kv_cache_config.max_tokens}, respectively). The smaller value will be used.'
+                    
                 )
             else:
                 max_tokens = kv_cache_config.max_tokens
@@ -600,6 +610,7 @@ class KVCacheManager(BaseResourceManager):
         max_tokens_secondary = host_cache_size / cache_size_bytes_per_token
         blocks_in_secondary_pool = max(
             0, int(max_tokens_secondary / tokens_per_block))
+        print(f'[DEBUG] blocks_in_primary_pool: {blocks_in_primary_pool}, blocks_in_secondary_pool: {blocks_in_secondary_pool}')
         return blocks_in_primary_pool, blocks_in_secondary_pool
 
     def get_max_atten_window_upper_bound(self, blocks_in_primary_pool,

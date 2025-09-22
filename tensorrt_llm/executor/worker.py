@@ -151,6 +151,8 @@ class GenerationExecutorWorker(GenerationExecutor):
                     self.llm_args.backend, self.llm_args.checkpoint_loader,
                     self.llm_args.checkpoint_format)
 
+            #free_gpu_memory_fraction=0.2
+            print(f"[DEBUG] Worker create_executor:: args{args}")
             _executor = create_executor(**args)
             self.max_seq_len = self.llm_args.max_seq_len
             if _executor.max_seq_len is not None:
@@ -850,6 +852,7 @@ def worker_main(
     print_colored_debug(f"Worker {mpi_rank()} ready to setup backend...\n",
                         "green")
 
+    print(f"[DEBUG] Worker executor_config{executor_config} llm_args{llm_args}")
     try:
         worker: GenerationExecutorWorker = worker_cls(
             engine,

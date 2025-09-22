@@ -1903,10 +1903,14 @@ class BaseLlmArgs(StrictBaseModel):
             fail_fast_on_attention_window_too_large=getattr(
                 self, 'fail_fast_on_attention_window_too_large', False),
         )
+        
+        print(f'[DEBUG] get_executor_config:: self.kv_cache_config: {self.kv_cache_config}')
+        # free_gpu_memory_fraction=0.2 
 
         if self.kv_cache_config is not None:
             executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
                 self.kv_cache_config)
+        print(f'[DEBUG] executor_config.kv_cache_config.free_gpu_memory_fraction: {executor_config.kv_cache_config.free_gpu_memory_fraction}')
         if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
             # Disable KV cache reuse for deterministic mode
             executor_config.kv_cache_config.enable_block_reuse = False
