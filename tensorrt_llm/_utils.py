@@ -534,7 +534,7 @@ def local_mpi_barrier():
 
 
 def mpi_broadcast(obj, root=0):
-    return mpi_comm().bcast(obj, root) if is_multi_device_enable() else obj
+    return mpi_comm().bcast(obj, root) if global_mpi_size() > 1 else obj
 
 
 def mpi_allgather(obj):

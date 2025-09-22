@@ -942,6 +942,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                         if p is not None:
                             weight_mapper.handle_manual_copy(
                                 module_name, module_weights, n, p)
+            del module_weights
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       False) in ["True", "true", "1", "yes", "y"]:
