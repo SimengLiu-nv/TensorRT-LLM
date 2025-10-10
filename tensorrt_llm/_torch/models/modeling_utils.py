@@ -1,16 +1,19 @@
 import contextlib
+import gc
 import math
 import os
 import time
 from dataclasses import dataclass
 from typing import Dict, Generic, List, Optional, Tuple, Type, TypeVar, Union
 
+import psutil
 import torch
 from torch import nn
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
+from tensorrt_llm._utils import debug_print
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
@@ -815,6 +818,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        skip_modules: List[str] = [],
                        params_map: Optional[Dict[str, str]] = None,
                        preload_weight_modules: Optional[List[str]] = None):
+    debug_print(f"Loading weights with v1 impl")
     # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 model loading where
     # we need some order in the module loading. Once this is resolved, we can remove this workaround.
     # TODO smor- this method is here as a temporary solution to load weights.
@@ -841,6 +845,9 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
     }
 
     def load_single_module(name, module):
+        debug_print(
+            f'[DEBUG] _load_weights_impl::load_single_module::name = {name}, module = {module.__class__.__name__}'
+        )
         if len(module._parameters) > 0:
             # skip load weights if module is in skip_modules
             if any(skip_module in name for skip_module in skip_modules):
@@ -896,9 +903,22 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "True") in ["True", "true", "1", "yes", "y"]:
+        base_total_ram = psutil.virtual_memory().used
+        base_gpu_ram = torch.cuda.memory_allocated()
+        base_cpu_ram = base_total_ram - base_gpu_ram
         for name, module in tqdm(list(model.named_modules()),
                                  desc="Loading weights"):
             load_single_module(name, module)
+            gc.collect()  # TODO check if this is necessary
+            new_total_ram = psutil.virtual_memory().used
+            new_gpu_ram = torch.cuda.memory_allocated()
+            new_cpu_ram = new_total_ram - new_gpu_ram
+            debug_print(
+                f"[DEBUG] Loaded weights for {name} in serial: Total RAM {(new_total_ram - base_total_ram) / (1024**3):.2f} GB, GPU RAM {(new_gpu_ram - base_gpu_ram) / (1024**3):.2f} GB, CPU RAM {(new_cpu_ram - base_cpu_ram) / (1024**3):.2f} GB"
+            )
+            base_total_ram = new_total_ram
+            base_gpu_ram = new_gpu_ram
+            base_cpu_ram = new_cpu_ram
     else:
         all_modules = dict(model.named_modules())
         serial_load_modules = []
@@ -929,6 +949,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                           skip_modules: List[str] = [],
                           params_map: Optional[Dict[str, str]] = None,
                           preload_weight_modules: Optional[List[str]] = None):
+    debug_print(f"Loading weights with v2 impl")
     # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 and Qwen3 model loading where
     # we need some order in the module loading. Once this is resolved, we can remove this workaround.
     weight_mapper.add_skip_modules(skip_modules)
@@ -937,6 +958,9 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
         logger.info(f"Renamed weights with params_map: {params_map}")
 
     def load_single_module(name, module):
+        debug_print(
+            f'[DEBUG] _load_weights_impl_v2::load_single_module::name = {name}, module = {module.__class__.__name__}'
+        )
         if len(module._parameters) > 0:
             if weight_mapper.should_skip_module(name):
                 return
@@ -964,9 +988,22 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "True") in ["True", "true", "1", "yes", "y"]:
+        base_total_ram = psutil.virtual_memory().used
+        base_gpu_ram = torch.cuda.memory_allocated()
+        base_cpu_ram = base_total_ram - base_gpu_ram
         for name, module in tqdm(list(model.named_modules()),
                                  desc="Loading weights"):
             load_single_module(name, module)
+            gc.collect()  # TODO check if this is necessary
+            new_total_ram = psutil.virtual_memory().used
+            new_gpu_ram = torch.cuda.memory_allocated()
+            new_cpu_ram = new_total_ram - new_gpu_ram
+            debug_print(
+                f"[DEBUG] Loaded weights for {name} in serial: Total RAM {(new_total_ram - base_total_ram) / (1024**3):.2f} GB, GPU RAM {(new_gpu_ram - base_gpu_ram) / (1024**3):.2f} GB, CPU RAM {(new_cpu_ram - base_cpu_ram) / (1024**3):.2f} GB"
+            )
+            base_total_ram = new_total_ram
+            base_gpu_ram = new_gpu_ram
+            base_cpu_ram = new_cpu_ram
     else:
         all_modules = dict(model.named_modules())
         serial_load_modules = []

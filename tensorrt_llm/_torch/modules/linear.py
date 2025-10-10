@@ -14,8 +14,10 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
+from tensorrt_llm._utils import is_device_integrated
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
@@ -64,6 +66,11 @@ def load_weight_shard(
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
         device: torch.device = torch.device('cpu'),
 ) -> torch.Tensor:
+    if weight.device.type != device.type and is_device_integrated():
+        logger.warning(
+            f"[load_weight_shard] Weight is on {weight.device} but device is set to {device}. Ignore the weight tensor device movements as it introduces extra memory consumption and data copies."
+        )
+        device = weight.device
     if isinstance(weight, torch.Tensor):
         tensor_shape = weight.shape
 
@@ -109,7 +116,7 @@ def copy_weight(dst: Parameter, src: torch.Tensor):
     if dst.dtype != src.dtype:
         src = src.to(dst.dtype)
     assert dst.dtype == src.dtype, f"Incompatible dtype. dst: {dst.dtype}, src: {src.dtype}"
-    dst.data.copy_(src)
+    dst.data.copy_(src, non_blocking=True)
 
 
 def load_weights_vanilla_helper(module: Linear,

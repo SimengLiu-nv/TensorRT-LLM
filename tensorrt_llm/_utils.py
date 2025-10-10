@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import nvtx
+from cuda import cudart
 from mpi4py import MPI
 from mpi4py.util import pkl5
 from packaging import version
@@ -44,6 +45,8 @@ import tensorrt as trt
 from tensorrt_llm.bindings import DataType, GptJsonConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
+
+_device_integrated = None
 
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
@@ -534,7 +537,11 @@ def local_mpi_barrier():
 
 
 def mpi_broadcast(obj, root=0):
-    return mpi_comm().bcast(obj, root) if is_multi_device_enable() else obj
+    return mpi_comm().bcast(obj, root) if global_mpi_size() > 1 else obj
+
+
+def debug_print(msg):
+    print(f'[{global_mpi_rank()}]{msg}')
 
 
 def mpi_allgather(obj):
@@ -1127,17 +1134,6 @@ class KVCacheEventSerializer:
         }
 
 
-def is_multi_device_enable():
-    """
-    This method evaluates if we are running on multiple GPUs and the flag ENABLE_MULTI_DEVICE is set.
-    So we can avoid broadcast calls on single GPU.
-    Issue: https://github.com/NVIDIA/TensorRT-LLM/issues/5927
-    ENABLE_MULTI_DEVICE is true by default when building TensorRT LLM so we need to also check
-    the number of devices
-    """
-    return local_mpi_size() > 1
-
-
 def set_prometheus_multiproc_dir() -> object:
     # Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.10/python/sglang/srt/utils.py#L1266
     global prometheus_multiproc_dir
@@ -1150,3 +1146,11 @@ def set_prometheus_multiproc_dir() -> object:
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
     logger.info(
         f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+
+
+def is_device_integrated():
+    global _device_integrated
+    if _device_integrated is None:
+        _device_integrated = cudart.cudaDeviceGetAttribute(
+            cudart.cudaDeviceAttr.cudaDevAttrIntegrated, 0)
+    return _device_integrated
