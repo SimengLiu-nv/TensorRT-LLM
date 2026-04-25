@@ -23,6 +23,8 @@ GPU. They are aligned with the C++ scheduler unit tests in:
   - cpp/tests/unit_tests/batch_manager/capacitySchedulerTest.cpp
 """
 
+import random
+from collections.abc import Hashable, Iterable
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -43,12 +45,13 @@ class MockPrefixReuseSummary:
 
     reusable_blocks_allocated: int = 0
     reusable_blocks_all: int = 0
-    first_new_block: Optional[object] = None
+    first_new_block: Optional[Hashable] = None
 
 
 def _make_request(
     request_id: int,
     prompt_len: int = 10,
+    max_new_tokens: int = 10,
     beam_width: int = 1,
     draft_tokens_len: int = 0,
     encoder_output_len: int = 0,
@@ -60,7 +63,7 @@ def _make_request(
     draft = list(range(draft_tokens_len)) if draft_tokens_len > 0 else None
     req = LlmRequest(
         request_id=request_id,
-        max_new_tokens=10,
+        max_new_tokens=max_new_tokens,
         input_tokens=tokens,
         sampling_config=SamplingConfig(beam_width),
         is_streaming=False,
@@ -145,7 +148,7 @@ class MockKVCacheManager:
         blocks_per_request: int = 5,
         is_variable_window: bool = False,
         enable_block_reuse: bool = False,
-    ):
+    ) -> None:
         self._window_sizes = window_sizes or [128]
         self._num_free_blocks = num_free_blocks
         self._blocks_per_request = blocks_per_request
@@ -153,44 +156,102 @@ class MockKVCacheManager:
         self.enable_block_reuse = enable_block_reuse
         self.max_attention_window_vec = self._window_sizes
         self._scheduling_started = False
+        self.analyze_prefix_reuse_calls = 0
+        self.remaining_blocks_calls = 0
+        self.needed_blocks_calls = 0
+        self.remaining_uncached_reuse_calls = 0
+        self.needed_uncached_reuse_calls = 0
+        self._cached_prefix_blocks: dict[Hashable, int] = {}
 
     def get_kv_cache_stats(self) -> MockKVCacheStats:
         return MockKVCacheStats(
             num_free_blocks_per_window_size={ws: self._num_free_blocks for ws in self._window_sizes}
         )
 
-    def get_remaining_blocks_to_completion(self, req, window_size: int) -> int:
-        return self._blocks_per_request
+    def get_remaining_blocks_to_completion(
+        self,
+        req: LlmRequest,
+        window_size: int,
+        cached_summary: Optional[MockPrefixReuseSummary] = None,
+    ) -> int:
+        self.remaining_blocks_calls += 1
+        if self._expects_cached_summary(req, cached_summary):
+            self.remaining_uncached_reuse_calls += 1
+        return self._blocks_needed_after_reuse(cached_summary)
 
-    def get_needed_blocks_one_step(self, req, two_step_lookahead: bool, window_size: int) -> int:
-        return self._blocks_per_request
+    def get_needed_blocks_one_step(
+        self,
+        req: LlmRequest,
+        two_step_lookahead: bool,
+        window_size: int,
+        cached_summary: Optional[MockPrefixReuseSummary] = None,
+    ) -> int:
+        self.needed_blocks_calls += 1
+        if self._expects_cached_summary(req, cached_summary):
+            self.needed_uncached_reuse_calls += 1
+        return self._blocks_needed_after_reuse(cached_summary)
 
     def scheduling_has_free_blocks(self, total: int, window_size: int) -> bool:
         return total <= self._num_free_blocks
 
-    def start_scheduling(self):
+    def start_scheduling(self) -> None:
         self._scheduling_started = True
 
-    def scheduling_remove_sequence(self, req_id: int):
+    def scheduling_remove_sequence(self, req_id: int) -> None:
         pass
 
-    def analyze_prefix_reuse(self, unique_tokens, req):
+    def analyze_prefix_reuse(
+        self, unique_tokens: Iterable[object], req: LlmRequest
+    ) -> MockPrefixReuseSummary:
+        self.analyze_prefix_reuse_calls += 1
         if self.enable_block_reuse and unique_tokens:
             # Derive a deterministic, hashable block key from the tokens so that
             # duplicate requests produce equal first_new_block values and trigger
             # the beneficial-to-skip logic.  UniqueToken objects (nanobind-wrapped
             # C++ structs) have no __hash__/__eq__, so extract the primitive fields.
-            block_key = tuple(
-                t if isinstance(t, int) else (t.token_id, t.token_extra_id) for t in unique_tokens
+            block_key = self._block_key(unique_tokens)
+            reusable_blocks = self._cached_prefix_blocks.get(block_key, 0)
+            return MockPrefixReuseSummary(
+                reusable_blocks_allocated=reusable_blocks,
+                reusable_blocks_all=reusable_blocks,
+                first_new_block=None if reusable_blocks > 0 else block_key,
             )
-            return MockPrefixReuseSummary(first_new_block=block_key)
         return MockPrefixReuseSummary()
+
+    def store_context(self, req: LlmRequest) -> None:
+        unique_tokens = req.get_unique_tokens(0)
+        if self.enable_block_reuse and unique_tokens:
+            self._cached_prefix_blocks[self._block_key(unique_tokens)] = max(
+                0, self._blocks_per_request - 1
+            )
 
     def get_max_resource_count(self) -> int:
         return self._num_free_blocks
 
-    def get_needed_resource_to_completion(self, req) -> int:
+    def get_needed_resource_to_completion(self, req: LlmRequest) -> int:
         return self._blocks_per_request
+
+    @staticmethod
+    def _block_key(unique_tokens: Iterable[object]) -> Hashable:
+        return tuple(
+            t if isinstance(t, int) else (t.token_id, t.token_extra_id) for t in unique_tokens
+        )
+
+    def _blocks_needed_after_reuse(self, cached_summary: Optional[MockPrefixReuseSummary]) -> int:
+        reusable_blocks = (
+            cached_summary.reusable_blocks_allocated if cached_summary is not None else 0
+        )
+        return max(0, self._blocks_per_request - reusable_blocks)
+
+    def _expects_cached_summary(
+        self, req: LlmRequest, cached_summary: Optional[MockPrefixReuseSummary]
+    ) -> bool:
+        return (
+            self.enable_block_reuse
+            and cached_summary is None
+            and req.is_context_init_state
+            and req.is_first_context_chunk
+        )
 
 
 class MockPeftCacheManager:
@@ -2450,6 +2511,256 @@ class TestPyCapacitySchedulerKVCacheReuse:
     C++ ref: DelayDuplicate*, ReuseAware*, MaxUtilizationReuse*, NoReuse* tests
     in capacitySchedulerTest.cpp.
     """
+
+    @staticmethod
+    def _make_requests_from_tokens(
+        token_sets: list[list[int]], max_new_tokens: int
+    ) -> list[LlmRequest]:
+        return [
+            _make_request(
+                request_id=request_id,
+                prompt_len=len(tokens),
+                max_new_tokens=max_new_tokens,
+                input_tokens=tokens,
+            )
+            for request_id, tokens in enumerate(token_sets)
+        ]
+
+    @staticmethod
+    def _make_seeded_duplicate_token_sets(
+        seed: int, num_pairs: int, prompt_len: int
+    ) -> list[list[int]]:
+        rng = random.Random(seed)
+        token_sets: list[list[int]] = []
+        for _ in range(num_pairs):
+            tokens = [rng.randint(0, 100_000) for _ in range(prompt_len)]
+            token_sets.extend([tokens, list(tokens)])
+        rng.shuffle(token_sets)
+        return token_sets
+
+    @staticmethod
+    def _run_capacity_iterations(
+        policy: CapacitySchedulerPolicy,
+        kv: MockKVCacheManager,
+        requests: list[LlmRequest],
+        max_new_tokens: int,
+        max_num_requests: int = 2,
+    ) -> tuple[int, list[list[int]]]:
+        scheduler = PyCapacityScheduler(
+            max_num_requests=max_num_requests,
+            kv_cache_manager=kv,
+            scheduler_policy=policy,
+        )
+        generated_tokens = {req.request_id: 0 for req in requests}
+        active_requests = list(requests)
+        iterations = 0
+        scheduled_request_ids: list[list[int]] = []
+        while active_requests:
+            fitting, disagg, paused = scheduler.schedule_request(active_requests)
+            assert not disagg
+            assert not paused
+            assert fitting, "scheduler made no progress"
+            scheduled_request_ids.append([req.request_id for req in fitting])
+
+            for req in fitting:
+                if req.is_context_init_state:
+                    kv.store_context(req)
+                    req.state = LlmRequestState.GENERATION_IN_PROGRESS
+                    generated_tokens[req.request_id] = 1
+                elif req.is_generation_in_progress_state:
+                    generated_tokens[req.request_id] += 1
+
+                if generated_tokens[req.request_id] >= max_new_tokens:
+                    req.state = LlmRequestState.GENERATION_COMPLETE
+
+            active_requests = [
+                req for req in active_requests if req.state != LlmRequestState.GENERATION_COMPLETE
+            ]
+            iterations += 1
+            assert iterations < 100, "iteration simulation did not converge"
+
+        return iterations, scheduled_request_ids
+
+    def test_guaranteed_no_evict_prefix_reuse_complexity(self) -> None:
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=3, enable_block_reuse=True)
+        scheduler = PyCapacityScheduler(
+            max_num_requests=4,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        )
+        requests = [
+            _make_request(i, prompt_len=20, input_tokens=[i * 1000 + j for j in range(20)])
+            for i in range(4)
+        ]
+
+        fitting, disagg, paused = scheduler.schedule_request(requests)
+
+        assert len(fitting) == len(requests)
+        assert not disagg
+        assert not paused
+        assert kv.analyze_prefix_reuse_calls == len(requests)
+        assert kv.remaining_blocks_calls == len(requests)
+        assert kv.remaining_uncached_reuse_calls == 0
+
+    def test_max_utilization_prefix_reuse_complexity(self) -> None:
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=3, enable_block_reuse=True)
+        scheduler = PyCapacityScheduler(
+            max_num_requests=4,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        )
+        requests = [
+            _make_request(i, prompt_len=20, input_tokens=[i * 1000 + j for j in range(20)])
+            for i in range(4)
+        ]
+
+        fitting, disagg, paused = scheduler.schedule_request(requests)
+
+        assert len(fitting) == len(requests)
+        assert not disagg
+        assert not paused
+        assert kv.analyze_prefix_reuse_calls == len(requests)
+        assert kv.needed_blocks_calls == len(requests)
+        assert kv.needed_uncached_reuse_calls == 0
+
+    def test_no_reuse_disabled_avoids_prefix_analysis(self) -> None:
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=3, enable_block_reuse=False)
+        scheduler = PyCapacityScheduler(
+            max_num_requests=4,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        )
+        requests = [_make_request(i, prompt_len=20) for i in range(4)]
+
+        fitting, disagg, paused = scheduler.schedule_request(requests)
+
+        assert len(fitting) == len(requests)
+        assert not disagg
+        assert not paused
+        assert kv.analyze_prefix_reuse_calls == 0
+
+    def test_shared_prefix_reuse_reduces_iteration_count(self) -> None:
+        max_new_tokens = 5
+        token_sets = [list(range(20)), list(range(20))]
+        reuse_requests = self._make_requests_from_tokens(token_sets, max_new_tokens)
+        no_reuse_requests = self._make_requests_from_tokens(token_sets, max_new_tokens)
+
+        reuse_iterations, reuse_schedule = self._run_capacity_iterations(
+            CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+            MockKVCacheManager(num_free_blocks=5, blocks_per_request=3, enable_block_reuse=True),
+            reuse_requests,
+            max_new_tokens,
+        )
+        no_reuse_iterations, no_reuse_schedule = self._run_capacity_iterations(
+            CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+            MockKVCacheManager(num_free_blocks=5, blocks_per_request=3, enable_block_reuse=False),
+            no_reuse_requests,
+            max_new_tokens,
+        )
+
+        assert reuse_iterations == 6, reuse_schedule
+        assert no_reuse_iterations == 10, no_reuse_schedule
+        assert reuse_iterations < no_reuse_iterations
+
+    def test_iteration_count_uses_fixed_seeded_workloads(self) -> None:
+        max_new_tokens = 5
+        expected_reuse_schedules = {
+            0: [
+                [0],
+                [0],
+                [0],
+                [0],
+                [0],
+                [1, 2],
+                [1, 2],
+                [1, 2],
+                [1, 2],
+                [1, 2],
+                [3],
+                [3],
+                [3],
+                [3],
+                [3],
+            ],
+            17: [
+                [0],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [1],
+                [2],
+                [2, 3],
+                [2, 3],
+                [2, 3],
+                [2, 3],
+                [3],
+            ],
+            149: [
+                [0],
+                [0],
+                [0],
+                [0],
+                [0],
+                [1, 2],
+                [1, 2],
+                [1, 2],
+                [1, 2],
+                [1, 2],
+                [3],
+                [3],
+                [3],
+                [3],
+                [3],
+            ],
+        }
+        expected_no_reuse_schedule = [
+            [0],
+            [0],
+            [0],
+            [0],
+            [0],
+            [1],
+            [1],
+            [1],
+            [1],
+            [1],
+            [2],
+            [2],
+            [2],
+            [2],
+            [2],
+            [3],
+            [3],
+            [3],
+            [3],
+            [3],
+        ]
+        for seed, expected_reuse_schedule in expected_reuse_schedules.items():
+            token_sets = self._make_seeded_duplicate_token_sets(
+                seed=seed, num_pairs=2, prompt_len=20
+            )
+            reuse_iterations, reuse_schedule = self._run_capacity_iterations(
+                CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+                MockKVCacheManager(
+                    num_free_blocks=5, blocks_per_request=3, enable_block_reuse=True
+                ),
+                self._make_requests_from_tokens(token_sets, max_new_tokens),
+                max_new_tokens,
+            )
+            no_reuse_iterations, no_reuse_schedule = self._run_capacity_iterations(
+                CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+                MockKVCacheManager(
+                    num_free_blocks=5, blocks_per_request=3, enable_block_reuse=False
+                ),
+                self._make_requests_from_tokens(token_sets, max_new_tokens),
+                max_new_tokens,
+            )
+            assert reuse_schedule == expected_reuse_schedule
+            assert no_reuse_schedule == expected_no_reuse_schedule
+            assert reuse_iterations == len(expected_reuse_schedule)
+            assert no_reuse_iterations == len(expected_no_reuse_schedule)
+            assert reuse_iterations < no_reuse_iterations
 
     def test_delay_duplicate_request(self):
         """C++ ref: DelayDuplicateRequest - identical requests delayed for reuse"""

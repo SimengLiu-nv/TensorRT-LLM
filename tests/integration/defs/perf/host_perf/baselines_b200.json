@@ -4,7 +4,8 @@
     "_collected": "2026-03-18",
     "scheduler": {
         "production_gen_only_bs8": 11.8,
-        "production_mixed_32gen_4ctx": 40.5
+        "production_mixed_32gen_4ctx": 40.5,
+        "production_prefix_reuse_64ctx_capacity_path": 4050.0
     },
     "sampler": {
         "greedy_bs8": 43.5,

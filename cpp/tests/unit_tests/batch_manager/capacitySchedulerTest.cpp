@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,7 +34,11 @@
 
 #include <cstdlib>
 #include <functional>
+#include <map>
 #include <memory>
+#include <numeric>
+#include <optional>
+#include <tuple>
 #include <vector>
 
 using namespace tensorrt_llm::runtime;
@@ -110,6 +114,56 @@ private:
     SizeType32 mMaxHostPages;
 };
 
+class InspectKVCacheManager : public kv_cache_manager::KVCacheManager
+{
+public:
+    using KVCacheManager::KVCacheManager;
+
+    [[nodiscard]] kv_cache_manager::PrefixReuseSummary analyzePrefixReuse(
+        kv_cache_manager::VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const override
+    {
+        ++mAnalyzePrefixReuseCalls;
+        return KVCacheManager::analyzePrefixReuse(uniqueTokens, llmRequest);
+    }
+
+    [[nodiscard]] SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize,
+        std::optional<kv_cache_manager::PrefixReuseSummary> const& cachedSummary = std::nullopt) const override
+    {
+        ++mRemainingBlocksToCompletionCalls;
+        if (countsAsUncachedFirstChunkReuse(req, cachedSummary))
+        {
+            ++mUncachedRemainingBlocksToCompletionCalls;
+        }
+        return KVCacheManager::getRemainingBlocksToCompletion(req, windowSize, cachedSummary);
+    }
+
+    [[nodiscard]] SizeType32 getNeededBlocksOneStep(LlmRequest const& req, bool twoStepsLookAhead,
+        SizeType32 windowSize,
+        std::optional<kv_cache_manager::PrefixReuseSummary> const& cachedSummary = std::nullopt) const override
+    {
+        ++mNeededBlocksOneStepCalls;
+        if (countsAsUncachedFirstChunkReuse(req, cachedSummary))
+        {
+            ++mUncachedNeededBlocksOneStepCalls;
+        }
+        return KVCacheManager::getNeededBlocksOneStep(req, twoStepsLookAhead, windowSize, cachedSummary);
+    }
+
+    mutable SizeType32 mAnalyzePrefixReuseCalls{0};
+    mutable SizeType32 mRemainingBlocksToCompletionCalls{0};
+    mutable SizeType32 mUncachedRemainingBlocksToCompletionCalls{0};
+    mutable SizeType32 mNeededBlocksOneStepCalls{0};
+    mutable SizeType32 mUncachedNeededBlocksOneStepCalls{0};
+
+private:
+    [[nodiscard]] bool countsAsUncachedFirstChunkReuse(
+        LlmRequest const& req, std::optional<kv_cache_manager::PrefixReuseSummary> const& cachedSummary) const
+    {
+        return isEnableBlockReuse() && !getBlockManager().isVariableWindow() && !isCrossKv() && req.isContextInitState()
+            && req.isFirstContextChunk() && !req.isDisaggGenerationInitState() && !cachedSummary.has_value();
+    }
+};
+
 class CapacitySchedulerTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
 {
 
@@ -139,6 +193,26 @@ protected:
 
         // init KV cache block manager
         return std::make_shared<kv_cache_manager::KVCacheManager>(numLayers, nbKvHeads, sizePerHead, tokensPerBlock,
+            blocksPerWindow, maxNumRequests, 1, std::vector<SizeType32>{maxNumTokensPerSeq}, std::nullopt, kvDtype,
+            sinkTokenLength, streamPtr, maxNumTokensPerSeq, enableReuse, cacheType);
+    }
+
+    static std::shared_ptr<InspectKVCacheManager> getInspectKvCacheManager(SizeType32 maxNumRequests,
+        SizeType32 tokensPerBlock, SizeType32 maxNumTokens, SizeType32 maxNumTokensPerSeq,
+        SizeType32 sinkTokenLength = 0, bool enableReuse = false,
+        kv_cache_manager::CacheType cacheType = kv_cache_manager::CacheType::kSELF)
+    {
+        auto const numLayers = 10;
+        auto const nbKvHeads = 10;
+        auto constexpr sizePerHead = 1;
+        auto const maxNumBlocks = tc::divUp(maxNumTokens, tokensPerBlock);
+        auto const kvDtype = nvinfer1::DataType::kHALF;
+        CudaStreamPtr streamPtr = std::make_shared<tensorrt_llm::runtime::CudaStream>();
+
+        using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+        auto const blocksPerWindow = BlocksPerWindow{{maxNumTokensPerSeq, {maxNumBlocks, 0}}};
+
+        return std::make_shared<InspectKVCacheManager>(numLayers, nbKvHeads, sizePerHead, tokensPerBlock,
             blocksPerWindow, maxNumRequests, 1, std::vector<SizeType32>{maxNumTokensPerSeq}, std::nullopt, kvDtype,
             sinkTokenLength, streamPtr, maxNumTokensPerSeq, enableReuse, cacheType);
     }
@@ -2034,6 +2108,115 @@ TEST_F(CapacitySchedulerTest, NoReuseWithDifferentPrompts)
     EXPECT_EQ(kvCacheManager->getNumReusedBlocks(), 0);
     // Both requests start at iteration 0 and finish together, so numIterations = maxNewTokens
     EXPECT_EQ(numIterations, maxNewTokens);
+}
+
+TEST_F(CapacitySchedulerTest, GuaranteedNoEvictPrefixReuseComplexity)
+{
+    SizeType32 kvCacheMaxNumTokens = 200;
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    SizeType32 maxNumRequests = 4;
+    bool enableReuse = true;
+
+    auto kvCacheManager = getInspectKvCacheManager(
+        maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, 0, enableReuse);
+    auto peftCacheManager = getPeftCacheManager();
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+
+    int32_t maxNewTokens = 5;
+    int32_t promptLen = 20;
+    RequestList activeRequests;
+    for (SizeType32 reqIdx = 0; reqIdx < maxNumRequests; ++reqIdx)
+    {
+        auto inputTokens = std::make_shared<std::vector<int32_t>>(promptLen);
+        std::iota(inputTokens->begin(), inputTokens->end(), reqIdx * 1000);
+        activeRequests.push_back(createRequest(inputTokens, maxNewTokens, reqIdx));
+    }
+
+    auto [scheduledRequests, scheduledDisaggGenInitRequests, pausedRequests] = capacityScheduler(activeRequests,
+        std::shared_ptr<kv_cache_manager::BaseKVCacheManager>(kvCacheManager), peftCacheManager, std::nullopt);
+
+    EXPECT_EQ(scheduledRequests.size(), activeRequests.size());
+    EXPECT_TRUE(scheduledDisaggGenInitRequests.empty());
+    EXPECT_TRUE(pausedRequests.empty());
+    EXPECT_EQ(kvCacheManager->mAnalyzePrefixReuseCalls, static_cast<SizeType32>(activeRequests.size()));
+    EXPECT_EQ(kvCacheManager->mRemainingBlocksToCompletionCalls, static_cast<SizeType32>(activeRequests.size()));
+    EXPECT_EQ(kvCacheManager->mUncachedRemainingBlocksToCompletionCalls, 0);
+}
+
+TEST_F(CapacitySchedulerTest, MaxUtilizationPrefixReuseComplexity)
+{
+    SizeType32 kvCacheMaxNumTokens = 200;
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    SizeType32 maxNumRequests = 4;
+    bool enableReuse = true;
+
+    auto kvCacheManager = getInspectKvCacheManager(
+        maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, 0, enableReuse);
+    auto peftCacheManager = getPeftCacheManager();
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kMAX_UTILIZATION, kvCacheManager != nullptr);
+
+    int32_t maxNewTokens = 5;
+    int32_t promptLen = 20;
+    RequestList activeRequests;
+    for (SizeType32 reqIdx = 0; reqIdx < maxNumRequests; ++reqIdx)
+    {
+        auto inputTokens = std::make_shared<std::vector<int32_t>>(promptLen);
+        std::iota(inputTokens->begin(), inputTokens->end(), reqIdx * 1000);
+        activeRequests.push_back(createRequest(inputTokens, maxNewTokens, reqIdx));
+    }
+
+    auto [scheduledRequests, scheduledDisaggGenInitRequests, pausedRequests] = capacityScheduler(activeRequests,
+        std::shared_ptr<kv_cache_manager::BaseKVCacheManager>(kvCacheManager), peftCacheManager, std::nullopt);
+
+    EXPECT_EQ(scheduledRequests.size(), activeRequests.size());
+    EXPECT_TRUE(scheduledDisaggGenInitRequests.empty());
+    EXPECT_TRUE(pausedRequests.empty());
+    EXPECT_EQ(kvCacheManager->mAnalyzePrefixReuseCalls, static_cast<SizeType32>(activeRequests.size()));
+    EXPECT_EQ(kvCacheManager->mNeededBlocksOneStepCalls, static_cast<SizeType32>(activeRequests.size()));
+    EXPECT_EQ(kvCacheManager->mUncachedNeededBlocksOneStepCalls, 0);
+}
+
+TEST_F(CapacitySchedulerTest, SharedPrefixReuseReducesIterationCount)
+{
+    SizeType32 kvCacheMaxNumTokens = 50;
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 40;
+    SizeType32 maxNumRequests = 2;
+    SizeType32 maxInputLen = 1000;
+    int32_t maxNewTokens = 5;
+    int32_t promptLen = 20;
+
+    auto runScenario = [&](bool enableReuse)
+    {
+        auto kvCacheManager = getKvCacheManager(
+            maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, 0, enableReuse);
+        auto peftCacheManager = getPeftCacheManager();
+        auto capacityScheduler = CapacityScheduler(
+            maxNumRequests, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+
+        auto inputTokens = std::make_shared<std::vector<int32_t>>(promptLen);
+        std::iota(inputTokens->begin(), inputTokens->end(), 0);
+
+        RequestList activeRequests;
+        activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 0));
+        activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 1));
+
+        auto addNewRequestsCb = [](RequestList&, int) {};
+        std::vector<ExpectedState> expectedStates;
+        return runTest(capacityScheduler, kvCacheManager, activeRequests, expectedStates, addNewRequestsCb, maxInputLen,
+            peftCacheManager);
+    };
+
+    auto const reuseIterations = runScenario(true);
+    auto const noReuseIterations = runScenario(false);
+
+    EXPECT_EQ(reuseIterations, maxNewTokens + 1);
+    EXPECT_EQ(noReuseIterations, maxNewTokens * 2);
+    EXPECT_LE(reuseIterations, noReuseIterations);
 }
 
 TEST_F(CapacitySchedulerTest, ReuseAwareSchedulingMaxUtilizationPolicy)

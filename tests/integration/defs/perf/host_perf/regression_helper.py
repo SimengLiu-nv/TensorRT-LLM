@@ -88,13 +88,21 @@ def _load_baselines():
     return _baselines_cache
 
 
-def check_regression(component: str, scenario_name: str, current_median_us: float):
+def check_regression(
+    component: str,
+    scenario_name: str,
+    current_median_us: float,
+    *,
+    fail_on_regression: bool = False,
+) -> bool:
     """Check if the current median exceeds the baseline by more than the regression factor.
 
     Args:
         component: One of "scheduler", "sampler", "kv_cache".
         scenario_name: The scenario ID matching a key in baselines_b200.json.
         current_median_us: The measured median latency in microseconds.
+        fail_on_regression: Raise AssertionError when a regression is detected or when
+            the scenario baseline is unavailable.
 
     Returns:
         True if a regression was detected, False otherwise.
@@ -105,17 +113,25 @@ def check_regression(component: str, scenario_name: str, current_median_us: floa
     baseline_us = component_baselines.get(scenario_name)
 
     if baseline_us is None:
-        print(f"  WARNING: No baseline for {component}/{scenario_name}, skipping regression check")
+        message = (
+            f"  WARNING: No baseline for {component}/{scenario_name}, skipping regression check"
+        )
+        print(message)
+        if fail_on_regression:
+            raise AssertionError(message)
         return False
 
     threshold_us = baseline_us * factor
     if current_median_us > threshold_us:
-        print(
+        message = (
             f"  REGRESSION DETECTED: {component}/{scenario_name} "
             f"median={current_median_us:.1f} µs > "
             f"threshold={threshold_us:.1f} µs "
             f"(baseline={baseline_us:.1f} µs × {factor}x)"
         )
+        print(message)
+        if fail_on_regression:
+            raise AssertionError(message)
         return True
     else:
         print(

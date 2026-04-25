@@ -1,9 +1,10 @@
 import dataclasses
 from abc import ABC, abstractmethod
 from collections import namedtuple
+from collections.abc import Hashable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Set
+from typing import Optional, Protocol
 
 from strenum import StrEnum
 
@@ -15,6 +16,43 @@ from tensorrt_llm.logger import logger
 from ..llm_request import LlmRequest, LlmRequestState
 
 RequestList = list[LlmRequest]
+PrefixBlockKey = Hashable
+
+
+class PrefixReuseSummaryProtocol(Protocol):
+    reusable_blocks_allocated: int
+    reusable_blocks_all: int
+    first_new_block: PrefixBlockKey | None
+
+
+class KVCacheStatsProtocol(Protocol):
+    num_free_blocks_per_window_size: dict[int, int]
+
+
+class NoEvictKVCacheManagerProtocol(Protocol):
+    def get_kv_cache_stats(self) -> KVCacheStatsProtocol: ...
+
+    def get_remaining_blocks_to_completion(
+        self,
+        req: LlmRequest,
+        window_size: int,
+        cached_summary: PrefixReuseSummaryProtocol | None = None,
+    ) -> int: ...
+
+
+class MaxUtilizationKVCacheManagerProtocol(NoEvictKVCacheManagerProtocol, Protocol):
+    max_attention_window_vec: list[int]
+
+    def get_needed_blocks_one_step(
+        self,
+        req: LlmRequest,
+        two_step_lookahead: bool,
+        window_size: int,
+        cached_summary: PrefixReuseSummaryProtocol | None = None,
+    ) -> int: ...
+
+    def scheduling_has_free_blocks(self, total: int, window_size: int) -> bool: ...
+
 
 SchedulerOutput = namedtuple(
     "SchedulerOutput",
@@ -874,8 +912,8 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
 
         skipping_is_relevant = scheduler._is_skipping_relevant()
 
-        newly_contributed_context_blocks: Set = set()
-        newly_contributed_cross_context_blocks: Set = set()
+        newly_contributed_context_blocks: set[PrefixBlockKey] = set()
+        newly_contributed_cross_context_blocks: set[PrefixBlockKey] = set()
         if not self.static_batch and skipping_is_relevant:
             newly_contributed_context_blocks, newly_contributed_cross_context_blocks = (
                 scheduler._prefill_contributed_blocks(active_requests)
@@ -928,12 +966,14 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
 
             for requests in [pending_dis_gen_init_requests, pending_requests]:
                 for req in requests:
+                    summary, cross_summary = scheduler._analyze_prefix_reuse_for_first_context(req)
                     if (
                         not self.static_batch
                         and skipping_is_relevant
                         and not req.is_disagg_generation_init_state
-                        and scheduler._beneficial_to_skip(
-                            req,
+                        and scheduler._beneficial_to_skip_with_summaries(
+                            summary,
+                            cross_summary,
                             newly_contributed_context_blocks,
                             newly_contributed_cross_context_blocks,
                         )
@@ -944,10 +984,12 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                         break
 
                     if req.is_context_init_state or req.is_disagg_generation_init_state:
-                        enough_blocks = reserved_blocks.enough_available_blocks(req)
+                        enough_blocks = reserved_blocks.enough_available_blocks(req, summary)
                         enough_cross_blocks = True
                         if reserved_cross_blocks is not None:
-                            enough_cross_blocks = reserved_cross_blocks.enough_available_blocks(req)
+                            enough_cross_blocks = reserved_cross_blocks.enough_available_blocks(
+                                req, cross_summary
+                            )
 
                         if not enough_blocks or not enough_cross_blocks:
                             break
@@ -964,9 +1006,9 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                                 uniq_task_ids.add(lora_task_id)
 
                         scheduled_requests.append(req)
-                        reserved_blocks.decrement_reserved_blocks(req)
+                        reserved_blocks.commit_blocks()
                         if reserved_cross_blocks is not None:
-                            reserved_cross_blocks.decrement_reserved_blocks(req)
+                            reserved_cross_blocks.commit_blocks()
 
         return scheduled_requests, []
 
@@ -1019,8 +1061,10 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                 req_it += 1
                 continue
 
-            if skipping_is_relevant and scheduler._beneficial_to_skip(
-                req, newly_contributed_context_blocks, set()
+            summary, _ = scheduler._analyze_prefix_reuse_for_first_context(req)
+
+            if skipping_is_relevant and scheduler._beneficial_to_skip_with_summaries(
+                summary, None, newly_contributed_context_blocks, set()
             ):
                 req_it += 1
                 continue
@@ -1032,6 +1076,7 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                 scheduled_blocks_manager,
                 num_scheduled_peft_pages,
                 seen_task_ids,
+                summary,
             )
 
             if was_scheduled:
@@ -1065,11 +1110,14 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
         scheduled_blocks_manager: "MaxUtilizationScheduledBlocksManager",
         num_scheduled_peft_pages: int,
         seen_task_ids: set[int],
+        cached_summary: PrefixReuseSummaryProtocol | None,
     ) -> bool:
         if len(scheduled_requests) >= scheduler.max_num_requests:
             return False
 
-        blocks_if_scheduled = scheduled_blocks_manager.prepare_blocks_if_schedulable(req)
+        blocks_if_scheduled = scheduled_blocks_manager.prepare_blocks_if_schedulable(
+            req, cached_summary
+        )
         if blocks_if_scheduled is None:
             return False
 
@@ -1104,7 +1152,7 @@ class NoEvictScheduledBlocksManager:
     Reference: cpp/tensorrt_llm/batch_manager/scheduledBlocksManager.h:29-62
     """
 
-    def __init__(self, kv_cache_manager):
+    def __init__(self, kv_cache_manager: NoEvictKVCacheManagerProtocol) -> None:
         """
         Initialize with free blocks from KVCacheManager.
         C++ equivalent: mAvailableBlocks = mKvCacheManager.getBlockManager().getNumFreeBlocksPerWindowSize()
@@ -1112,25 +1160,41 @@ class NoEvictScheduledBlocksManager:
         self.kv_cache_manager = kv_cache_manager
         stats = kv_cache_manager.get_kv_cache_stats()
         self.available_blocks: dict[int, int] = dict(stats.num_free_blocks_per_window_size)
+        self._cached_needed_blocks: list[tuple[int, int]] = []
 
-    def decrement_reserved_blocks(self, req: LlmRequest) -> None:
+    def decrement_reserved_blocks(
+        self, req: LlmRequest, cached_summary: PrefixReuseSummaryProtocol | None = None
+    ) -> None:
         """
         Decrement available blocks by the blocks needed to complete this request.
         C++ reference: scheduledBlocksManager.h:40-46
         """
-        for window_size in self.available_blocks:
-            needed = self.kv_cache_manager.get_remaining_blocks_to_completion(req, window_size)
-            self.available_blocks[window_size] -= needed
+        self.enough_available_blocks(req, cached_summary)
+        self.commit_blocks()
 
-    def enough_available_blocks(self, req: LlmRequest) -> bool:
+    def enough_available_blocks(
+        self, req: LlmRequest, cached_summary: PrefixReuseSummaryProtocol | None = None
+    ) -> bool:
         """
         Check if there are enough available blocks for this request across all window sizes.
         C++ reference: scheduledBlocksManager.h:48-57
         """
-        return all(
-            self.kv_cache_manager.get_remaining_blocks_to_completion(req, ws) <= avail
-            for ws, avail in self.available_blocks.items()
-        )
+        self._cached_needed_blocks.clear()
+        enough = True
+        for window_size, available in self.available_blocks.items():
+            needed = self.kv_cache_manager.get_remaining_blocks_to_completion(
+                req, window_size, cached_summary
+            )
+            self._cached_needed_blocks.append((window_size, needed))
+            if needed > available:
+                enough = False
+        return enough
+
+    def commit_blocks(self) -> None:
+        """Commit the block counts cached by the last enough_available_blocks call."""
+        for window_size, needed in self._cached_needed_blocks:
+            self.available_blocks[window_size] -= needed
+        self._cached_needed_blocks.clear()
 
 
 class MaxUtilizationScheduledBlocksManager:
@@ -1141,7 +1205,9 @@ class MaxUtilizationScheduledBlocksManager:
     Reference: cpp/tensorrt_llm/batch_manager/scheduledBlocksManager.h:64-117
     """
 
-    def __init__(self, kv_cache_manager, two_steps_look_ahead: bool):
+    def __init__(
+        self, kv_cache_manager: MaxUtilizationKVCacheManagerProtocol, two_steps_look_ahead: bool
+    ) -> None:
         """
         Initialize scheduled blocks count per window size.
         C++ equivalent: iterate windowSizes and set mNumScheduledBlocks[windowSize] = 0
@@ -1151,7 +1217,9 @@ class MaxUtilizationScheduledBlocksManager:
         window_sizes = set(kv_cache_manager.max_attention_window_vec)
         self.num_scheduled_blocks: dict[int, int] = {ws: 0 for ws in window_sizes}
 
-    def prepare_blocks_if_schedulable(self, req: LlmRequest) -> Optional[dict[int, int]]:
+    def prepare_blocks_if_schedulable(
+        self, req: LlmRequest, cached_summary: PrefixReuseSummaryProtocol | None = None
+    ) -> Optional[dict[int, int]]:
         """
         Check if request can be scheduled and return new block counts if so.
         Returns None if request cannot fit.
@@ -1160,7 +1228,7 @@ class MaxUtilizationScheduledBlocksManager:
         blocks_if_scheduled = {}
         for window_size, num_scheduled in self.num_scheduled_blocks.items():
             required = self.kv_cache_manager.get_needed_blocks_one_step(
-                req, self.two_steps_look_ahead, window_size
+                req, self.two_steps_look_ahead, window_size, cached_summary
             )
             logger.debug(
                 f"MaxUtilizationScheduler: request ID {req.request_id} "
@@ -1290,15 +1358,17 @@ class PyCapacityScheduler:
             return False
         return True
 
-    def _prefill_contributed_blocks(self, active_requests: RequestList) -> tuple[set, set]:
+    def _prefill_contributed_blocks(
+        self, active_requests: RequestList
+    ) -> tuple[set[PrefixBlockKey], set[PrefixBlockKey]]:
         """
         Collect blocks contributed by chunked context requests already executing.
         These blocks can be reused by later requests.
 
         C++ reference: capacityScheduler.cpp:34-68 (prefillWithChunkedContextsAlreadyExecuting)
         """
-        newly_contributed_context_blocks: Set = set()
-        newly_contributed_cross_context_blocks: Set = set()
+        newly_contributed_context_blocks: set[PrefixBlockKey] = set()
+        newly_contributed_cross_context_blocks: set[PrefixBlockKey] = set()
 
         if self.kv_cache_manager is None:
             return newly_contributed_context_blocks, newly_contributed_cross_context_blocks
@@ -1330,11 +1400,76 @@ class PyCapacityScheduler:
 
         return newly_contributed_context_blocks, newly_contributed_cross_context_blocks
 
+    def _analyze_prefix_reuse_for_first_context(
+        self, req: LlmRequest
+    ) -> tuple[PrefixReuseSummaryProtocol | None, PrefixReuseSummaryProtocol | None]:
+        """Analyze first-chunk context reuse once so skip and budget checks can share it."""
+        if not (
+            req.is_context_init_state
+            and req.is_first_context_chunk
+            and not req.is_disagg_generation_init_state
+        ):
+            return None, None
+
+        summary: PrefixReuseSummaryProtocol | None = None
+        cross_summary: PrefixReuseSummaryProtocol | None = None
+
+        if (
+            self.kv_cache_manager is not None
+            and self.kv_cache_manager.enable_block_reuse
+            and not self.kv_cache_manager.is_variable_window
+        ):
+            summary = self.kv_cache_manager.analyze_prefix_reuse(req.get_unique_tokens(0), req)
+
+        if (
+            self.cross_kv_cache_manager is not None
+            and self.cross_kv_cache_manager.enable_block_reuse
+            and not self.cross_kv_cache_manager.is_variable_window
+        ):
+            encoder_unique_tokens = req.get_encoder_unique_tokens()
+            if encoder_unique_tokens is not None:
+                cross_summary = self.cross_kv_cache_manager.analyze_prefix_reuse(
+                    encoder_unique_tokens, req
+                )
+
+        return summary, cross_summary
+
+    def _beneficial_to_skip_with_summaries(
+        self,
+        summary: PrefixReuseSummaryProtocol | None,
+        cross_summary: PrefixReuseSummaryProtocol | None,
+        newly_contributed_context_blocks: set[PrefixBlockKey],
+        newly_contributed_cross_context_blocks: set[PrefixBlockKey],
+    ) -> bool:
+        """
+        Check beneficial-to-skip using already-computed reuse summaries.
+
+        When the request is not skipped, registers first-new-block contributions
+        so subsequent duplicate first-context chunks can be deferred.
+        """
+        ctx_new_block = summary.first_new_block if summary is not None else None
+        if ctx_new_block is not None and ctx_new_block in newly_contributed_context_blocks:
+            return True
+
+        cross_new_block = cross_summary.first_new_block if cross_summary is not None else None
+        if (
+            cross_new_block is not None
+            and cross_new_block in newly_contributed_cross_context_blocks
+        ):
+            return True
+
+        if ctx_new_block is not None:
+            newly_contributed_context_blocks.add(ctx_new_block)
+        if cross_new_block is not None:
+            newly_contributed_cross_context_blocks.add(cross_new_block)
+
+        return False
+
     def _beneficial_to_skip(
         self,
         req: LlmRequest,
-        newly_contributed_context_blocks: set,
-        newly_contributed_cross_context_blocks: set,
+        newly_contributed_context_blocks: set[PrefixBlockKey],
+        newly_contributed_cross_context_blocks: set[PrefixBlockKey],
     ) -> bool:
         """
         Check if it's beneficial to skip this request.
@@ -1348,40 +1483,13 @@ class PyCapacityScheduler:
         """
         if not (req.is_context_init_state and req.is_first_context_chunk):
             return False
-
-        ctx_new_block = None
-        cross_new_block = None
-
-        if self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse:
-            unique_tokens = req.get_unique_tokens(0)
-            summary = self.kv_cache_manager.analyze_prefix_reuse(unique_tokens, req)
-            if summary.first_new_block is not None:
-                if summary.first_new_block in newly_contributed_context_blocks:
-                    return True
-                ctx_new_block = summary.first_new_block
-
-        if (
-            self.cross_kv_cache_manager is not None
-            and self.cross_kv_cache_manager.enable_block_reuse
-        ):
-            encoder_unique_tokens = req.get_encoder_unique_tokens()
-            if encoder_unique_tokens is not None:
-                summary = self.cross_kv_cache_manager.analyze_prefix_reuse(
-                    encoder_unique_tokens, req
-                )
-                if summary.first_new_block is not None:
-                    if summary.first_new_block in newly_contributed_cross_context_blocks:
-                        return True
-                    cross_new_block = summary.first_new_block
-
-        # Request is NOT skipped — register contributions so subsequent duplicate
-        # requests can be deferred correctly.
-        if ctx_new_block is not None:
-            newly_contributed_context_blocks.add(ctx_new_block)
-        if cross_new_block is not None:
-            newly_contributed_cross_context_blocks.add(cross_new_block)
-
-        return False
+        summary, cross_summary = self._analyze_prefix_reuse_for_first_context(req)
+        return self._beneficial_to_skip_with_summaries(
+            summary,
+            cross_summary,
+            newly_contributed_context_blocks,
+            newly_contributed_cross_context_blocks,
+        )
 
     def _get_max_peft_pages(self) -> int:
         """Get maximum PEFT cache pages."""
