@@ -4260,13 +4260,14 @@ void KVCacheManager::addSequenceBatch(
         {
             auto const reusablePrepopulatedLen
                 = hasNonSwaWindow[i] ? minNonSwaPrepopulatedLen[i] : minPrepopulatedLen[i];
-            // There is one request-level cached-prefix scalar. In mixed
-            // full+SWA models it must track the full-attention reusable prefix:
-            // SWA layers use their bounded physical tail, while full-attention
-            // layers would lose long-prefix reuse if a missing SWA tail capped
-            // this shared scalar.
+            // There is still one request-level prepopulated cursor shared by
+            // full-attention and SWA layers. Select the largest prefix that is
+            // safe for every window. A promptLen-window cap is only a
+            // counterfactual diagnostic: it can be too conservative when SWA has
+            // the needed prefix cached, and unsafe when SWA's own safe prefix is
+            // shorter than that cap.
             auto const swaSafePrepopulatedLen = hasSwaWindow[i] ? minSwaPrepopulatedLen[i] : reusablePrepopulatedLen;
-            auto const selectedPrepopulatedLen = reusablePrepopulatedLen;
+            auto const selectedPrepopulatedLen = std::min(reusablePrepopulatedLen, swaSafePrepopulatedLen);
             if (logKvReuseDebug)
             {
                 auto const smallestSwaWindow = getSmallestSwaWindow(mBlockManager.getWindowSizesMetadata());
