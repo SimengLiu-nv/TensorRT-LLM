@@ -1037,6 +1037,15 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     // Wire the dummy root block into the shared lookup tree so that direct children
     // can navigate to it via getPrevBlock() and blockInRadixTree() returns true for them.
     mCachedBlocksRoot->setAsRoot(mLookupTree->getRoot(), mWindowSize);
+
+    if (isKvCacheReuseDebugLoggingEnabled())
+    {
+        TLLM_LOG_INFO(
+            "[kv-reuse-debug] %s::pool-config window=%d isSWA=%s managedLayers=%zu primaryBlocks=%d "
+            "secondaryBlocks=%d tokensPerBlock=%d maxNumSequences=%d",
+            mLogPrefix.c_str(), mWindowSize, logBool(mIsSWA), managedLayers.size(), mNumPrimaryBlocks,
+            mNumSecondaryBlocks, mTokensPerBlock, maxNumSequences);
+    }
 }
 
 WindowBlockManager::~WindowBlockManager()
@@ -1058,6 +1067,74 @@ WindowBlockManager::~WindowBlockManager()
     TLLM_LOG_DEBUG("%s - reused tokens:                       %.0f ", mLogPrefix.c_str(), mReusedTokens);
     TLLM_LOG_DEBUG("%s - reused tokens percentage (%%):        %.2f ", mLogPrefix.c_str(),
         100.0 * mReusedTokens / mTotalInputTokens);
+}
+
+void WindowBlockManager::updateSwaDebugNewestRealBlock(
+    BlockPtr const& block, SizeType32 prefixTokens, char const* reason)
+{
+    if (!mIsSWA || !block || block->isPlaceholder())
+    {
+        return;
+    }
+
+    bool const hadValidAnchor = mSwaDebugHistory.newestRealAnchorValid;
+    bool const advancesPrefix = !hadValidAnchor || prefixTokens > mSwaDebugHistory.newestRealPrefixTokens;
+    if (!advancesPrefix)
+    {
+        return;
+    }
+
+    auto const previousBlockId = mSwaDebugHistory.newestRealBlockId;
+    auto const previousPrefixTokens = mSwaDebugHistory.newestRealPrefixTokens;
+    mSwaDebugHistory.newestRealBlockId = block->getBlockId();
+    mSwaDebugHistory.newestRealPrefixTokens = prefixTokens;
+    mSwaDebugHistory.newestRealAnchorValid = true;
+
+    if (isKvCacheReuseDebugLoggingEnabled())
+    {
+        auto const primaryFreeBlocks = getNumFreeBlocks();
+        auto const primaryUsedBlocks = getNumPrimaryBlocks() - primaryFreeBlocks;
+        TLLM_LOG_INFO(
+            "[kv-reuse-debug] %s::swa-newest-real reason=%s blockId=%d prefixTokens=%d previousValid=%s "
+            "previousBlockId=%d previousPrefixTokens=%d primaryUsedBlocks=%d primaryFreeBlocks=%d primaryMaxBlocks=%d",
+            mLogPrefix.c_str(), reason, block->getBlockId(), prefixTokens, logBool(hadValidAnchor), previousBlockId,
+            previousPrefixTokens, primaryUsedBlocks, primaryFreeBlocks, getNumPrimaryBlocks());
+    }
+}
+
+void WindowBlockManager::noteSwaDebugEvictedBlock(BlockPtr const& block, char const* reason)
+{
+    if (!mIsSWA || !block || block->isPlaceholder() || block->getUniqueTokens().empty())
+    {
+        return;
+    }
+
+    ++mSwaDebugHistory.evictedStoredBlocks;
+    bool const wasNewest
+        = mSwaDebugHistory.newestRealAnchorValid && block->getBlockId() == mSwaDebugHistory.newestRealBlockId;
+    auto const lostPrefixTokens = wasNewest ? mSwaDebugHistory.newestRealPrefixTokens : SizeType32{0};
+    if (wasNewest)
+    {
+        ++mSwaDebugHistory.evictedNewestBlocks;
+        mSwaDebugHistory.newestRealAnchorValid = false;
+        mSwaDebugHistory.newestRealPrefixTokens = 0;
+        mSwaDebugHistory.newestRealBlockId = KVCacheBlock::kCachedBlocksRootId;
+    }
+
+    if (isKvCacheReuseDebugLoggingEnabled())
+    {
+        auto const primaryFreeBlocks = getNumFreeBlocks();
+        auto const primaryUsedBlocks = getNumPrimaryBlocks() - primaryFreeBlocks;
+        TLLM_LOG_INFO(
+            "[kv-reuse-debug] %s::swa-real-evicted reason=%s blockId=%d wasNewest=%s lostPrefixTokens=%d "
+            "uniqueTokens=%zu evictedStoredBlocks=%llu evictedNewestBlocks=%llu newestValid=%s newestBlockId=%d "
+            "newestPrefixTokens=%d primaryUsedBlocks=%d primaryFreeBlocks=%d primaryMaxBlocks=%d",
+            mLogPrefix.c_str(), reason, block->getBlockId(), logBool(wasNewest), lostPrefixTokens,
+            block->getUniqueTokens().size(), static_cast<unsigned long long>(mSwaDebugHistory.evictedStoredBlocks),
+            static_cast<unsigned long long>(mSwaDebugHistory.evictedNewestBlocks),
+            logBool(mSwaDebugHistory.newestRealAnchorValid), mSwaDebugHistory.newestRealBlockId,
+            mSwaDebugHistory.newestRealPrefixTokens, primaryUsedBlocks, primaryFreeBlocks, getNumPrimaryBlocks());
+    }
 }
 
 bool BlockManager::verifyQueueIntegrity(SizeType32 windowSize) const
@@ -1369,6 +1446,10 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         {
             mEventManager->enqueueRemovedEvent(block, mWindowSize);
         }
+        if (mIsSWA && blockInRadixTree(block))
+        {
+            noteSwaDebugEvictedBlock(block, "getFreeBlock-repurpose");
+        }
         block->detachFromLookupNode();
     }
     // Claim the block in primary block queue
@@ -1529,6 +1610,15 @@ PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
     }
     summary.totalMatchedTokens = reuseMatches.totalMatchedTokens;
     summary.firstNewBlock = reuseMatches.firstNewBlock;
+    summary.exactNodesVisited = reuseMatches.exactNodesVisited;
+    summary.realValueMatches = reuseMatches.realValueMatches;
+    summary.valueLessTraversalNodes = reuseMatches.valueLessTraversalNodes;
+    summary.partialValueMatches = reuseMatches.partialValueMatches;
+    summary.latestMissingAnchorEndToken = reuseMatches.latestMissingAnchorEndToken;
+    summary.committedPrefixAfterMissingAnchor = reuseMatches.committedPrefixAfterMissingAnchor;
+    summary.latestRealValueEndToken = reuseMatches.latestRealValueEndToken;
+    summary.trailingRealValueBlocks = reuseMatches.trailingRealValueBlocks;
+    summary.trailingRealValueTokens = reuseMatches.trailingRealValueTokens;
 
     TLLM_LOG_DEBUG(
         "%s::analyzePrefixReuse - reusableAllocated=%d, reusableAll=%d, totalMatchedTokens=%d, "
@@ -1544,6 +1634,27 @@ PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
             blockKeys.size(), summary.reusableBlocksAllocated, summary.reusableBlocksAll, summary.totalMatchedTokens,
             logBool(summary.firstNewBlock.has_value()),
             summary.firstNewBlock.has_value() ? summary.firstNewBlock->uniqueTokens.size() : 0);
+        TLLM_LOG_INFO(
+            "[kv-reuse-debug] %s::analyzePrefixReuse-path request=%lu window=%d isSWA=%s exactNodesVisited=%d "
+            "realValueMatches=%d valueLessTraversalNodes=%d partialValueMatches=%d latestMissingAnchorEndToken=%d "
+            "committedPrefixAfterMissingAnchor=%d latestRealValueEndToken=%d trailingRealValueBlocks=%d "
+            "trailingRealValueTokens=%d newestSwaAnchorValid=%s newestSwaAnchorBlockId=%d "
+            "newestSwaAnchorPrefixTokens=%d swaRealStores=%llu swaExistingRealStores=%llu "
+            "swaOowPlaceholders=%llu swaOowAnchorHits=%llu swaOowAnchorMisses=%llu swaOowDetachReplacements=%llu "
+            "swaEvictedStoredBlocks=%llu swaEvictedNewestBlocks=%llu",
+            mLogPrefix.c_str(), llmRequest.mRequestId, mWindowSize, logBool(mIsSWA), summary.exactNodesVisited,
+            summary.realValueMatches, summary.valueLessTraversalNodes, summary.partialValueMatches,
+            summary.latestMissingAnchorEndToken, summary.committedPrefixAfterMissingAnchor,
+            summary.latestRealValueEndToken, summary.trailingRealValueBlocks, summary.trailingRealValueTokens,
+            logBool(mSwaDebugHistory.newestRealAnchorValid), mSwaDebugHistory.newestRealBlockId,
+            mSwaDebugHistory.newestRealPrefixTokens, static_cast<unsigned long long>(mSwaDebugHistory.realStores),
+            static_cast<unsigned long long>(mSwaDebugHistory.existingRealStores),
+            static_cast<unsigned long long>(mSwaDebugHistory.oowPlaceholders),
+            static_cast<unsigned long long>(mSwaDebugHistory.oowPlaceholderAnchorHits),
+            static_cast<unsigned long long>(mSwaDebugHistory.oowPlaceholderAnchorMisses),
+            static_cast<unsigned long long>(mSwaDebugHistory.oowDetachReplacements),
+            static_cast<unsigned long long>(mSwaDebugHistory.evictedStoredBlocks),
+            static_cast<unsigned long long>(mSwaDebugHistory.evictedNewestBlocks));
     }
     return summary;
 }
@@ -1558,6 +1669,9 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
     auto searchNode = mCachedBlocksRoot ? mCachedBlocksRoot->getLookupNode() : nullptr;
     SizeType32 candidateMatchedTokens{0};
     SizeType32 latestMissingAnchorEndToken{0};
+    SizeType32 candidateLatestRealValueEndToken{0};
+    SizeType32 candidateTrailingRealValueBlocks{0};
+    SizeType32 candidateTrailingRealValueTokens{0};
 
     auto updateSafePrefix = [&]()
     {
@@ -1566,6 +1680,13 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
         {
             result.matches = candidateMatches;
             result.totalMatchedTokens = candidateMatchedTokens;
+            result.latestRealValueEndToken = candidateLatestRealValueEndToken;
+            result.trailingRealValueBlocks = candidateTrailingRealValueBlocks;
+            result.trailingRealValueTokens = candidateTrailingRealValueTokens;
+            if (latestMissingAnchorEndToken > 0)
+            {
+                result.committedPrefixAfterMissingAnchor = candidateMatchedTokens;
+            }
         }
     };
 
@@ -1579,6 +1700,7 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
         auto exactMatch = searchNode->findMatchingNode(blockKey);
         if (exactMatch.has_value())
         {
+            ++result.exactNodesVisited;
             auto const numMatchedTokens = static_cast<SizeType32>(blockKey.uniqueTokens.size());
             if (candidateMatchedTokens + numMatchedTokens > maxMatchedTokens)
             {
@@ -1592,12 +1714,20 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
             if (existing.has_value() && *existing)
             {
                 auto block = *existing;
+                ++result.realValueMatches;
                 candidateMatches.push_back(ReuseMatch{block, numMatchedTokens, !block->isFull(), false});
+                candidateLatestRealValueEndToken = candidateMatchedTokens;
+                ++candidateTrailingRealValueBlocks;
+                candidateTrailingRealValueTokens += numMatchedTokens;
             }
             else if (mIsSWA)
             {
+                ++result.valueLessTraversalNodes;
                 candidateMatches.push_back(ReuseMatch{nullptr, numMatchedTokens, false, true});
                 latestMissingAnchorEndToken = std::max(latestMissingAnchorEndToken, candidateMatchedTokens);
+                result.latestMissingAnchorEndToken = latestMissingAnchorEndToken;
+                candidateTrailingRealValueBlocks = 0;
+                candidateTrailingRealValueTokens = 0;
             }
             else
             {
@@ -1627,7 +1757,11 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
                     if (candidateMatchedTokens + numMatchedTokens <= maxMatchedTokens)
                     {
                         candidateMatchedTokens += numMatchedTokens;
+                        ++result.partialValueMatches;
                         candidateMatches.push_back(ReuseMatch{block, numMatchedTokens, true, false});
+                        candidateLatestRealValueEndToken = candidateMatchedTokens;
+                        ++candidateTrailingRealValueBlocks;
+                        candidateTrailingRealValueTokens += numMatchedTokens;
                         updateSafePrefix();
                     }
                     break;
@@ -2638,12 +2772,19 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
     std::vector<KVCacheBlock::IdType> pinnedBlockIds;
     // prevBlock tracks the trie-level parent used for hash chaining and setPrevBlockInSeq.
     BlockPtr prevBlock = mCachedBlocksRoot;
+    SizeType32 prefixEndTokens = 0;
+    SizeType32 debugRealInserted = 0;
+    SizeType32 debugExistingReal = 0;
+    SizeType32 debugOowPlaceholders = 0;
+    SizeType32 debugOowAnchorHits = 0;
+    SizeType32 debugOowAnchorMisses = 0;
 
     for (std::size_t i = 0; i < nodeMatches.exactMatches.size() && i < numBlocks; ++i)
     {
         auto const& node = nodeMatches.exactMatches[i].node;
         auto const& block = blocks[i];
         auto const& blockKey = blockKeys[i];
+        prefixEndTokens += static_cast<SizeType32>(blockKey.uniqueTokens.size());
 
         if (block->isPlaceholder())
         {
@@ -2661,12 +2802,28 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             if (block->getBlockId() == KVCacheBlock::kPlaceholderBlockId)
             {
                 // SWA on-demand placeholder path.
+                if (mIsSWA)
+                {
+                    ++debugOowPlaceholders;
+                    ++mSwaDebugHistory.oowPlaceholders;
+                }
                 if (existing.has_value() && *existing)
                 {
+                    if (mIsSWA)
+                    {
+                        ++debugOowAnchorHits;
+                        ++mSwaDebugHistory.oowPlaceholderAnchorHits;
+                        updateSwaDebugNewestRealBlock(*existing, prefixEndTokens, "store-oow-placeholder-anchor");
+                    }
                     TLLM_LOG_DEBUG("%s::storeBlocks - OOW placeholder at %zu, found anchor block %d in trie",
                         mLogPrefix.c_str(), i, (*existing)->getBlockId());
                     prevBlock = *existing;
                     continue;
+                }
+                if (mIsSWA)
+                {
+                    ++debugOowAnchorMisses;
+                    ++mSwaDebugHistory.oowPlaceholderAnchorMisses;
                 }
                 TLLM_LOG_DEBUG(
                     "%s::storeBlocks - OOW placeholder at %zu, anchor block evicted; continuing past missing anchor",
@@ -2722,6 +2879,12 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             // Trie slot already occupied (block previously stored by this or another sequence).
             // Advance prevBlock and continue. Subsequent blocks may still need
             // storing as children of this node.
+            if (mIsSWA && *existing && !(*existing)->isPlaceholder())
+            {
+                ++debugExistingReal;
+                ++mSwaDebugHistory.existingRealStores;
+                updateSwaDebugNewestRealBlock(*existing, prefixEndTokens, "store-existing-real");
+            }
             TLLM_LOG_DEBUG("%s::storeBlocks - Block %d: slot occupied by %d, skipping", mLogPrefix.c_str(), bid,
                 (*existing)->getBlockId());
             prevBlock = *existing;
@@ -2747,6 +2910,12 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             storedBlocks.push_back(block);
             prevBlock = block;
             numBlocksStoredForReuse++;
+            if (mIsSWA)
+            {
+                ++debugRealInserted;
+                ++mSwaDebugHistory.realStores;
+                updateSwaDebugNewestRealBlock(block, prefixEndTokens, "store-new-real");
+            }
         }
 
         if (pinBlocks)
@@ -2784,6 +2953,30 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
         {
             mEventManager->enqueueStoredEvent(nonPlaceholderStoredBlocks, mWindowSize);
         }
+    }
+    if (mIsSWA && isKvCacheReuseDebugLoggingEnabled())
+    {
+        auto const primaryFreeBlocks = getNumFreeBlocks();
+        auto const primaryUsedBlocks = getNumPrimaryBlocks() - primaryFreeBlocks;
+        TLLM_LOG_INFO(
+            "[kv-reuse-debug] %s::storeBlocks-swa-summary blockKeys=%zu blocks=%zu realInserted=%d "
+            "existingReal=%d oowPlaceholders=%d oowAnchorHits=%d oowAnchorMisses=%d storedThisCall=%d "
+            "newestValid=%s newestBlockId=%d newestPrefixTokens=%d realStores=%llu existingRealStores=%llu "
+            "oowPlaceholdersTotal=%llu oowAnchorHitsTotal=%llu oowAnchorMissesTotal=%llu evictedStoredBlocks=%llu "
+            "evictedNewestBlocks=%llu oowDetachReplacementsTotal=%llu primaryUsedBlocks=%d primaryFreeBlocks=%d "
+            "primaryMaxBlocks=%d",
+            mLogPrefix.c_str(), blockKeys.size(), blocks.size(), debugRealInserted, debugExistingReal,
+            debugOowPlaceholders, debugOowAnchorHits, debugOowAnchorMisses, numBlocksStoredForReuse,
+            logBool(mSwaDebugHistory.newestRealAnchorValid), mSwaDebugHistory.newestRealBlockId,
+            mSwaDebugHistory.newestRealPrefixTokens, static_cast<unsigned long long>(mSwaDebugHistory.realStores),
+            static_cast<unsigned long long>(mSwaDebugHistory.existingRealStores),
+            static_cast<unsigned long long>(mSwaDebugHistory.oowPlaceholders),
+            static_cast<unsigned long long>(mSwaDebugHistory.oowPlaceholderAnchorHits),
+            static_cast<unsigned long long>(mSwaDebugHistory.oowPlaceholderAnchorMisses),
+            static_cast<unsigned long long>(mSwaDebugHistory.evictedStoredBlocks),
+            static_cast<unsigned long long>(mSwaDebugHistory.evictedNewestBlocks),
+            static_cast<unsigned long long>(mSwaDebugHistory.oowDetachReplacements), primaryUsedBlocks,
+            primaryFreeBlocks, getNumPrimaryBlocks());
     }
     return {numBlocksStoredForReuse, pinnedBlockIds};
 }
@@ -3489,6 +3682,9 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             req.setEstimatedReusableTokens(estimatedReusableTokens);
             if (logKvReuseDebug)
             {
+                auto const primaryMaxBlocks = mBlockManager.getNumPrimaryBlocks(windowSize);
+                auto const primaryFreeBlocks = mBlockManager.getNumFreeBlocks(windowSize);
+                auto const primaryUsedBlocks = primaryMaxBlocks - primaryFreeBlocks;
                 TLLM_LOG_INFO(
                     "[kv-reuse-debug] KVCacheManager::getNeededBlocksOneStep request=%lu window=%d isSWA=%s "
                     "contextInit=%s firstContextChunk=%s disaggGenInit=%s twoStepsLookAhead=%s promptLen=%d "
@@ -3496,7 +3692,11 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
                     "numSharedBlocks=%d numUnSharedTokens=%d numUnSharedBlocks=%d requiredBeforeReuse=%d "
                     "cachedSummary=%s reusableBlocksAllocated=%d reusableBlocksAll=%d totalMatchedTokens=%d "
                     "promptInputLen=%d maxRecoverableSharedBlocks=%d reusableSharedBlocks=%d "
-                    "maxRecoverableTokensForReuse=%d requiredAfterReuse=%d estimatedReusableTokens=%d",
+                    "maxRecoverableTokensForReuse=%d requiredAfterReuse=%d estimatedReusableTokens=%d "
+                    "exactNodesVisited=%d realValueMatches=%d valueLessTraversalNodes=%d partialValueMatches=%d "
+                    "latestMissingAnchorEndToken=%d committedPrefixAfterMissingAnchor=%d latestRealValueEndToken=%d "
+                    "trailingRealValueBlocks=%d trailingRealValueTokens=%d primaryUsedBlocks=%d primaryFreeBlocks=%d "
+                    "primaryMaxBlocks=%d primaryUsedPct=%.2f",
                     req.mRequestId, windowSize, logBool(metadata.isSWA), logBool(req.isContextInitState()),
                     logBool(req.isFirstContextChunk()), logBool(req.isDisaggGenerationInitState()),
                     logBool(twoStepsLookAhead), req.mPromptLen, chunkSize, maxDraftTokensToAdd, getTokensPerBlock(),
@@ -3504,7 +3704,14 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
                     numRequiredBlocksBeforeReuse, logBool(cachedSummary.has_value()), summary.reusableBlocksAllocated,
                     summary.reusableBlocksAll, summary.totalMatchedTokens, promptInputLen, maxRecoverableSharedBlocks,
                     reusableSharedBlocks, maxRecoverableTokensForReuse, numRequiredBlocks,
-                    req.getEstimatedReusableTokens());
+                    req.getEstimatedReusableTokens(), summary.exactNodesVisited, summary.realValueMatches,
+                    summary.valueLessTraversalNodes, summary.partialValueMatches, summary.latestMissingAnchorEndToken,
+                    summary.committedPrefixAfterMissingAnchor, summary.latestRealValueEndToken,
+                    summary.trailingRealValueBlocks, summary.trailingRealValueTokens, primaryUsedBlocks,
+                    primaryFreeBlocks, primaryMaxBlocks,
+                    primaryMaxBlocks > 0
+                        ? 100.0 * static_cast<double>(primaryUsedBlocks) / static_cast<double>(primaryMaxBlocks)
+                        : 0.0);
             }
         }
         else if (logKvReuseDebug)
@@ -3629,6 +3836,15 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
     SizeType32 numReusableBlocksAllocated = 0;
     SizeType32 numReusableBlocksAll = 0;
     SizeType32 summaryTotalMatchedTokens = 0;
+    SizeType32 summaryExactNodesVisited = 0;
+    SizeType32 summaryRealValueMatches = 0;
+    SizeType32 summaryValueLessTraversalNodes = 0;
+    SizeType32 summaryPartialValueMatches = 0;
+    SizeType32 summaryLatestMissingAnchorEndToken = 0;
+    SizeType32 summaryCommittedPrefixAfterMissingAnchor = 0;
+    SizeType32 summaryLatestRealValueEndToken = 0;
+    SizeType32 summaryTrailingRealValueBlocks = 0;
+    SizeType32 summaryTrailingRealValueTokens = 0;
     SizeType32 maxRecoverableBlocksForReuse = 0;
     SizeType32 estimatedReusableTokenBlocks = 0;
     SizeType32 maxRecoverableTokensForReuse = 0;
@@ -3650,6 +3866,15 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
         numReusableBlocksAllocated = summary.reusableBlocksAllocated;
         numReusableBlocksAll = summary.reusableBlocksAll;
         summaryTotalMatchedTokens = summary.totalMatchedTokens;
+        summaryExactNodesVisited = summary.exactNodesVisited;
+        summaryRealValueMatches = summary.realValueMatches;
+        summaryValueLessTraversalNodes = summary.valueLessTraversalNodes;
+        summaryPartialValueMatches = summary.partialValueMatches;
+        summaryLatestMissingAnchorEndToken = summary.latestMissingAnchorEndToken;
+        summaryCommittedPrefixAfterMissingAnchor = summary.committedPrefixAfterMissingAnchor;
+        summaryLatestRealValueEndToken = summary.latestRealValueEndToken;
+        summaryTrailingRealValueBlocks = summary.trailingRealValueBlocks;
+        summaryTrailingRealValueTokens = summary.trailingRealValueTokens;
         numReusableContextBlocks
             = std::min({numReusableBlocksAllocated, numContextBlocks, maxRecoverableBlocksForReuse});
         // Block-shaped token estimate kept for logs/comparison. The value used by
@@ -3697,6 +3922,9 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
 
     if (isKvCacheReuseDebugLoggingEnabled())
     {
+        auto const primaryMaxBlocks = mBlockManager.getNumPrimaryBlocks(windowSize);
+        auto const primaryFreeBlocks = mBlockManager.getNumFreeBlocks(windowSize);
+        auto const primaryUsedBlocks = primaryMaxBlocks - primaryFreeBlocks;
         TLLM_LOG_INFO(
             "[kv-reuse-debug] KVCacheManager::getRemainingBlocksToCompletion request=%lu window=%d isSWA=%s "
             "promptLen=%d maxNewTokens=%d tokensPerBlock=%d temporaryAttentionWindow=%d numContextBlocks=%d "
@@ -3704,14 +3932,25 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
             "reusableBlocksAllocated=%d reusableBlocksAll=%d totalMatchedTokens=%d reusableContextBlocks=%d "
             "estimatedReusableTokens=%d estimatedReusableTokenBlocks=%d maxRecoverableBlocks=%d "
             "maxRecoverableTokensForReuse=%d effectiveContextBlocks=%d isSlidingWindow=%s "
-            "willCrossBlockBoundary=%s willCrossWindowBlockBoundary=%s numExtraBlocksPerBeam=%d remainingBlocks=%d",
+            "willCrossBlockBoundary=%s willCrossWindowBlockBoundary=%s numExtraBlocksPerBeam=%d remainingBlocks=%d "
+            "exactNodesVisited=%d realValueMatches=%d valueLessTraversalNodes=%d partialValueMatches=%d "
+            "latestMissingAnchorEndToken=%d committedPrefixAfterMissingAnchor=%d latestRealValueEndToken=%d "
+            "trailingRealValueBlocks=%d trailingRealValueTokens=%d primaryUsedBlocks=%d primaryFreeBlocks=%d "
+            "primaryMaxBlocks=%d primaryUsedPct=%.2f",
             req.mRequestId, windowSize, logBool(metadata.isSWA), req.mPromptLen, req.mMaxNewTokens, getTokensPerBlock(),
             temporaryAttentionWindow, numContextBlocks, numTotalBlocksPerBeam, numGenBlocksPerBeam,
             numAllocBlocksPerBeam, logBool(cachedSummary.has_value()), numReusableBlocksAllocated, numReusableBlocksAll,
             summaryTotalMatchedTokens, numReusableContextBlocks, req.getEstimatedReusableTokens(),
             estimatedReusableTokenBlocks, maxRecoverableBlocksForReuse, maxRecoverableTokensForReuse,
             effectiveContextBlocks, logBool(isSlidingWindow), logBool(willCrossBlockBoundary),
-            logBool(willCrossWindowBlockBoundary), numExtraBlocksPerBeam, remainingBlocks);
+            logBool(willCrossWindowBlockBoundary), numExtraBlocksPerBeam, remainingBlocks, summaryExactNodesVisited,
+            summaryRealValueMatches, summaryValueLessTraversalNodes, summaryPartialValueMatches,
+            summaryLatestMissingAnchorEndToken, summaryCommittedPrefixAfterMissingAnchor,
+            summaryLatestRealValueEndToken, summaryTrailingRealValueBlocks, summaryTrailingRealValueTokens,
+            primaryUsedBlocks, primaryFreeBlocks, primaryMaxBlocks,
+            primaryMaxBlocks > 0
+                ? 100.0 * static_cast<double>(primaryUsedBlocks) / static_cast<double>(primaryMaxBlocks)
+                : 0.0);
     }
 
     return remainingBlocks;
@@ -3824,6 +4063,29 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
             sequence.changeCacheBlock(mWindowSize, beamIdx, outOfWindowBlockIdx, KVCacheBlock::kPlaceholderBlockId);
             setOffsets(offsetsPtr, offsetsShape, beamIdx, outOfWindowBlockIdx, KVCacheBlock::kPlaceholderBlockId);
             continue;
+        }
+
+        if (mIsSWA && isKvCacheReuseDebugLoggingEnabled())
+        {
+            ++mSwaDebugHistory.oowDetachReplacements;
+            auto const prefixTokens = outOfWindowBlockIdx * mTokensPerBlock
+                + static_cast<SizeType32>(outOfWindowBlock->getUniqueTokens().size());
+            auto const inReuseTree = blockInRadixTree(outOfWindowBlock);
+            if (inReuseTree)
+            {
+                updateSwaDebugNewestRealBlock(outOfWindowBlock, prefixTokens, "detach-oow-real-still-stored");
+            }
+            auto const primaryFreeBlocks = getNumFreeBlocks();
+            auto const primaryUsedBlocks = getNumPrimaryBlocks() - primaryFreeBlocks;
+            TLLM_LOG_INFO(
+                "[kv-reuse-debug] %s::swa-oow-replace request=%lu blockIdx=%d blockId=%d prefixTokens=%d "
+                "inReuseTree=%s newestValid=%s newestBlockId=%d newestPrefixTokens=%d oowDetachReplacements=%llu "
+                "primaryUsedBlocks=%d primaryFreeBlocks=%d primaryMaxBlocks=%d",
+                mLogPrefix.c_str(), requestId, outOfWindowBlockIdx, outOfWindowBlock->getBlockId(), prefixTokens,
+                logBool(inReuseTree), logBool(mSwaDebugHistory.newestRealAnchorValid),
+                mSwaDebugHistory.newestRealBlockId, mSwaDebugHistory.newestRealPrefixTokens,
+                static_cast<unsigned long long>(mSwaDebugHistory.oowDetachReplacements), primaryUsedBlocks,
+                primaryFreeBlocks, getNumPrimaryBlocks());
         }
 
         blockSlot = KVCacheBlock::createPlaceholder();
@@ -3960,19 +4222,27 @@ void KVCacheManager::addSequenceBatch(
                     = hasNonSwaWindow[i] ? minNonSwaPrepopulatedLen[i] : static_cast<SizeType32>(-1);
                 auto const currentMinSwaPrepopulatedLen
                     = hasSwaWindow[i] ? minSwaPrepopulatedLen[i] : static_cast<SizeType32>(-1);
+                auto const primaryMaxBlocks = mBlockManager.getNumPrimaryBlocks(windowSize);
+                auto const primaryFreeBlocks = mBlockManager.getNumFreeBlocks(windowSize);
+                auto const primaryUsedBlocks = primaryMaxBlocks - primaryFreeBlocks;
                 TLLM_LOG_INFO(
                     "[kv-reuse-debug] KVCacheManager::addSequenceBatch window-result request=%lu window=%d isSWA=%s "
                     "promptLen=%d inputLength=%d effectiveInputLength=%d temporaryAttentionWindow=%d maxTokenNum=%d "
                     "tokensPerBlock=%d numContextBlocks=%d firstRealBlockIdx=%d physicalContextBlocks=%d "
                     "windowPrepopulatedLen=%d minAllPrepopulatedLen=%d hasNonSwaWindow=%s "
                     "minNonSwaPrepopulatedLen=%d hasSwaWindow=%s minSwaPrepopulatedLen=%d allocTotalDelta=%d "
-                    "allocNewDelta=%d reusedDelta=%d missedDelta=%d",
+                    "allocNewDelta=%d reusedDelta=%d missedDelta=%d primaryUsedBlocks=%d primaryFreeBlocks=%d "
+                    "primaryMaxBlocks=%d primaryUsedPct=%.2f",
                     llmRequests[i].get().mRequestId, windowSize, logBool(metadata.isSWA), promptLen,
                     std::get<1>(requestInfos[i]), inputLengths[i], temporaryAttentionWindow, maxTokenNum,
                     getTokensPerBlock(), numContextBlocksVec[i], firstRealBlockIdxVec[i], physicalContextBlocks,
                     stats.prepopulatedLen, minPrepopulatedLen[i], logBool(hasNonSwaWindow[i]),
                     currentMinNonSwaPrepopulatedLen, logBool(hasSwaWindow[i]), currentMinSwaPrepopulatedLen,
-                    stats.allocTotalDelta, stats.allocNewDelta, stats.reusedDelta, stats.missedDelta);
+                    stats.allocTotalDelta, stats.allocNewDelta, stats.reusedDelta, stats.missedDelta, primaryUsedBlocks,
+                    primaryFreeBlocks, primaryMaxBlocks,
+                    primaryMaxBlocks > 0
+                        ? 100.0 * static_cast<double>(primaryUsedBlocks) / static_cast<double>(primaryMaxBlocks)
+                        : 0.0);
             }
             totalAllocTotalDelta[i] += stats.allocTotalDelta;
             totalAllocNewDelta[i] += stats.allocNewDelta;

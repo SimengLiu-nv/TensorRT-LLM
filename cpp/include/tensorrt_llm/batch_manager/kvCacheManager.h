@@ -759,6 +759,19 @@ struct PrefixReuseSummary
     /// probe yet; a concrete BlockKey identifies the first missing full block.
     /// Used by the capacity scheduler's skip-check logic to decide whether to defer a request.
     std::optional<BlockKey> firstNewBlock{std::nullopt};
+
+    /// Debug-only accounting from the same radix walk. These fields are logged
+    /// behind TLLM_KV_CACHE_REUSE_DEBUG to distinguish real cached SWA blocks
+    /// from value-less traversal anchors.
+    SizeType32 exactNodesVisited{0};
+    SizeType32 realValueMatches{0};
+    SizeType32 valueLessTraversalNodes{0};
+    SizeType32 partialValueMatches{0};
+    SizeType32 latestMissingAnchorEndToken{0};
+    SizeType32 committedPrefixAfterMissingAnchor{0};
+    SizeType32 latestRealValueEndToken{0};
+    SizeType32 trailingRealValueBlocks{0};
+    SizeType32 trailingRealValueTokens{0};
 };
 
 // The WindowBlockManager manages the metadata of KVCacheBlocks.
@@ -1200,7 +1213,35 @@ private:
         std::vector<ReuseMatch> matches;
         SizeType32 totalMatchedTokens{0};
         std::optional<BlockKey> firstNewBlock{std::nullopt};
+        SizeType32 exactNodesVisited{0};
+        SizeType32 realValueMatches{0};
+        SizeType32 valueLessTraversalNodes{0};
+        SizeType32 partialValueMatches{0};
+        SizeType32 latestMissingAnchorEndToken{0};
+        SizeType32 committedPrefixAfterMissingAnchor{0};
+        SizeType32 latestRealValueEndToken{0};
+        SizeType32 trailingRealValueBlocks{0};
+        SizeType32 trailingRealValueTokens{0};
     };
+
+    struct SwaDebugHistory
+    {
+        KVCacheBlock::IdType newestRealBlockId{KVCacheBlock::kCachedBlocksRootId};
+        SizeType32 newestRealPrefixTokens{0};
+        bool newestRealAnchorValid{false};
+        std::uint64_t realStores{0};
+        std::uint64_t existingRealStores{0};
+        std::uint64_t oowPlaceholders{0};
+        std::uint64_t oowPlaceholderAnchorHits{0};
+        std::uint64_t oowPlaceholderAnchorMisses{0};
+        std::uint64_t oowDetachReplacements{0};
+        std::uint64_t evictedStoredBlocks{0};
+        std::uint64_t evictedNewestBlocks{0};
+    };
+
+    void updateSwaDebugNewestRealBlock(BlockPtr const& block, SizeType32 prefixTokens, char const* reason);
+
+    void noteSwaDebugEvictedBlock(BlockPtr const& block, char const* reason);
 
     //! \brief Find the reusable prefix, including SWA traversal-only anchors.
     //! \details Value-less exact nodes are only accepted for SWA when enough later tokens
@@ -1338,6 +1379,7 @@ private:
     double mReusedTokens;
     // Total number of input tokens
     double mTotalInputTokens;
+    SwaDebugHistory mSwaDebugHistory;
     // Whether blocks that are partially matched should be reused.
     bool mEnablePartialReuse;
     // Whether partially matched blocks that are already in use should be copied and reused.
@@ -1510,6 +1552,16 @@ public:
     [[nodiscard]] SizeType32 getNumFreeBlocks() const
     {
         return sumWindows([](WindowBlockManager const& manager) { return manager.getNumFreeBlocks(); });
+    }
+
+    [[nodiscard]] SizeType32 getNumFreeBlocks(SizeType32 windowSize) const
+    {
+        return mWindowBlockManagers.at(windowSize).getNumFreeBlocks();
+    }
+
+    [[nodiscard]] SizeType32 getNumPrimaryBlocks(SizeType32 windowSize) const
+    {
+        return mWindowBlockManagers.at(windowSize).getNumPrimaryBlocks();
     }
 
     [[nodiscard]] bool schedulingHasFreeBlocks(SizeType32 numRequired, SizeType32 windowSize) const
