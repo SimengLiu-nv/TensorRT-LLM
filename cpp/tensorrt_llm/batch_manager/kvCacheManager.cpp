@@ -4260,14 +4260,13 @@ void KVCacheManager::addSequenceBatch(
         {
             auto const reusablePrepopulatedLen
                 = hasNonSwaWindow[i] ? minNonSwaPrepopulatedLen[i] : minPrepopulatedLen[i];
-            // There is still one request-level prepopulated cursor shared by
-            // full-attention and SWA layers. Select the largest prefix that is
-            // safe for every window. A promptLen-window cap is only a
-            // counterfactual diagnostic: it can be too conservative when SWA has
-            // the needed prefix cached, and unsafe when SWA's own safe prefix is
-            // shorter than that cap.
+            // There is one request-level cached-prefix scalar. In mixed
+            // full+SWA models it must track the full-attention reusable prefix:
+            // SWA layers use their bounded physical tail, while full-attention
+            // layers would lose long-prefix reuse if a missing SWA tail capped
+            // this shared scalar.
             auto const swaSafePrepopulatedLen = hasSwaWindow[i] ? minSwaPrepopulatedLen[i] : reusablePrepopulatedLen;
-            auto const selectedPrepopulatedLen = std::min(reusablePrepopulatedLen, swaSafePrepopulatedLen);
+            auto const selectedPrepopulatedLen = reusablePrepopulatedLen;
             if (logKvReuseDebug)
             {
                 auto const smallestSwaWindow = getSmallestSwaWindow(mBlockManager.getWindowSizesMetadata());
@@ -4283,22 +4282,23 @@ void KVCacheManager::addSequenceBatch(
                 auto const cappedUncachedSuffix = llmRequest.getPromptLen() >= cappedPrepopulatedLen
                     ? llmRequest.getPromptLen() - cappedPrepopulatedLen
                     : 0;
+                auto const swaWouldLowerTokens
+                    = reusablePrepopulatedLen - std::min(reusablePrepopulatedLen, swaSafePrepopulatedLen);
                 TLLM_LOG_INFO(
                     "[kv-reuse-debug] KVCacheManager::addSequenceBatch select request=%lu promptLen=%d "
                     "tokensPerBlock=%d hasNonSwaWindow=%s hasSwaWindow=%s fullAttentionPrepopulatedLen=%d "
                     "swaPrepopulatedLen=%d minAllPrepopulatedLen=%d reusablePrepopulatedLen=%d "
                     "swaSafePrepopulatedLen=%d smallestSwaWindow=%d selectedPrepopulatedLen=%d "
                     "uncachedSuffix=%d cappedPrepopulatedLen=%d cappedUncachedSuffix=%d capWouldApply=%s "
-                    "fullOnlyUnsafeTokens=%d totalAllocTotalDelta=%d totalAllocNewDelta=%d totalReusedDelta=%d "
+                    "swaWouldLowerTokens=%d totalAllocTotalDelta=%d totalAllocNewDelta=%d totalReusedDelta=%d "
                     "totalMissedDelta=%d",
                     llmRequest.mRequestId, llmRequest.getPromptLen(), getTokensPerBlock(), logBool(hasNonSwaWindow[i]),
                     logBool(hasSwaWindow[i]), fullAttentionPrepopulatedLen, swaPrepopulatedLen, minPrepopulatedLen[i],
                     reusablePrepopulatedLen, swaSafePrepopulatedLen,
                     smallestSwaWindow.value_or(static_cast<SizeType32>(-1)), selectedPrepopulatedLen, uncachedSuffix,
                     cappedPrepopulatedLen, cappedUncachedSuffix,
-                    logBool(cappedPrepopulatedLen < reusablePrepopulatedLen),
-                    reusablePrepopulatedLen - selectedPrepopulatedLen, totalAllocTotalDelta[i], totalAllocNewDelta[i],
-                    totalReusedDelta[i], totalMissedDelta[i]);
+                    logBool(cappedPrepopulatedLen < reusablePrepopulatedLen), swaWouldLowerTokens,
+                    totalAllocTotalDelta[i], totalAllocNewDelta[i], totalReusedDelta[i], totalMissedDelta[i]);
             }
             TLLM_LOG_DEBUG("KVCacheManager::addSequenceBatch: Setting prepopulatedPromptLen to %d for request %lu",
                 selectedPrepopulatedLen, llmRequest.mRequestId);

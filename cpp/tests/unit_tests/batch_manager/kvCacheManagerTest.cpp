@@ -4350,7 +4350,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowReuseUsesSwaSafePrefix)
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(/*requestId=*/1, secondRequest)));
 }
 
-TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowReuseDoesNotOutrunSwaPrefix)
+TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowReuseKeepsFullPrefixWhenSwaTailMissing)
 {
     auto constexpr numLayers = 2;
     auto constexpr numHeads = 2;
@@ -4428,8 +4428,9 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowReuseDoesNotOutrunSwaPref
     kvCacheManager.addSequenceBatch({{{/*requestId=*/1, secondInputLength, beamWidth}}}, {std::ref(*secondRequest)});
 
     auto constexpr swaSafePrefix = missingSwaBlockEnd - tokensPerBlock;
-    EXPECT_EQ(secondRequest->getPrepopulatedPromptLen(), swaSafePrefix);
-    EXPECT_EQ(secondRequest->getContextCurrentPosition(), swaSafePrefix);
+    static_assert(swaSafePrefix < reusedPrefixLength);
+    EXPECT_EQ(secondRequest->getPrepopulatedPromptLen(), reusedPrefixLength);
+    EXPECT_EQ(secondRequest->getContextCurrentPosition(), reusedPrefixLength);
 
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*secondRequest);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(/*requestId=*/1, secondRequest)));
