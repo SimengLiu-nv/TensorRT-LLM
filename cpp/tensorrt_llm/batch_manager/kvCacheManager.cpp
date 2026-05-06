@@ -1095,6 +1095,8 @@ void WindowBlockManager::updateSwaDebugNewestRealBlock(
         return;
     }
 
+    mSwaDebugHistory.realBlockPrefixTokens[block->getBlockId()] = prefixTokens;
+
     bool const hadValidAnchor = mSwaDebugHistory.newestRealAnchorValid;
     bool const advancesPrefix = !hadValidAnchor || prefixTokens > mSwaDebugHistory.newestRealPrefixTokens;
     if (!advancesPrefix)
@@ -1130,7 +1132,14 @@ void WindowBlockManager::noteSwaDebugEvictedBlock(BlockPtr const& block, char co
     ++mSwaDebugHistory.evictedStoredBlocks;
     bool const wasNewest
         = mSwaDebugHistory.newestRealAnchorValid && block->getBlockId() == mSwaDebugHistory.newestRealBlockId;
+    auto const prefixIt = mSwaDebugHistory.realBlockPrefixTokens.find(block->getBlockId());
+    bool const evictedPrefixKnown = prefixIt != mSwaDebugHistory.realBlockPrefixTokens.end();
+    auto const evictedPrefixTokens = evictedPrefixKnown ? prefixIt->second : SizeType32{-1};
     auto const lostPrefixTokens = wasNewest ? mSwaDebugHistory.newestRealPrefixTokens : SizeType32{0};
+    if (evictedPrefixKnown)
+    {
+        mSwaDebugHistory.realBlockPrefixTokens.erase(prefixIt);
+    }
     if (wasNewest)
     {
         ++mSwaDebugHistory.evictedNewestBlocks;
@@ -1145,10 +1154,13 @@ void WindowBlockManager::noteSwaDebugEvictedBlock(BlockPtr const& block, char co
         auto const primaryUsedBlocks = getNumPrimaryBlocks() - primaryFreeBlocks;
         TLLM_LOG_INFO(
             "[kv-reuse-debug] %s::swa-real-evicted reason=%s blockId=%d wasNewest=%s lostPrefixTokens=%d "
-            "uniqueTokens=%zu evictedStoredBlocks=%llu evictedNewestBlocks=%llu newestValid=%s newestBlockId=%d "
+            "evictedPrefixKnown=%s evictedPrefixTokens=%d uniqueTokens=%zu trackedRealPrefixes=%zu "
+            "evictedStoredBlocks=%llu evictedNewestBlocks=%llu newestValid=%s newestBlockId=%d "
             "newestPrefixTokens=%d primaryUsedBlocks=%d primaryFreeBlocks=%d primaryMaxBlocks=%d",
             mLogPrefix.c_str(), reason, block->getBlockId(), logBool(wasNewest), lostPrefixTokens,
-            block->getUniqueTokens().size(), static_cast<unsigned long long>(mSwaDebugHistory.evictedStoredBlocks),
+            logBool(evictedPrefixKnown), evictedPrefixTokens, block->getUniqueTokens().size(),
+            mSwaDebugHistory.realBlockPrefixTokens.size(),
+            static_cast<unsigned long long>(mSwaDebugHistory.evictedStoredBlocks),
             static_cast<unsigned long long>(mSwaDebugHistory.evictedNewestBlocks),
             logBool(mSwaDebugHistory.newestRealAnchorValid), mSwaDebugHistory.newestRealBlockId,
             mSwaDebugHistory.newestRealPrefixTokens, primaryUsedBlocks, primaryFreeBlocks, getNumPrimaryBlocks());
@@ -2981,8 +2993,8 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             "existingReal=%d oowPlaceholders=%d oowAnchorHits=%d oowAnchorMisses=%d storedThisCall=%d "
             "newestValid=%s newestBlockId=%d newestPrefixTokens=%d realStores=%llu existingRealStores=%llu "
             "oowPlaceholdersTotal=%llu oowAnchorHitsTotal=%llu oowAnchorMissesTotal=%llu evictedStoredBlocks=%llu "
-            "evictedNewestBlocks=%llu oowDetachReplacementsTotal=%llu primaryUsedBlocks=%d primaryFreeBlocks=%d "
-            "primaryMaxBlocks=%d",
+            "evictedNewestBlocks=%llu trackedRealPrefixes=%zu oowDetachReplacementsTotal=%llu primaryUsedBlocks=%d "
+            "primaryFreeBlocks=%d primaryMaxBlocks=%d",
             mLogPrefix.c_str(), blockKeys.size(), blocks.size(), debugRealInserted, debugExistingReal,
             debugOowPlaceholders, debugOowAnchorHits, debugOowAnchorMisses, numBlocksStoredForReuse,
             logBool(mSwaDebugHistory.newestRealAnchorValid), mSwaDebugHistory.newestRealBlockId,
@@ -2993,6 +3005,7 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             static_cast<unsigned long long>(mSwaDebugHistory.oowPlaceholderAnchorMisses),
             static_cast<unsigned long long>(mSwaDebugHistory.evictedStoredBlocks),
             static_cast<unsigned long long>(mSwaDebugHistory.evictedNewestBlocks),
+            mSwaDebugHistory.realBlockPrefixTokens.size(),
             static_cast<unsigned long long>(mSwaDebugHistory.oowDetachReplacements), primaryUsedBlocks,
             primaryFreeBlocks, getNumPrimaryBlocks());
     }

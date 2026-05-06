@@ -1237,6 +1237,7 @@ private:
         std::uint64_t oowDetachReplacements{0};
         std::uint64_t evictedStoredBlocks{0};
         std::uint64_t evictedNewestBlocks{0};
+        std::unordered_map<KVCacheBlock::IdType, SizeType32> realBlockPrefixTokens;
     };
 
     void updateSwaDebugNewestRealBlock(BlockPtr const& block, SizeType32 prefixTokens, char const* reason);
