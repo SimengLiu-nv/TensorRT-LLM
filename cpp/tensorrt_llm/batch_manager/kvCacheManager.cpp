@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <optional>
@@ -54,6 +55,66 @@ using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>
 
 namespace
 {
+
+bool isTruthyEnvVar(char const* name) noexcept
+{
+    auto const* value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+}
+
+bool isKvCacheReuseDebugLoggingEnabled() noexcept
+{
+    return isTruthyEnvVar("TLLM_KVCACHE_REUSE_DEBUG") || isTruthyEnvVar("TRTLLM_KVCACHE_REUSE_DEBUG")
+        || isTruthyEnvVar("TRTLLM_VSWA_REUSE_PROOF_LOG");
+}
+
+char const* logBool(bool value) noexcept
+{
+    return value ? "true" : "false";
+}
+
+struct ClaimBlockCounts
+{
+    SizeType32 full{0};
+    SizeType32 partial{0};
+    SizeType32 copies{0};
+    SizeType32 placeholders{0};
+    SizeType32 traversalOnly{0};
+    SizeType32 releaseCopySource{0};
+};
+
+ClaimBlockCounts countClaimBlocks(WindowBlockManager::ClaimResult const& claimResult)
+{
+    ClaimBlockCounts counts;
+    for (auto const& claimedBlock : claimResult.claimedBlocks)
+    {
+        if (claimedBlock.isPartialMatch)
+        {
+            ++counts.partial;
+        }
+        else
+        {
+            ++counts.full;
+        }
+        if (claimedBlock.needsCopy)
+        {
+            ++counts.copies;
+        }
+        if (claimedBlock.isPlaceholder)
+        {
+            ++counts.placeholders;
+        }
+        if (claimedBlock.isTraversalOnly)
+        {
+            ++counts.traversalOnly;
+        }
+        if (claimedBlock.shouldReleaseCopySource)
+        {
+            ++counts.releaseCopySource;
+        }
+    }
+    return counts;
+}
 
 //! \brief Get all blocks in a sequence by traversing backwards from the last block.
 //! \param lastBlock is a BlockPtr to the last block in the sequence to start traversal from
@@ -1470,6 +1531,16 @@ PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
 
     TLLM_LOG_DEBUG("%s::analyzePrefixReuse - reusableAllocated=%d, reusableAll=%d, hasNewBlock=%d", mLogPrefix.c_str(),
         summary.reusableBlocksAllocated, summary.reusableBlocksAll, summary.firstNewBlock.has_value());
+    if (isKvCacheReuseDebugLoggingEnabled())
+    {
+        TLLM_LOG_INFO(
+            "[kv-reuse-debug] %s::analyzePrefixReuse request=%lu window=%d isSWA=%s uniqueTokens=%zu blockKeys=%zu "
+            "reusableAllocated=%d reusableAll=%d hasFirstNewBlock=%s firstNewBlockTokens=%zu",
+            mLogPrefix.c_str(), llmRequest.mRequestId, mWindowSize, logBool(mIsSWA), uniqueTokens.size(),
+            blockKeys.size(), summary.reusableBlocksAllocated, summary.reusableBlocksAll,
+            logBool(summary.firstNewBlock.has_value()),
+            summary.firstNewBlock.has_value() ? summary.firstNewBlock->uniqueTokens.size() : 0);
+    }
     return summary;
 }
 
@@ -2070,6 +2141,7 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
     auto const n = sequences.size();
     std::vector<ClaimResult> claimResults(n);
     std::vector<BatchSeqStats> results(n);
+    bool const logKvReuseDebug = isKvCacheReuseDebugLoggingEnabled();
 
     // Hold the lock for the entire two-phase operation.
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
@@ -2100,6 +2172,25 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
     // Phase 2: Onboard + allocate for each request, snapshotting stats between requests.
     for (size_t i = 0; i < n; ++i)
     {
+        if (logKvReuseDebug)
+        {
+            auto const claimCounts = countClaimBlocks(claimResults[i]);
+            auto const physicalContextBlocks = numContextBlocksVec[i] - firstRealBlockIdxVec[i];
+            TLLM_LOG_INFO(
+                "[kv-reuse-debug] %s::addSequenceBatch claim request=%lu window=%d isSWA=%s reuseEnabled=%s "
+                "inputLength=%d numContextBlocks=%d firstRealBlockIdx=%d physicalContextBlocks=%d "
+                "numSharedContextBlocks=%d shareLastContextBlockAmongBeams=%s claimedBlocks=%zu fullClaimed=%d "
+                "partialClaimed=%d copies=%d placeholders=%d traversalOnly=%d releaseCopySource=%d "
+                "totalMatchedTokens=%d latestMatchingNonPlaceholderBlockIdx=%d blockKeys=%zu",
+                mLogPrefix.c_str(), sequences[i]->getRequestId(), mWindowSize, logBool(mIsSWA),
+                logBool(isEnableBlockReuse), inputLengths[i], numContextBlocksVec[i], firstRealBlockIdxVec[i],
+                physicalContextBlocks, claimResults[i].numSharedContextBlocks,
+                logBool(claimResults[i].shareLastContextBlockAmongBeams), claimResults[i].claimedBlocks.size(),
+                claimCounts.full, claimCounts.partial, claimCounts.copies, claimCounts.placeholders,
+                claimCounts.traversalOnly, claimCounts.releaseCopySource, claimResults[i].totalMatchedTokens,
+                claimResults[i].latestMatchingNonPlaceholderBlockIdx, claimResults[i].blockKeys.size());
+        }
+
         SizeType32 const preTotalBlocks = mAllocTotalBlocks;
         SizeType32 const preNewBlocks = mAllocNewBlocks;
         SizeType32 const preReused = mReusedBlocks;
@@ -2112,6 +2203,18 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
         results[i].allocNewDelta = mAllocNewBlocks - preNewBlocks;
         results[i].reusedDelta = mReusedBlocks - preReused;
         results[i].missedDelta = mMissedBlocks - preMissed;
+
+        if (logKvReuseDebug)
+        {
+            TLLM_LOG_INFO(
+                "[kv-reuse-debug] %s::addSequenceBatch onboard request=%lu window=%d isSWA=%s "
+                "sequencePrepopulatedPromptLen=%d returnedPrepopulatedLen=%d allocTotalDelta=%d allocNewDelta=%d "
+                "reusedDelta=%d missedDelta=%d allocTotal=%d allocNew=%d reused=%d missed=%d",
+                mLogPrefix.c_str(), sequences[i]->getRequestId(), mWindowSize, logBool(mIsSWA),
+                sequences[i]->getCurrentPrepopulatedPromptLen(), results[i].prepopulatedLen, results[i].allocTotalDelta,
+                results[i].allocNewDelta, results[i].reusedDelta, results[i].missedDelta, mAllocTotalBlocks,
+                mAllocNewBlocks, mReusedBlocks, mMissedBlocks);
+        }
     }
 
     // No deferred release needed: non-leaf copy sources are released in Phase 2
@@ -3333,9 +3436,11 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
 {
     // Default to zero; overwritten below when block reuse is active for a first-chunk context request.
     req.setEstimatedReusableTokens(0);
+    bool const logKvReuseDebug = isKvCacheReuseDebugLoggingEnabled();
 
     if ((req.isContextInitState() && req.isFirstContextChunk()) || req.isDisaggGenerationInitState())
     {
+        auto const metadata = mBlockManager.getWindowSizeMetadata(windowSize);
         auto const chunkSize = req.mMaxNewTokens;
         auto const maxDraftTokensToAdd = req.getNumDraftTokens();
         auto const promptCacheLen
@@ -3347,11 +3452,12 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
         auto const numUnSharedBlocks
             = tc::ceilDiv(numUnSharedTokens, getTokensPerBlock()) * req.mSamplingConfig.beamWidth;
         auto numRequiredBlocks = numSharedBlocks + numUnSharedBlocks;
+        auto const numRequiredBlocksBeforeReuse = numRequiredBlocks;
 
         // Subtract reusable blocks if block reuse is enabled. For variable-window
         // attention, reuse must be analyzed per window because each window owns a
         // distinct block pool and can have a different reusable prefix.
-        if (mEnableBlockReuse && !isCrossKv() && !req.isDisaggGenerationInitState())
+        if (mEnableBlockReuse && !isCrossKv())
         {
             // Use the cached summary if provided; otherwise perform a fresh tree walk.
             auto const summary = cachedSummary.has_value()
@@ -3372,6 +3478,37 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             numRequiredBlocks -= reusableSharedBlocks;
             // Store on request so the micro batch scheduler can use it for token budget
             req.setEstimatedReusableTokens(reusableSharedBlocks * getTokensPerBlock());
+            if (logKvReuseDebug)
+            {
+                TLLM_LOG_INFO(
+                    "[kv-reuse-debug] KVCacheManager::getNeededBlocksOneStep request=%lu window=%d isSWA=%s "
+                    "contextInit=%s firstContextChunk=%s disaggGenInit=%s twoStepsLookAhead=%s promptLen=%d "
+                    "chunkSize=%d draftTokens=%d tokensPerBlock=%d sinkBubbleLength=%d promptCacheLen=%d "
+                    "numSharedBlocks=%d numUnSharedTokens=%d numUnSharedBlocks=%d requiredBeforeReuse=%d "
+                    "cachedSummary=%s reusableBlocksAllocated=%d reusableBlocksAll=%d promptInputLen=%d "
+                    "maxRecoverableSharedBlocks=%d reusableSharedBlocks=%d requiredAfterReuse=%d "
+                    "estimatedReusableTokens=%d",
+                    req.mRequestId, windowSize, logBool(metadata.isSWA), logBool(req.isContextInitState()),
+                    logBool(req.isFirstContextChunk()), logBool(req.isDisaggGenerationInitState()),
+                    logBool(twoStepsLookAhead), req.mPromptLen, chunkSize, maxDraftTokensToAdd, getTokensPerBlock(),
+                    mSinkBubbleLength, promptCacheLen, numSharedBlocks, numUnSharedTokens, numUnSharedBlocks,
+                    numRequiredBlocksBeforeReuse, logBool(cachedSummary.has_value()), summary.reusableBlocksAllocated,
+                    summary.reusableBlocksAll, promptInputLen, maxRecoverableSharedBlocks, reusableSharedBlocks,
+                    numRequiredBlocks, req.getEstimatedReusableTokens());
+            }
+        }
+        else if (logKvReuseDebug)
+        {
+            TLLM_LOG_INFO(
+                "[kv-reuse-debug] KVCacheManager::getNeededBlocksOneStep request=%lu window=%d isSWA=%s "
+                "reuseSubtractionSkipped=%s mEnableBlockReuse=%s isCrossKv=%s contextInit=%s firstContextChunk=%s "
+                "disaggGenInit=%s promptLen=%d chunkSize=%d draftTokens=%d tokensPerBlock=%d sinkBubbleLength=%d "
+                "promptCacheLen=%d numSharedBlocks=%d numUnSharedTokens=%d numUnSharedBlocks=%d requiredBlocks=%d",
+                req.mRequestId, windowSize, logBool(metadata.isSWA), "true", logBool(mEnableBlockReuse),
+                logBool(isCrossKv()), logBool(req.isContextInitState()), logBool(req.isFirstContextChunk()),
+                logBool(req.isDisaggGenerationInitState()), req.mPromptLen, chunkSize, maxDraftTokensToAdd,
+                getTokensPerBlock(), mSinkBubbleLength, promptCacheLen, numSharedBlocks, numUnSharedTokens,
+                numUnSharedBlocks, numRequiredBlocks);
         }
         return numRequiredBlocks;
     }
@@ -3481,6 +3618,8 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
     SizeType32 numReusableContextBlocks = 0;
     SizeType32 numReusableBlocksAllocated = 0;
     SizeType32 numReusableBlocksAll = 0;
+    SizeType32 maxRecoverableBlocksForReuse = 0;
+    SizeType32 estimatedReusableTokenBlocks = 0;
     if (mEnableBlockReuse && req.isContextInitState() && req.isFirstContextChunk() && numAllocBlocksPerBeam == 0)
     {
         // Use the cached summary if provided; otherwise perform a fresh tree walk.
@@ -3494,14 +3633,15 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
         // must not be double-counted against the capacity estimate.
         // Cap at (promptLen-1)/tpb to avoid over-counting when the prompt is exactly
         // block-aligned (last full block has not been committed to the tree yet).
-        SizeType32 const maxRecoverableBlocks = (req.mPromptLen - 1) / getTokensPerBlock();
+        maxRecoverableBlocksForReuse = (req.mPromptLen - 1) / getTokensPerBlock();
         numReusableBlocksAllocated = summary.reusableBlocksAllocated;
         numReusableBlocksAll = summary.reusableBlocksAll;
-        numReusableContextBlocks = std::min({numReusableBlocksAllocated, numContextBlocks, maxRecoverableBlocks});
+        numReusableContextBlocks
+            = std::min({numReusableBlocksAllocated, numContextBlocks, maxRecoverableBlocksForReuse});
         // Token budget: count all reusable blocks (free or allocated). Cached tokens need
         // not be recomputed regardless of whether their blocks currently have active refs.
-        req.setEstimatedReusableTokens(
-            std::min({numReusableBlocksAll, numContextBlocks, maxRecoverableBlocks}) * getTokensPerBlock());
+        estimatedReusableTokenBlocks = std::min({numReusableBlocksAll, numContextBlocks, maxRecoverableBlocksForReuse});
+        req.setEstimatedReusableTokens(estimatedReusableTokenBlocks * getTokensPerBlock());
         TLLM_LOG_DEBUG(
             "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, "
             "numReusableBlocksAllocated=%d, numReusableBlocksAll=%d, "
@@ -3537,6 +3677,24 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
         SizeType32 const effectiveTotalBlocks = numTotalBlocksPerBeam - numReusableContextBlocks;
         remainingBlocks
             = (effectiveTotalBlocks - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
+    }
+
+    if (isKvCacheReuseDebugLoggingEnabled())
+    {
+        TLLM_LOG_INFO(
+            "[kv-reuse-debug] KVCacheManager::getRemainingBlocksToCompletion request=%lu window=%d isSWA=%s "
+            "promptLen=%d maxNewTokens=%d tokensPerBlock=%d temporaryAttentionWindow=%d numContextBlocks=%d "
+            "numTotalBlocksPerBeam=%d numGenBlocksPerBeam=%d numAllocBlocksPerBeam=%d cachedSummary=%s "
+            "reusableBlocksAllocated=%d reusableBlocksAll=%d reusableContextBlocks=%d estimatedReusableTokens=%d "
+            "estimatedReusableTokenBlocks=%d maxRecoverableBlocks=%d effectiveContextBlocks=%d isSlidingWindow=%s "
+            "willCrossBlockBoundary=%s willCrossWindowBlockBoundary=%s numExtraBlocksPerBeam=%d remainingBlocks=%d",
+            req.mRequestId, windowSize, logBool(metadata.isSWA), req.mPromptLen, req.mMaxNewTokens, getTokensPerBlock(),
+            temporaryAttentionWindow, numContextBlocks, numTotalBlocksPerBeam, numGenBlocksPerBeam,
+            numAllocBlocksPerBeam, logBool(cachedSummary.has_value()), numReusableBlocksAllocated, numReusableBlocksAll,
+            numReusableContextBlocks, req.getEstimatedReusableTokens(), estimatedReusableTokenBlocks,
+            maxRecoverableBlocksForReuse, effectiveContextBlocks, logBool(isSlidingWindow),
+            logBool(willCrossBlockBoundary), logBool(willCrossWindowBlockBoundary), numExtraBlocksPerBeam,
+            remainingBlocks);
     }
 
     return remainingBlocks;
@@ -3695,6 +3853,7 @@ void KVCacheManager::addSequenceBatch(
         return;
     }
     auto const n = requestInfos.size();
+    bool const logKvReuseDebug = isKvCacheReuseDebugLoggingEnabled();
 
     // --- Setup: create sequences, hold them (window-independent) ---
     std::vector<GenerationRequest*> sequences(n);
@@ -3725,7 +3884,9 @@ void KVCacheManager::addSequenceBatch(
     // the request-level cached-prefix scalar.
     std::vector<SizeType32> minPrepopulatedLen(n, std::numeric_limits<SizeType32>::max());
     std::vector<SizeType32> minNonSwaPrepopulatedLen(n, std::numeric_limits<SizeType32>::max());
+    std::vector<SizeType32> minSwaPrepopulatedLen(n, std::numeric_limits<SizeType32>::max());
     std::vector<bool> hasNonSwaWindow(n, false);
+    std::vector<bool> hasSwaWindow(n, false);
     // Accumulate block allocation stats across all windows per sequence
     std::vector<SizeType32> totalAllocTotalDelta(n, 0);
     std::vector<SizeType32> totalAllocNewDelta(n, 0);
@@ -3769,6 +3930,33 @@ void KVCacheManager::addSequenceBatch(
                 hasNonSwaWindow[i] = true;
                 minNonSwaPrepopulatedLen[i] = std::min(minNonSwaPrepopulatedLen[i], stats.prepopulatedLen);
             }
+            else
+            {
+                hasSwaWindow[i] = true;
+                minSwaPrepopulatedLen[i] = std::min(minSwaPrepopulatedLen[i], stats.prepopulatedLen);
+            }
+            if (logKvReuseDebug)
+            {
+                auto const promptLen = llmRequests[i].get().getPromptLen();
+                auto const physicalContextBlocks = numContextBlocksVec[i] - firstRealBlockIdxVec[i];
+                auto const currentMinNonSwaPrepopulatedLen
+                    = hasNonSwaWindow[i] ? minNonSwaPrepopulatedLen[i] : static_cast<SizeType32>(-1);
+                auto const currentMinSwaPrepopulatedLen
+                    = hasSwaWindow[i] ? minSwaPrepopulatedLen[i] : static_cast<SizeType32>(-1);
+                TLLM_LOG_INFO(
+                    "[kv-reuse-debug] KVCacheManager::addSequenceBatch window-result request=%lu window=%d isSWA=%s "
+                    "promptLen=%d inputLength=%d effectiveInputLength=%d temporaryAttentionWindow=%d maxTokenNum=%d "
+                    "tokensPerBlock=%d numContextBlocks=%d firstRealBlockIdx=%d physicalContextBlocks=%d "
+                    "windowPrepopulatedLen=%d minAllPrepopulatedLen=%d hasNonSwaWindow=%s "
+                    "minNonSwaPrepopulatedLen=%d hasSwaWindow=%s minSwaPrepopulatedLen=%d allocTotalDelta=%d "
+                    "allocNewDelta=%d reusedDelta=%d missedDelta=%d",
+                    llmRequests[i].get().mRequestId, windowSize, logBool(metadata.isSWA), promptLen,
+                    std::get<1>(requestInfos[i]), inputLengths[i], temporaryAttentionWindow, maxTokenNum,
+                    getTokensPerBlock(), numContextBlocksVec[i], firstRealBlockIdxVec[i], physicalContextBlocks,
+                    stats.prepopulatedLen, minPrepopulatedLen[i], logBool(hasNonSwaWindow[i]),
+                    currentMinNonSwaPrepopulatedLen, logBool(hasSwaWindow[i]), currentMinSwaPrepopulatedLen,
+                    stats.allocTotalDelta, stats.allocNewDelta, stats.reusedDelta, stats.missedDelta);
+            }
             totalAllocTotalDelta[i] += stats.allocTotalDelta;
             totalAllocNewDelta[i] += stats.allocNewDelta;
             totalReusedDelta[i] += stats.reusedDelta;
@@ -3785,8 +3973,36 @@ void KVCacheManager::addSequenceBatch(
         {
             auto const reusablePrepopulatedLen
                 = hasNonSwaWindow[i] ? minNonSwaPrepopulatedLen[i] : minPrepopulatedLen[i];
-            auto const selectedPrepopulatedLen = capPrepopulatedLenForSwaReuse(
-                reusablePrepopulatedLen, llmRequest.getPromptLen(), mBlockManager.getWindowSizesMetadata());
+            auto const selectedPrepopulatedLen = reusablePrepopulatedLen;
+            if (logKvReuseDebug)
+            {
+                auto const smallestSwaWindow = getSmallestSwaWindow(mBlockManager.getWindowSizesMetadata());
+                auto const fullAttentionPrepopulatedLen
+                    = hasNonSwaWindow[i] ? minNonSwaPrepopulatedLen[i] : static_cast<SizeType32>(-1);
+                auto const swaPrepopulatedLen
+                    = hasSwaWindow[i] ? minSwaPrepopulatedLen[i] : static_cast<SizeType32>(-1);
+                auto const cappedPrepopulatedLen = capPrepopulatedLenForSwaReuse(
+                    reusablePrepopulatedLen, llmRequest.getPromptLen(), mBlockManager.getWindowSizesMetadata());
+                auto const uncachedSuffix = llmRequest.getPromptLen() >= selectedPrepopulatedLen
+                    ? llmRequest.getPromptLen() - selectedPrepopulatedLen
+                    : 0;
+                auto const cappedUncachedSuffix = llmRequest.getPromptLen() >= cappedPrepopulatedLen
+                    ? llmRequest.getPromptLen() - cappedPrepopulatedLen
+                    : 0;
+                TLLM_LOG_INFO(
+                    "[kv-reuse-debug] KVCacheManager::addSequenceBatch select request=%lu promptLen=%d "
+                    "tokensPerBlock=%d hasNonSwaWindow=%s hasSwaWindow=%s fullAttentionPrepopulatedLen=%d "
+                    "swaPrepopulatedLen=%d minAllPrepopulatedLen=%d reusablePrepopulatedLen=%d "
+                    "smallestSwaWindow=%d selectedPrepopulatedLen=%d uncachedSuffix=%d cappedPrepopulatedLen=%d "
+                    "cappedUncachedSuffix=%d capWouldApply=%s totalAllocTotalDelta=%d totalAllocNewDelta=%d "
+                    "totalReusedDelta=%d totalMissedDelta=%d",
+                    llmRequest.mRequestId, llmRequest.getPromptLen(), getTokensPerBlock(), logBool(hasNonSwaWindow[i]),
+                    logBool(hasSwaWindow[i]), fullAttentionPrepopulatedLen, swaPrepopulatedLen, minPrepopulatedLen[i],
+                    reusablePrepopulatedLen, smallestSwaWindow.value_or(static_cast<SizeType32>(-1)),
+                    selectedPrepopulatedLen, uncachedSuffix, cappedPrepopulatedLen, cappedUncachedSuffix,
+                    logBool(cappedPrepopulatedLen < reusablePrepopulatedLen), totalAllocTotalDelta[i],
+                    totalAllocNewDelta[i], totalReusedDelta[i], totalMissedDelta[i]);
+            }
             TLLM_LOG_DEBUG("KVCacheManager::addSequenceBatch: Setting prepopulatedPromptLen to %d for request %lu",
                 selectedPrepopulatedLen, llmRequest.mRequestId);
             llmRequest.setPrepopulatedPromptLen(selectedPrepopulatedLen, getTokensPerBlock());

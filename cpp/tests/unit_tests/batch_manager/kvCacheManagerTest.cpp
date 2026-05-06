@@ -4287,7 +4287,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
 }
 
-TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowReuseKeepsFreshSwaWindow)
+TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowReusePreservesFullWindowPrefix)
 {
     auto constexpr numLayers = 2;
     auto constexpr numHeads = 2;
@@ -4343,8 +4343,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowReuseKeepsFreshSwaWindow)
 
     kvCacheManager.addSequenceBatch({{{/*requestId=*/1, secondInputLength, beamWidth}}}, {std::ref(*secondRequest)});
 
-    EXPECT_EQ(secondRequest->getPrepopulatedPromptLen(), secondInputLength - swaAttentionWindow);
-    EXPECT_EQ(secondRequest->getContextCurrentPosition(), secondInputLength - swaAttentionWindow);
+    EXPECT_EQ(secondRequest->getPrepopulatedPromptLen(), reusedPrefixLength);
+    EXPECT_EQ(secondRequest->getContextCurrentPosition(), reusedPrefixLength);
 
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*secondRequest);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(/*requestId=*/1, secondRequest)));
