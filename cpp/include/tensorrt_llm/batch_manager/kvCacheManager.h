@@ -748,6 +748,12 @@ struct PrefixReuseSummary
     /// Used by the token budget (NoEvict) since all cached tokens avoid recompute.
     SizeType32 reusableBlocksAll{0};
 
+    /// Longest prefix length that can be safely skipped for this window.
+    /// For SWA this can include traversal-only out-of-window anchors that do
+    /// not own physical KV memory, but only after enough later matched tokens
+    /// make those anchors irrelevant to the active attention window.
+    SizeType32 totalMatchedTokens{0};
+
     /// First block key NOT found in the radix tree. std::nullopt means either all full
     /// prefix blocks matched (full prefix hit) or the request has no full block key to
     /// probe yet; a concrete BlockKey identifies the first missing full block.
@@ -1860,8 +1866,7 @@ public:
     [[nodiscard]] virtual OffsetTableDimensions getOffsetTableDimensions() const = 0;
 
     [[nodiscard]] virtual std::deque<executor::KVCacheEvent> getLatestEvents(
-        std::optional<std::chrono::milliseconds> timeout = std::nullopt) const
-        = 0;
+        std::optional<std::chrono::milliseconds> timeout = std::nullopt) const = 0;
 
     [[nodiscard]] virtual BlockManager const& getBlockManager() const = 0;
 
@@ -1871,8 +1876,7 @@ public:
     /// @param cachedSummary Optional pre-computed PrefixReuseSummary to avoid redundant radix tree walks.
     /// @return  The number of blocks
     [[nodiscard]] virtual SizeType32 getNeededBlocksOneStep(LlmRequest const& req, bool twoStepsLookAhead,
-        SizeType32 windowSize, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const
-        = 0;
+        SizeType32 windowSize, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const = 0;
 
     /// @brief  Function that computes the number of KV cache blocks needed to advance a request to completion (i.e. for
     /// maxNewTokens).
@@ -1880,8 +1884,7 @@ public:
     /// @param cachedSummary Optional pre-computed PrefixReuseSummary to avoid redundant radix tree walks.
     /// @return  The number of blocks
     [[nodiscard]] virtual SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize,
-        std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const
-        = 0;
+        std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const = 0;
 
     /// @brief Pin blocks associated with a request to prevent eviction.
     /// @param requestId The ID of the request whose blocks should be pinned.
@@ -1921,13 +1924,11 @@ public:
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getLayerToPoolMapping() const = 0;
 
     virtual void getBlockOffsetsOfBatch(
-        runtime::ITensor& output, SizeType32 firstBatchSlotIdx, SizeType32 batchSize, SizeType32 beamWidth) const
-        = 0;
+        runtime::ITensor& output, SizeType32 firstBatchSlotIdx, SizeType32 batchSize, SizeType32 beamWidth) const = 0;
 
     //! @return maxBlockCount of all beams
     virtual SizeType32 copyBlockOffsets(runtime::ITensor& output, SizeType32 outputSlotOffset,
-        LlmRequest::RequestIdType requestId, bool useSwaCyclicSlots = true, bool useSwaContextSlots = false) const
-        = 0;
+        LlmRequest::RequestIdType requestId, bool useSwaCyclicSlots = true, bool useSwaContextSlots = false) const = 0;
 
     [[nodiscard]] virtual bool isEnableBlockReuse() const = 0;
 
@@ -1948,8 +1949,7 @@ public:
     //! \brief Combined prefix reuse analysis — single radix tree walk.
     //! \details Collects firstNewBlock + reusableBlocksAllocated + reusableBlocksAll in one pass.
     [[nodiscard]] virtual PrefixReuseSummary analyzePrefixReuse(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
-        = 0;
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const = 0;
 
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
@@ -1966,17 +1966,15 @@ public:
 
     //! \brief Get the block ids of a request [per beam] **for a given window size block manager**
     [[nodiscard]] virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
-        LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
-        = 0;
+        LlmRequest::RequestIdType requestId, SizeType32 windowSize) const = 0;
 
     //! \brief Get the block ids of a batch of requests [per beam] **for a given window size block manager**
     [[nodiscard]] virtual std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
-        std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const
-        = 0;
+        std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const = 0;
 
     /// @brief Get the last block id (beam 0) for a given sequence and window size
-    [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const
-        = 0;
+    [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> getLastBlockId(
+        LlmRequest::RequestIdType requestId) const = 0;
 
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getUniquePrimaryPool() const = 0;
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
@@ -2074,8 +2072,7 @@ public:
     //! @param windowSize The attention window size this block belongs to.
     //! @return The retention priority of the block, or default priority if block not found.
     [[nodiscard]] virtual executor::RetentionPriority getPriorityByBlockId(
-        KVCacheBlock::IdType blockId, SizeType32 windowSize) const
-        = 0;
+        KVCacheBlock::IdType blockId, SizeType32 windowSize) const = 0;
 };
 
 class KVCacheManager : public BaseKVCacheManager

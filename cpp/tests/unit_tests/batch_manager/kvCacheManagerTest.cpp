@@ -4287,7 +4287,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
 }
 
-TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowReusePreservesFullWindowPrefix)
+TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowReuseUsesSwaSafePrefix)
 {
     auto constexpr numLayers = 2;
     auto constexpr numHeads = 2;
@@ -4345,6 +4345,91 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowReusePreservesFullWindowP
 
     EXPECT_EQ(secondRequest->getPrepopulatedPromptLen(), reusedPrefixLength);
     EXPECT_EQ(secondRequest->getContextCurrentPosition(), reusedPrefixLength);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*secondRequest);
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(/*requestId=*/1, secondRequest)));
+}
+
+TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowReuseDoesNotOutrunSwaPrefix)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numHeads = 2;
+    auto constexpr sizePerHead = 64;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr sinkTokenLength = 0;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr maxSequenceLength = 64;
+
+    auto constexpr swaAttentionWindow = 8;
+    auto constexpr fullAttentionWindow = maxSequenceLength;
+    auto const maxAttentionWindowVec = std::vector<SizeType32>{swaAttentionWindow, fullAttentionWindow};
+
+    auto constexpr blocksInPrimaryPoolPerWindow = 32;
+    auto constexpr blocksInSecondaryPoolPerWindow = 32;
+    auto constexpr enableBlockReuse = true;
+
+    auto const blocksPerWindow
+        = BlocksPerWindow{{swaAttentionWindow, {blocksInPrimaryPoolPerWindow, blocksInSecondaryPoolPerWindow}},
+            {fullAttentionWindow, {blocksInPrimaryPoolPerWindow, blocksInSecondaryPoolPerWindow}}};
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        maxBeamWidth, maxAttentionWindowVec, std::nullopt, dtype, sinkTokenLength, stream, maxSequenceLength,
+        enableBlockReuse);
+    kvCacheManager.allocatePools(false);
+
+    SizeType32 constexpr maxNewTokens = 8;
+    auto constexpr beamWidth = maxBeamWidth;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    TokenIdType constexpr firstToken = 1000;
+    auto constexpr storedInputLength = 40;
+    auto storedInputTokens = std::make_shared<VecTokens>(storedInputLength);
+    std::iota(storedInputTokens->begin(), storedInputTokens->end(), firstToken);
+    auto storedRequest
+        = std::make_shared<LlmRequest>(/*requestId=*/0, maxNewTokens, storedInputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequenceBatch({{{/*requestId=*/0, storedInputLength, beamWidth}}}, {std::ref(*storedRequest)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*storedRequest);
+    kvCacheManager.storeContextBlocks(*storedRequest);
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(/*requestId=*/0, storedRequest)));
+
+    auto const makeBlockKeys = [&](SizeType32 usableTokens)
+    {
+        auto prefixTokens = std::make_shared<VecTokens>(usableTokens);
+        std::iota(prefixTokens->begin(), prefixTokens->end(), firstToken);
+        auto prefixRequest = std::make_shared<LlmRequest>(99, maxNewTokens, prefixTokens, samplingConfig, isStreaming);
+        auto const& uniqueTokens = prefixRequest->getUniqueTokens(/*beamIdx=*/0);
+        auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
+            uniqueTokens, static_cast<SizeType32>(uniqueTokens.size()), tokensPerBlock, /*allowPartial=*/false);
+        return buildBlockKeys(blockedUniqueTokens, *prefixRequest);
+    };
+
+    auto constexpr missingSwaBlockEnd = 9 * tokensPerBlock;
+    auto const missingSwaBlockKeys = makeBlockKeys(missingSwaBlockEnd);
+    auto swaBlock = kvCacheManager.findBlocksInReuseTreeByBlockKeys(missingSwaBlockKeys, swaAttentionWindow);
+    ASSERT_NE(swaBlock, nullptr);
+    ASSERT_NE(kvCacheManager.findBlocksInReuseTreeByBlockKeys(missingSwaBlockKeys, fullAttentionWindow), nullptr);
+
+    swaBlock->detachFromLookupNode();
+    ASSERT_EQ(kvCacheManager.findBlocksInReuseTreeByBlockKeys(missingSwaBlockKeys, swaAttentionWindow), nullptr);
+    ASSERT_NE(kvCacheManager.findBlocksInReuseTreeByBlockKeys(missingSwaBlockKeys, fullAttentionWindow), nullptr);
+
+    auto constexpr reusedPrefixLength = storedInputLength - 1;
+    auto constexpr secondInputLength = reusedPrefixLength + swaAttentionWindow - 1;
+    auto secondInputTokens = std::make_shared<VecTokens>(secondInputLength);
+    std::iota(secondInputTokens->begin(), secondInputTokens->begin() + reusedPrefixLength, firstToken);
+    std::iota(
+        secondInputTokens->begin() + reusedPrefixLength, secondInputTokens->end(), firstToken + storedInputLength);
+    auto secondRequest
+        = std::make_shared<LlmRequest>(/*requestId=*/1, maxNewTokens, secondInputTokens, samplingConfig, isStreaming);
+
+    kvCacheManager.addSequenceBatch({{{/*requestId=*/1, secondInputLength, beamWidth}}}, {std::ref(*secondRequest)});
+
+    auto constexpr swaSafePrefix = missingSwaBlockEnd - tokensPerBlock;
+    EXPECT_EQ(secondRequest->getPrepopulatedPromptLen(), swaSafePrefix);
+    EXPECT_EQ(secondRequest->getContextCurrentPosition(), swaSafePrefix);
 
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*secondRequest);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(/*requestId=*/1, secondRequest)));

@@ -44,15 +44,27 @@ public:
         LlmRequest const& req, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt)
     {
         mCachedNeededBlocks.clear();
+        std::optional<SizeType32> minEstimatedReusableTokens;
         bool enough = true;
         for (auto const& [windowSize, availableBlocks] : mAvailableBlocks)
         {
             auto const needed = mKvCacheManager.getRemainingBlocksToCompletion(req, windowSize, cachedSummary);
+            if (windowSize != LinearAttentionMetadata::kRecurrentStates)
+            {
+                auto const windowEstimatedReusableTokens = req.getEstimatedReusableTokens();
+                minEstimatedReusableTokens = minEstimatedReusableTokens.has_value()
+                    ? std::min(*minEstimatedReusableTokens, windowEstimatedReusableTokens)
+                    : windowEstimatedReusableTokens;
+            }
             mCachedNeededBlocks.emplace_back(windowSize, needed);
             if (needed > availableBlocks)
             {
                 enough = false;
             }
+        }
+        if (minEstimatedReusableTokens.has_value())
+        {
+            req.setEstimatedReusableTokens(*minEstimatedReusableTokens);
         }
         return enough;
     }
@@ -94,10 +106,18 @@ public:
         LlmRequest const& req, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt)
     {
         std::map<SizeType32, SizeType32> blocksIfScheduled;
+        std::optional<SizeType32> minEstimatedReusableTokens;
         for (auto const& [windowSize, numScheduled] : mNumScheduledBlocks)
         {
             auto const required
                 = mKvCacheManager.getNeededBlocksOneStep(req, mTwoStepsLookAhead, windowSize, cachedSummary);
+            if (windowSize != LinearAttentionMetadata::kRecurrentStates)
+            {
+                auto const windowEstimatedReusableTokens = req.getEstimatedReusableTokens();
+                minEstimatedReusableTokens = minEstimatedReusableTokens.has_value()
+                    ? std::min(*minEstimatedReusableTokens, windowEstimatedReusableTokens)
+                    : windowEstimatedReusableTokens;
+            }
 
             TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu required blocks %i for %i window size",
                 req.mRequestId, required, windowSize);
@@ -110,6 +130,10 @@ public:
                 return std::nullopt;
             }
             blocksIfScheduled[windowSize] = scheduledTotal;
+        }
+        if (minEstimatedReusableTokens.has_value())
+        {
+            req.setEstimatedReusableTokens(*minEstimatedReusableTokens);
         }
         return blocksIfScheduled;
     }

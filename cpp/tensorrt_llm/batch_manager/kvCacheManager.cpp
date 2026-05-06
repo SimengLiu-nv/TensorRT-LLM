@@ -1527,17 +1527,21 @@ PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
             ++summary.reusableBlocksAllocated;
         }
     }
+    summary.totalMatchedTokens = reuseMatches.totalMatchedTokens;
     summary.firstNewBlock = reuseMatches.firstNewBlock;
 
-    TLLM_LOG_DEBUG("%s::analyzePrefixReuse - reusableAllocated=%d, reusableAll=%d, hasNewBlock=%d", mLogPrefix.c_str(),
-        summary.reusableBlocksAllocated, summary.reusableBlocksAll, summary.firstNewBlock.has_value());
+    TLLM_LOG_DEBUG(
+        "%s::analyzePrefixReuse - reusableAllocated=%d, reusableAll=%d, totalMatchedTokens=%d, "
+        "hasNewBlock=%d",
+        mLogPrefix.c_str(), summary.reusableBlocksAllocated, summary.reusableBlocksAll, summary.totalMatchedTokens,
+        summary.firstNewBlock.has_value());
     if (isKvCacheReuseDebugLoggingEnabled())
     {
         TLLM_LOG_INFO(
             "[kv-reuse-debug] %s::analyzePrefixReuse request=%lu window=%d isSWA=%s uniqueTokens=%zu blockKeys=%zu "
-            "reusableAllocated=%d reusableAll=%d hasFirstNewBlock=%s firstNewBlockTokens=%zu",
+            "reusableAllocated=%d reusableAll=%d totalMatchedTokens=%d hasFirstNewBlock=%s firstNewBlockTokens=%zu",
             mLogPrefix.c_str(), llmRequest.mRequestId, mWindowSize, logBool(mIsSWA), uniqueTokens.size(),
-            blockKeys.size(), summary.reusableBlocksAllocated, summary.reusableBlocksAll,
+            blockKeys.size(), summary.reusableBlocksAllocated, summary.reusableBlocksAll, summary.totalMatchedTokens,
             logBool(summary.firstNewBlock.has_value()),
             summary.firstNewBlock.has_value() ? summary.firstNewBlock->uniqueTokens.size() : 0);
     }
@@ -3476,8 +3480,13 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             auto const reusableSharedBlocks
                 = std::min({numReusableBlocks, numSharedBlocks, maxRecoverableSharedBlocks});
             numRequiredBlocks -= reusableSharedBlocks;
-            // Store on request so the micro batch scheduler can use it for token budget
-            req.setEstimatedReusableTokens(reusableSharedBlocks * getTokensPerBlock());
+            // Store on request so the micro batch scheduler can use it for token budget.
+            // The compute-skip estimate is a token prefix, not a block-capacity count:
+            // SWA may traverse placeholder anchors that do not subtract allocatable blocks
+            // but still make a longer prefix safe to skip.
+            auto const maxRecoverableTokensForReuse = req.mPromptLen > 0 ? req.mPromptLen - 1 : 0;
+            auto const estimatedReusableTokens = std::min(summary.totalMatchedTokens, maxRecoverableTokensForReuse);
+            req.setEstimatedReusableTokens(estimatedReusableTokens);
             if (logKvReuseDebug)
             {
                 TLLM_LOG_INFO(
@@ -3485,16 +3494,17 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
                     "contextInit=%s firstContextChunk=%s disaggGenInit=%s twoStepsLookAhead=%s promptLen=%d "
                     "chunkSize=%d draftTokens=%d tokensPerBlock=%d sinkBubbleLength=%d promptCacheLen=%d "
                     "numSharedBlocks=%d numUnSharedTokens=%d numUnSharedBlocks=%d requiredBeforeReuse=%d "
-                    "cachedSummary=%s reusableBlocksAllocated=%d reusableBlocksAll=%d promptInputLen=%d "
-                    "maxRecoverableSharedBlocks=%d reusableSharedBlocks=%d requiredAfterReuse=%d "
-                    "estimatedReusableTokens=%d",
+                    "cachedSummary=%s reusableBlocksAllocated=%d reusableBlocksAll=%d totalMatchedTokens=%d "
+                    "promptInputLen=%d maxRecoverableSharedBlocks=%d reusableSharedBlocks=%d "
+                    "maxRecoverableTokensForReuse=%d requiredAfterReuse=%d estimatedReusableTokens=%d",
                     req.mRequestId, windowSize, logBool(metadata.isSWA), logBool(req.isContextInitState()),
                     logBool(req.isFirstContextChunk()), logBool(req.isDisaggGenerationInitState()),
                     logBool(twoStepsLookAhead), req.mPromptLen, chunkSize, maxDraftTokensToAdd, getTokensPerBlock(),
                     mSinkBubbleLength, promptCacheLen, numSharedBlocks, numUnSharedTokens, numUnSharedBlocks,
                     numRequiredBlocksBeforeReuse, logBool(cachedSummary.has_value()), summary.reusableBlocksAllocated,
-                    summary.reusableBlocksAll, promptInputLen, maxRecoverableSharedBlocks, reusableSharedBlocks,
-                    numRequiredBlocks, req.getEstimatedReusableTokens());
+                    summary.reusableBlocksAll, summary.totalMatchedTokens, promptInputLen, maxRecoverableSharedBlocks,
+                    reusableSharedBlocks, maxRecoverableTokensForReuse, numRequiredBlocks,
+                    req.getEstimatedReusableTokens());
             }
         }
         else if (logKvReuseDebug)
@@ -3618,8 +3628,11 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
     SizeType32 numReusableContextBlocks = 0;
     SizeType32 numReusableBlocksAllocated = 0;
     SizeType32 numReusableBlocksAll = 0;
+    SizeType32 summaryTotalMatchedTokens = 0;
     SizeType32 maxRecoverableBlocksForReuse = 0;
     SizeType32 estimatedReusableTokenBlocks = 0;
+    SizeType32 maxRecoverableTokensForReuse = 0;
+    SizeType32 estimatedReusableTokens = 0;
     if (mEnableBlockReuse && req.isContextInitState() && req.isFirstContextChunk() && numAllocBlocksPerBeam == 0)
     {
         // Use the cached summary if provided; otherwise perform a fresh tree walk.
@@ -3636,18 +3649,21 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
         maxRecoverableBlocksForReuse = (req.mPromptLen - 1) / getTokensPerBlock();
         numReusableBlocksAllocated = summary.reusableBlocksAllocated;
         numReusableBlocksAll = summary.reusableBlocksAll;
+        summaryTotalMatchedTokens = summary.totalMatchedTokens;
         numReusableContextBlocks
             = std::min({numReusableBlocksAllocated, numContextBlocks, maxRecoverableBlocksForReuse});
-        // Token budget: count all reusable blocks (free or allocated). Cached tokens need
-        // not be recomputed regardless of whether their blocks currently have active refs.
+        // Block-shaped token estimate kept for logs/comparison. The value used by
+        // microbatch scheduling is the safe matched token prefix below.
         estimatedReusableTokenBlocks = std::min({numReusableBlocksAll, numContextBlocks, maxRecoverableBlocksForReuse});
-        req.setEstimatedReusableTokens(estimatedReusableTokenBlocks * getTokensPerBlock());
+        maxRecoverableTokensForReuse = req.mPromptLen > 0 ? req.mPromptLen - 1 : 0;
+        estimatedReusableTokens = std::min(summaryTotalMatchedTokens, maxRecoverableTokensForReuse);
+        req.setEstimatedReusableTokens(estimatedReusableTokens);
         TLLM_LOG_DEBUG(
             "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, "
-            "numReusableBlocksAllocated=%d, numReusableBlocksAll=%d, "
+            "numReusableBlocksAllocated=%d, numReusableBlocksAll=%d, totalMatchedTokens=%d, "
             "numReusableContextBlocks=%d, numGenBlocksPerBeam=%d",
             req.mRequestId, numContextBlocks, numReusableBlocksAllocated, numReusableBlocksAll,
-            numReusableContextBlocks, numGenBlocksPerBeam);
+            summaryTotalMatchedTokens, numReusableContextBlocks, numGenBlocksPerBeam);
     }
 
     // In case of sliding window attention, a new block is allocated when the
@@ -3685,16 +3701,17 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
             "[kv-reuse-debug] KVCacheManager::getRemainingBlocksToCompletion request=%lu window=%d isSWA=%s "
             "promptLen=%d maxNewTokens=%d tokensPerBlock=%d temporaryAttentionWindow=%d numContextBlocks=%d "
             "numTotalBlocksPerBeam=%d numGenBlocksPerBeam=%d numAllocBlocksPerBeam=%d cachedSummary=%s "
-            "reusableBlocksAllocated=%d reusableBlocksAll=%d reusableContextBlocks=%d estimatedReusableTokens=%d "
-            "estimatedReusableTokenBlocks=%d maxRecoverableBlocks=%d effectiveContextBlocks=%d isSlidingWindow=%s "
+            "reusableBlocksAllocated=%d reusableBlocksAll=%d totalMatchedTokens=%d reusableContextBlocks=%d "
+            "estimatedReusableTokens=%d estimatedReusableTokenBlocks=%d maxRecoverableBlocks=%d "
+            "maxRecoverableTokensForReuse=%d effectiveContextBlocks=%d isSlidingWindow=%s "
             "willCrossBlockBoundary=%s willCrossWindowBlockBoundary=%s numExtraBlocksPerBeam=%d remainingBlocks=%d",
             req.mRequestId, windowSize, logBool(metadata.isSWA), req.mPromptLen, req.mMaxNewTokens, getTokensPerBlock(),
             temporaryAttentionWindow, numContextBlocks, numTotalBlocksPerBeam, numGenBlocksPerBeam,
             numAllocBlocksPerBeam, logBool(cachedSummary.has_value()), numReusableBlocksAllocated, numReusableBlocksAll,
-            numReusableContextBlocks, req.getEstimatedReusableTokens(), estimatedReusableTokenBlocks,
-            maxRecoverableBlocksForReuse, effectiveContextBlocks, logBool(isSlidingWindow),
-            logBool(willCrossBlockBoundary), logBool(willCrossWindowBlockBoundary), numExtraBlocksPerBeam,
-            remainingBlocks);
+            summaryTotalMatchedTokens, numReusableContextBlocks, req.getEstimatedReusableTokens(),
+            estimatedReusableTokenBlocks, maxRecoverableBlocksForReuse, maxRecoverableTokensForReuse,
+            effectiveContextBlocks, logBool(isSlidingWindow), logBool(willCrossBlockBoundary),
+            logBool(willCrossWindowBlockBoundary), numExtraBlocksPerBeam, remainingBlocks);
     }
 
     return remainingBlocks;
@@ -3973,7 +3990,14 @@ void KVCacheManager::addSequenceBatch(
         {
             auto const reusablePrepopulatedLen
                 = hasNonSwaWindow[i] ? minNonSwaPrepopulatedLen[i] : minPrepopulatedLen[i];
-            auto const selectedPrepopulatedLen = reusablePrepopulatedLen;
+            // There is still one request-level prepopulated cursor shared by
+            // full-attention and SWA layers. Select the largest prefix that is
+            // safe for every window. A promptLen-window cap is only a
+            // counterfactual diagnostic: it can be too conservative when SWA has
+            // the needed prefix cached, and unsafe when SWA's own safe prefix is
+            // shorter than that cap.
+            auto const swaSafePrepopulatedLen = hasSwaWindow[i] ? minSwaPrepopulatedLen[i] : reusablePrepopulatedLen;
+            auto const selectedPrepopulatedLen = std::min(reusablePrepopulatedLen, swaSafePrepopulatedLen);
             if (logKvReuseDebug)
             {
                 auto const smallestSwaWindow = getSmallestSwaWindow(mBlockManager.getWindowSizesMetadata());
@@ -3993,15 +4017,18 @@ void KVCacheManager::addSequenceBatch(
                     "[kv-reuse-debug] KVCacheManager::addSequenceBatch select request=%lu promptLen=%d "
                     "tokensPerBlock=%d hasNonSwaWindow=%s hasSwaWindow=%s fullAttentionPrepopulatedLen=%d "
                     "swaPrepopulatedLen=%d minAllPrepopulatedLen=%d reusablePrepopulatedLen=%d "
-                    "smallestSwaWindow=%d selectedPrepopulatedLen=%d uncachedSuffix=%d cappedPrepopulatedLen=%d "
-                    "cappedUncachedSuffix=%d capWouldApply=%s totalAllocTotalDelta=%d totalAllocNewDelta=%d "
-                    "totalReusedDelta=%d totalMissedDelta=%d",
+                    "swaSafePrepopulatedLen=%d smallestSwaWindow=%d selectedPrepopulatedLen=%d "
+                    "uncachedSuffix=%d cappedPrepopulatedLen=%d cappedUncachedSuffix=%d capWouldApply=%s "
+                    "fullOnlyUnsafeTokens=%d totalAllocTotalDelta=%d totalAllocNewDelta=%d totalReusedDelta=%d "
+                    "totalMissedDelta=%d",
                     llmRequest.mRequestId, llmRequest.getPromptLen(), getTokensPerBlock(), logBool(hasNonSwaWindow[i]),
                     logBool(hasSwaWindow[i]), fullAttentionPrepopulatedLen, swaPrepopulatedLen, minPrepopulatedLen[i],
-                    reusablePrepopulatedLen, smallestSwaWindow.value_or(static_cast<SizeType32>(-1)),
-                    selectedPrepopulatedLen, uncachedSuffix, cappedPrepopulatedLen, cappedUncachedSuffix,
-                    logBool(cappedPrepopulatedLen < reusablePrepopulatedLen), totalAllocTotalDelta[i],
-                    totalAllocNewDelta[i], totalReusedDelta[i], totalMissedDelta[i]);
+                    reusablePrepopulatedLen, swaSafePrepopulatedLen,
+                    smallestSwaWindow.value_or(static_cast<SizeType32>(-1)), selectedPrepopulatedLen, uncachedSuffix,
+                    cappedPrepopulatedLen, cappedUncachedSuffix,
+                    logBool(cappedPrepopulatedLen < reusablePrepopulatedLen),
+                    reusablePrepopulatedLen - selectedPrepopulatedLen, totalAllocTotalDelta[i], totalAllocNewDelta[i],
+                    totalReusedDelta[i], totalMissedDelta[i]);
             }
             TLLM_LOG_DEBUG("KVCacheManager::addSequenceBatch: Setting prepopulatedPromptLen to %d for request %lu",
                 selectedPrepopulatedLen, llmRequest.mRequestId);
