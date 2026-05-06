@@ -155,6 +155,32 @@ SizeType32 getFirstRealBlockIdxForWindow(
     return logicalBlocks > physicalBlocks ? logicalBlocks - physicalBlocks : 0;
 }
 
+std::optional<SizeType32> getSmallestSwaWindow(std::map<SizeType32, WindowSizeMetadata> const& metadataByWindow)
+{
+    std::optional<SizeType32> smallestSwaWindow;
+    for (auto const& [windowSize, metadata] : metadataByWindow)
+    {
+        if (metadata.isSWA)
+        {
+            smallestSwaWindow = smallestSwaWindow.has_value() ? std::min(*smallestSwaWindow, windowSize) : windowSize;
+        }
+    }
+    return smallestSwaWindow;
+}
+
+SizeType32 capPrepopulatedLenForSwaReuse(
+    SizeType32 prepopulatedLen, SizeType32 promptLen, std::map<SizeType32, WindowSizeMetadata> const& metadataByWindow)
+{
+    auto const smallestSwaWindow = getSmallestSwaWindow(metadataByWindow);
+    if (!smallestSwaWindow.has_value() || promptLen <= *smallestSwaWindow)
+    {
+        return prepopulatedLen;
+    }
+
+    auto const maxSwaSafePrepopulatedLen = promptLen - *smallestSwaWindow;
+    return std::min(prepopulatedLen, maxSwaSafePrepopulatedLen);
+}
+
 } // namespace
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
@@ -3757,8 +3783,10 @@ void KVCacheManager::addSequenceBatch(
 
         if (mEnableBlockReuse)
         {
-            auto const selectedPrepopulatedLen
+            auto const reusablePrepopulatedLen
                 = hasNonSwaWindow[i] ? minNonSwaPrepopulatedLen[i] : minPrepopulatedLen[i];
+            auto const selectedPrepopulatedLen = capPrepopulatedLenForSwaReuse(
+                reusablePrepopulatedLen, llmRequest.getPromptLen(), mBlockManager.getWindowSizesMetadata());
             TLLM_LOG_DEBUG("KVCacheManager::addSequenceBatch: Setting prepopulatedPromptLen to %d for request %lu",
                 selectedPrepopulatedLen, llmRequest.mRequestId);
             llmRequest.setPrepopulatedPromptLen(selectedPrepopulatedLen, getTokensPerBlock());

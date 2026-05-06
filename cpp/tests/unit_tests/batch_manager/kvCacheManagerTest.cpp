@@ -4287,6 +4287,69 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
 }
 
+TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowReuseKeepsFreshSwaWindow)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numHeads = 2;
+    auto constexpr sizePerHead = 64;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr sinkTokenLength = 0;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr maxSequenceLength = 64;
+
+    auto constexpr swaAttentionWindow = 8;
+    auto constexpr fullAttentionWindow = maxSequenceLength;
+    auto const maxAttentionWindowVec = std::vector<SizeType32>{swaAttentionWindow, fullAttentionWindow};
+
+    auto constexpr blocksInPrimaryPoolPerWindow = 32;
+    auto constexpr blocksInSecondaryPoolPerWindow = 32;
+    auto constexpr enableBlockReuse = true;
+
+    auto const blocksPerWindow
+        = BlocksPerWindow{{swaAttentionWindow, {blocksInPrimaryPoolPerWindow, blocksInSecondaryPoolPerWindow}},
+            {fullAttentionWindow, {blocksInPrimaryPoolPerWindow, blocksInSecondaryPoolPerWindow}}};
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        maxBeamWidth, maxAttentionWindowVec, std::nullopt, dtype, sinkTokenLength, stream, maxSequenceLength,
+        enableBlockReuse);
+    kvCacheManager.allocatePools(false);
+
+    SizeType32 constexpr maxNewTokens = 8;
+    auto constexpr beamWidth = maxBeamWidth;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    TokenIdType constexpr firstToken = 1000;
+    auto constexpr storedInputLength = 40;
+    auto storedInputTokens = std::make_shared<VecTokens>(storedInputLength);
+    std::iota(storedInputTokens->begin(), storedInputTokens->end(), firstToken);
+    auto storedRequest
+        = std::make_shared<LlmRequest>(/*requestId=*/0, maxNewTokens, storedInputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequenceBatch({{{/*requestId=*/0, storedInputLength, beamWidth}}}, {std::ref(*storedRequest)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*storedRequest);
+    kvCacheManager.storeContextBlocks(*storedRequest);
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(/*requestId=*/0, storedRequest)));
+
+    auto constexpr reusedPrefixLength = storedInputLength - 1;
+    auto constexpr secondInputLength = reusedPrefixLength + swaAttentionWindow - 1;
+    auto secondInputTokens = std::make_shared<VecTokens>(secondInputLength);
+    std::iota(secondInputTokens->begin(), secondInputTokens->begin() + reusedPrefixLength, firstToken);
+    std::iota(
+        secondInputTokens->begin() + reusedPrefixLength, secondInputTokens->end(), firstToken + storedInputLength);
+    auto secondRequest
+        = std::make_shared<LlmRequest>(/*requestId=*/1, maxNewTokens, secondInputTokens, samplingConfig, isStreaming);
+
+    kvCacheManager.addSequenceBatch({{{/*requestId=*/1, secondInputLength, beamWidth}}}, {std::ref(*secondRequest)});
+
+    EXPECT_EQ(secondRequest->getPrepopulatedPromptLen(), secondInputLength - swaAttentionWindow);
+    EXPECT_EQ(secondRequest->getContextCurrentPosition(), secondInputLength - swaAttentionWindow);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*secondRequest);
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(/*requestId=*/1, secondRequest)));
+}
+
 TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamOverflow)
 {
     auto constexpr numLayers = 12;
