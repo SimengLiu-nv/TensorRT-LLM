@@ -241,8 +241,9 @@ SizeType32 getUsableUniqueTokenCountForReuse(
 std::vector<SizeType32> getReuseSafeWindowOrder(std::map<SizeType32, WindowSizeMetadata> const& metadataByWindow)
 {
     // Mixed full+SWA models keep a single request-level cached-prefix scalar.
-    // Process full-attention windows first so the short SWA tail cannot cap
-    // the prefix that full-attention layers can safely reuse.
+    // Process full-attention windows first so later SWA windows can only lower
+    // the per-sequence reusable-prefix cursor. GenerationRequest enforces that
+    // per-window currentPrepopulatedPromptLen moves non-increasingly.
     std::vector<SizeType32> orderedWindowSizes;
     orderedWindowSizes.reserve(metadataByWindow.size());
 
@@ -1763,6 +1764,13 @@ PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
     summary.latestRealValueEndToken = reuseMatches.latestRealValueEndToken;
     summary.trailingRealValueBlocks = reuseMatches.trailingRealValueBlocks;
     summary.trailingRealValueTokens = reuseMatches.trailingRealValueTokens;
+    summary.rawCandidateMatchedTokens = reuseMatches.rawCandidateMatchedTokens;
+    summary.rawCandidateMatchBlocks = reuseMatches.rawCandidateMatchBlocks;
+    summary.safeMatchBlocks = static_cast<SizeType32>(reuseMatches.matches.size());
+    summary.firstMissBlockIdx = reuseMatches.firstMissBlockIdx;
+    summary.firstMissPrefixTokens = reuseMatches.firstMissPrefixTokens;
+    summary.firstMissBlockTokens = reuseMatches.firstMissBlockTokens;
+    summary.stoppedByMaxMatchedTokens = reuseMatches.stoppedByMaxMatchedTokens;
 
     TLLM_LOG_DEBUG(
         "%s::analyzePrefixReuse - reusableAllocated=%d, reusableAll=%d, totalMatchedTokens=%d, "
@@ -1782,7 +1790,9 @@ PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
             "[kv-reuse-debug] %s::analyzePrefixReuse-path request=%lu window=%d isSWA=%s exactNodesVisited=%d "
             "realValueMatches=%d valueLessTraversalNodes=%d partialValueMatches=%d latestMissingAnchorEndToken=%d "
             "committedPrefixAfterMissingAnchor=%d latestRealValueEndToken=%d trailingRealValueBlocks=%d "
-            "trailingRealValueTokens=%d newestSwaAnchorValid=%s newestSwaAnchorBlockId=%d "
+            "trailingRealValueTokens=%d rawCandidateMatchedTokens=%d rawCandidateMatchBlocks=%d safeMatchBlocks=%d "
+            "firstMissBlockIdx=%d firstMissPrefixTokens=%d firstMissBlockTokens=%d stoppedByMaxMatchedTokens=%s "
+            "newestSwaAnchorValid=%s newestSwaAnchorBlockId=%d "
             "newestSwaAnchorPrefixTokens=%d swaRealStores=%llu swaExistingRealStores=%llu "
             "swaOowPlaceholders=%llu swaOowAnchorHits=%llu swaOowAnchorMisses=%llu swaOowDetachReplacements=%llu "
             "swaEvictedStoredBlocks=%llu swaEvictedNewestBlocks=%llu",
@@ -1790,8 +1800,11 @@ PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
             summary.realValueMatches, summary.valueLessTraversalNodes, summary.partialValueMatches,
             summary.latestMissingAnchorEndToken, summary.committedPrefixAfterMissingAnchor,
             summary.latestRealValueEndToken, summary.trailingRealValueBlocks, summary.trailingRealValueTokens,
-            logBool(mSwaDebugHistory.newestRealAnchorValid), mSwaDebugHistory.newestRealBlockId,
-            mSwaDebugHistory.newestRealPrefixTokens, static_cast<unsigned long long>(mSwaDebugHistory.realStores),
+            summary.rawCandidateMatchedTokens, summary.rawCandidateMatchBlocks, summary.safeMatchBlocks,
+            summary.firstMissBlockIdx, summary.firstMissPrefixTokens, summary.firstMissBlockTokens,
+            logBool(summary.stoppedByMaxMatchedTokens), logBool(mSwaDebugHistory.newestRealAnchorValid),
+            mSwaDebugHistory.newestRealBlockId, mSwaDebugHistory.newestRealPrefixTokens,
+            static_cast<unsigned long long>(mSwaDebugHistory.realStores),
             static_cast<unsigned long long>(mSwaDebugHistory.existingRealStores),
             static_cast<unsigned long long>(mSwaDebugHistory.oowPlaceholders),
             static_cast<unsigned long long>(mSwaDebugHistory.oowPlaceholderAnchorHits),
@@ -1816,9 +1829,12 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
     SizeType32 candidateLatestRealValueEndToken{0};
     SizeType32 candidateTrailingRealValueBlocks{0};
     SizeType32 candidateTrailingRealValueTokens{0};
+    SizeType32 blockIdx{0};
 
     auto updateSafePrefix = [&]()
     {
+        result.rawCandidateMatchedTokens = candidateMatchedTokens;
+        result.rawCandidateMatchBlocks = static_cast<SizeType32>(candidateMatches.size());
         if (!mIsSWA || latestMissingAnchorEndToken == 0
             || candidateMatchedTokens >= latestMissingAnchorEndToken + mWindowSize)
         {
@@ -1848,6 +1864,10 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
             auto const numMatchedTokens = static_cast<SizeType32>(blockKey.uniqueTokens.size());
             if (candidateMatchedTokens + numMatchedTokens > maxMatchedTokens)
             {
+                result.stoppedByMaxMatchedTokens = true;
+                result.firstMissBlockIdx = blockIdx;
+                result.firstMissPrefixTokens = candidateMatchedTokens;
+                result.firstMissBlockTokens = numMatchedTokens;
                 break;
             }
 
@@ -1875,11 +1895,15 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
             }
             else
             {
+                result.firstMissBlockIdx = blockIdx;
+                result.firstMissPrefixTokens = candidateMatchedTokens;
+                result.firstMissBlockTokens = numMatchedTokens;
                 break;
             }
 
             searchNode = node;
             updateSafePrefix();
+            ++blockIdx;
             continue;
         }
 
@@ -1908,13 +1932,28 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
                         candidateTrailingRealValueTokens += numMatchedTokens;
                         updateSafePrefix();
                     }
+                    else
+                    {
+                        result.stoppedByMaxMatchedTokens = true;
+                        result.firstMissBlockIdx = blockIdx;
+                        result.firstMissPrefixTokens = candidateMatchedTokens;
+                        result.firstMissBlockTokens = numMatchedTokens;
+                    }
                     break;
                 }
             }
         }
+        if (result.firstMissBlockIdx < 0 && blockIdx < static_cast<SizeType32>(blockKeys.size()))
+        {
+            result.firstMissBlockIdx = blockIdx;
+            result.firstMissPrefixTokens = candidateMatchedTokens;
+            result.firstMissBlockTokens = static_cast<SizeType32>(blockKey.uniqueTokens.size());
+        }
         break;
     }
 
+    result.rawCandidateMatchedTokens = candidateMatchedTokens;
+    result.rawCandidateMatchBlocks = static_cast<SizeType32>(candidateMatches.size());
     if (result.matches.size() < blockKeys.size())
     {
         result.firstNewBlock = blockKeys[result.matches.size()];
@@ -3889,7 +3928,9 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
                     "maxRecoverableTokensForReuse=%d requiredAfterReuse=%d estimatedReusableTokens=%d "
                     "exactNodesVisited=%d realValueMatches=%d valueLessTraversalNodes=%d partialValueMatches=%d "
                     "latestMissingAnchorEndToken=%d committedPrefixAfterMissingAnchor=%d latestRealValueEndToken=%d "
-                    "trailingRealValueBlocks=%d trailingRealValueTokens=%d primaryUsedBlocks=%d primaryFreeBlocks=%d "
+                    "trailingRealValueBlocks=%d trailingRealValueTokens=%d rawCandidateMatchedTokens=%d "
+                    "rawCandidateMatchBlocks=%d safeMatchBlocks=%d firstMissBlockIdx=%d firstMissPrefixTokens=%d "
+                    "firstMissBlockTokens=%d stoppedByMaxMatchedTokens=%s primaryUsedBlocks=%d primaryFreeBlocks=%d "
                     "primaryMaxBlocks=%d primaryUsedPct=%.2f",
                     req.mRequestId, windowSize, logBool(metadata.isSWA), logBool(req.isContextInitState()),
                     logBool(req.isFirstContextChunk()), logBool(req.isDisaggGenerationInitState()),
@@ -3901,8 +3942,10 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
                     req.getEstimatedReusableTokens(), summary.exactNodesVisited, summary.realValueMatches,
                     summary.valueLessTraversalNodes, summary.partialValueMatches, summary.latestMissingAnchorEndToken,
                     summary.committedPrefixAfterMissingAnchor, summary.latestRealValueEndToken,
-                    summary.trailingRealValueBlocks, summary.trailingRealValueTokens, primaryUsedBlocks,
-                    primaryFreeBlocks, primaryMaxBlocks,
+                    summary.trailingRealValueBlocks, summary.trailingRealValueTokens, summary.rawCandidateMatchedTokens,
+                    summary.rawCandidateMatchBlocks, summary.safeMatchBlocks, summary.firstMissBlockIdx,
+                    summary.firstMissPrefixTokens, summary.firstMissBlockTokens,
+                    logBool(summary.stoppedByMaxMatchedTokens), primaryUsedBlocks, primaryFreeBlocks, primaryMaxBlocks,
                     primaryMaxBlocks > 0
                         ? 100.0 * static_cast<double>(primaryUsedBlocks) / static_cast<double>(primaryMaxBlocks)
                         : 0.0);
@@ -3917,12 +3960,22 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
                     "returnBlocks=%d requiredBeforeReuse=%d numSharedBlocks=%d promptInputLen=%d "
                     "maxRecoverableSharedBlocks=%d reusableSharedBlocks=%d reusableBlocksAllocated=%d "
                     "reusableBlocksAll=%d totalMatchedTokens=%d estimatedReusableTokens=%d "
-                    "contextCurrentPosition=%d",
+                    "contextCurrentPosition=%d exactNodesVisited=%d realValueMatches=%d valueLessTraversalNodes=%d "
+                    "latestMissingAnchorEndToken=%d committedPrefixAfterMissingAnchor=%d latestRealValueEndToken=%d "
+                    "trailingRealValueBlocks=%d trailingRealValueTokens=%d rawCandidateMatchedTokens=%d "
+                    "rawCandidateMatchBlocks=%d safeMatchBlocks=%d firstMissBlockIdx=%d firstMissPrefixTokens=%d "
+                    "firstMissBlockTokens=%d stoppedByMaxMatchedTokens=%s",
                     static_cast<void const*>(this), windowSet.c_str(), req.mRequestId, windowSize,
                     logBool(metadata.isSWA), numRequiredBlocks, numRequiredBlocksBeforeReuse, numSharedBlocks,
                     promptInputLen, maxRecoverableSharedBlocks, reusableSharedBlocks, summary.reusableBlocksAllocated,
                     summary.reusableBlocksAll, summary.totalMatchedTokens, req.getEstimatedReusableTokens(),
-                    req.getContextCurrentPosition());
+                    req.getContextCurrentPosition(), summary.exactNodesVisited, summary.realValueMatches,
+                    summary.valueLessTraversalNodes, summary.latestMissingAnchorEndToken,
+                    summary.committedPrefixAfterMissingAnchor, summary.latestRealValueEndToken,
+                    summary.trailingRealValueBlocks, summary.trailingRealValueTokens, summary.rawCandidateMatchedTokens,
+                    summary.rawCandidateMatchBlocks, summary.safeMatchBlocks, summary.firstMissBlockIdx,
+                    summary.firstMissPrefixTokens, summary.firstMissBlockTokens,
+                    logBool(summary.stoppedByMaxMatchedTokens));
             }
         }
         else if (logKvReuseDebug)
@@ -4087,6 +4140,13 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
     SizeType32 summaryLatestRealValueEndToken = 0;
     SizeType32 summaryTrailingRealValueBlocks = 0;
     SizeType32 summaryTrailingRealValueTokens = 0;
+    SizeType32 summaryRawCandidateMatchedTokens = 0;
+    SizeType32 summaryRawCandidateMatchBlocks = 0;
+    SizeType32 summarySafeMatchBlocks = 0;
+    SizeType32 summaryFirstMissBlockIdx = -1;
+    SizeType32 summaryFirstMissPrefixTokens = 0;
+    SizeType32 summaryFirstMissBlockTokens = 0;
+    bool summaryStoppedByMaxMatchedTokens = false;
     SizeType32 maxRecoverableBlocksForReuse = 0;
     SizeType32 estimatedReusableTokenBlocks = 0;
     SizeType32 maxRecoverableTokensForReuse = 0;
@@ -4117,6 +4177,13 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
         summaryLatestRealValueEndToken = summary.latestRealValueEndToken;
         summaryTrailingRealValueBlocks = summary.trailingRealValueBlocks;
         summaryTrailingRealValueTokens = summary.trailingRealValueTokens;
+        summaryRawCandidateMatchedTokens = summary.rawCandidateMatchedTokens;
+        summaryRawCandidateMatchBlocks = summary.rawCandidateMatchBlocks;
+        summarySafeMatchBlocks = summary.safeMatchBlocks;
+        summaryFirstMissBlockIdx = summary.firstMissBlockIdx;
+        summaryFirstMissPrefixTokens = summary.firstMissPrefixTokens;
+        summaryFirstMissBlockTokens = summary.firstMissBlockTokens;
+        summaryStoppedByMaxMatchedTokens = summary.stoppedByMaxMatchedTokens;
         numReusableContextBlocks
             = std::min({numReusableBlocksAllocated, numContextBlocks, maxRecoverableBlocksForReuse});
         // Block-shaped token estimate kept for logs/comparison. The value used by
@@ -4177,7 +4244,9 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
             "willCrossBlockBoundary=%s willCrossWindowBlockBoundary=%s numExtraBlocksPerBeam=%d remainingBlocks=%d "
             "exactNodesVisited=%d realValueMatches=%d valueLessTraversalNodes=%d partialValueMatches=%d "
             "latestMissingAnchorEndToken=%d committedPrefixAfterMissingAnchor=%d latestRealValueEndToken=%d "
-            "trailingRealValueBlocks=%d trailingRealValueTokens=%d primaryUsedBlocks=%d primaryFreeBlocks=%d "
+            "trailingRealValueBlocks=%d trailingRealValueTokens=%d rawCandidateMatchedTokens=%d "
+            "rawCandidateMatchBlocks=%d safeMatchBlocks=%d firstMissBlockIdx=%d firstMissPrefixTokens=%d "
+            "firstMissBlockTokens=%d stoppedByMaxMatchedTokens=%s primaryUsedBlocks=%d primaryFreeBlocks=%d "
             "primaryMaxBlocks=%d primaryUsedPct=%.2f",
             req.mRequestId, windowSize, logBool(metadata.isSWA), req.mPromptLen, req.mMaxNewTokens, getTokensPerBlock(),
             temporaryAttentionWindow, numContextBlocks, numTotalBlocksPerBeam, numGenBlocksPerBeam,
@@ -4189,7 +4258,9 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
             summaryRealValueMatches, summaryValueLessTraversalNodes, summaryPartialValueMatches,
             summaryLatestMissingAnchorEndToken, summaryCommittedPrefixAfterMissingAnchor,
             summaryLatestRealValueEndToken, summaryTrailingRealValueBlocks, summaryTrailingRealValueTokens,
-            primaryUsedBlocks, primaryFreeBlocks, primaryMaxBlocks,
+            summaryRawCandidateMatchedTokens, summaryRawCandidateMatchBlocks, summarySafeMatchBlocks,
+            summaryFirstMissBlockIdx, summaryFirstMissPrefixTokens, summaryFirstMissBlockTokens,
+            logBool(summaryStoppedByMaxMatchedTokens), primaryUsedBlocks, primaryFreeBlocks, primaryMaxBlocks,
             primaryMaxBlocks > 0
                 ? 100.0 * static_cast<double>(primaryUsedBlocks) / static_cast<double>(primaryMaxBlocks)
                 : 0.0);
@@ -4205,12 +4276,21 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
             "returnBlocks=%d promptLen=%d maxNewTokens=%d numContextBlocks=%d numTotalBlocksPerBeam=%d "
             "numGenBlocksPerBeam=%d numAllocBlocksPerBeam=%d reusableContextBlocks=%d "
             "reusableBlocksAllocated=%d reusableBlocksAll=%d totalMatchedTokens=%d estimatedReusableTokens=%d "
-            "effectiveContextBlocks=%d numExtraBlocksPerBeam=%d contextCurrentPosition=%d",
+            "effectiveContextBlocks=%d numExtraBlocksPerBeam=%d contextCurrentPosition=%d "
+            "exactNodesVisited=%d realValueMatches=%d valueLessTraversalNodes=%d latestMissingAnchorEndToken=%d "
+            "committedPrefixAfterMissingAnchor=%d latestRealValueEndToken=%d trailingRealValueBlocks=%d "
+            "trailingRealValueTokens=%d rawCandidateMatchedTokens=%d rawCandidateMatchBlocks=%d safeMatchBlocks=%d "
+            "firstMissBlockIdx=%d firstMissPrefixTokens=%d firstMissBlockTokens=%d stoppedByMaxMatchedTokens=%s",
             static_cast<void const*>(this), windowSet.c_str(), req.mRequestId, windowSize, logBool(metadata.isSWA),
             remainingBlocks, req.mPromptLen, req.mMaxNewTokens, numContextBlocks, numTotalBlocksPerBeam,
             numGenBlocksPerBeam, numAllocBlocksPerBeam, numReusableContextBlocks, numReusableBlocksAllocated,
             numReusableBlocksAll, summaryTotalMatchedTokens, req.getEstimatedReusableTokens(), effectiveContextBlocks,
-            numExtraBlocksPerBeam, req.getContextCurrentPosition());
+            numExtraBlocksPerBeam, req.getContextCurrentPosition(), summaryExactNodesVisited, summaryRealValueMatches,
+            summaryValueLessTraversalNodes, summaryLatestMissingAnchorEndToken,
+            summaryCommittedPrefixAfterMissingAnchor, summaryLatestRealValueEndToken, summaryTrailingRealValueBlocks,
+            summaryTrailingRealValueTokens, summaryRawCandidateMatchedTokens, summaryRawCandidateMatchBlocks,
+            summarySafeMatchBlocks, summaryFirstMissBlockIdx, summaryFirstMissPrefixTokens, summaryFirstMissBlockTokens,
+            logBool(summaryStoppedByMaxMatchedTokens));
     }
 
     logKvCacheBlockQueryReturn(
@@ -4559,8 +4639,7 @@ void KVCacheManager::addSequenceBatch(
             // There is still one request-level prepopulated cursor shared by
             // full-attention and SWA layers. It must remain safe for every
             // window; otherwise the executor can skip tokens whose SWA tail is
-            // not backed by real KV blocks. Scheduler accounting may still use
-            // the non-SWA estimate before this authoritative cursor is set.
+            // not backed by real KV blocks.
             auto const swaSafePrepopulatedLen = hasSwaWindow[i] ? minSwaPrepopulatedLen[i] : reusablePrepopulatedLen;
             auto const selectedPrepopulatedLen = std::min(reusablePrepopulatedLen, swaSafePrepopulatedLen);
             if (logKvReuseDebug)

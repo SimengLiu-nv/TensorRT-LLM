@@ -45,7 +45,6 @@ public:
     {
         mCachedNeededBlocks.clear();
         std::optional<SizeType32> minEstimatedReusableTokens;
-        std::optional<SizeType32> minNonSwaEstimatedReusableTokens;
         bool enough = true;
         for (auto const& [windowSize, availableBlocks] : mAvailableBlocks)
         {
@@ -56,12 +55,6 @@ public:
                 minEstimatedReusableTokens = minEstimatedReusableTokens.has_value()
                     ? std::min(*minEstimatedReusableTokens, windowEstimatedReusableTokens)
                     : windowEstimatedReusableTokens;
-                if (!mKvCacheManager.getBlockManager().getWindowSizeMetadata(windowSize).isSWA)
-                {
-                    minNonSwaEstimatedReusableTokens = minNonSwaEstimatedReusableTokens.has_value()
-                        ? std::min(*minNonSwaEstimatedReusableTokens, windowEstimatedReusableTokens)
-                        : windowEstimatedReusableTokens;
-                }
             }
             mCachedNeededBlocks.emplace_back(windowSize, needed);
             if (needed > availableBlocks)
@@ -69,11 +62,7 @@ public:
                 enough = false;
             }
         }
-        if (minNonSwaEstimatedReusableTokens.has_value())
-        {
-            req.setEstimatedReusableTokens(*minNonSwaEstimatedReusableTokens);
-        }
-        else if (minEstimatedReusableTokens.has_value())
+        if (minEstimatedReusableTokens.has_value())
         {
             req.setEstimatedReusableTokens(*minEstimatedReusableTokens);
         }
@@ -118,7 +107,6 @@ public:
     {
         std::map<SizeType32, SizeType32> blocksIfScheduled;
         std::optional<SizeType32> minEstimatedReusableTokens;
-        std::optional<SizeType32> minNonSwaEstimatedReusableTokens;
         for (auto const& [windowSize, numScheduled] : mNumScheduledBlocks)
         {
             auto const required
@@ -129,12 +117,6 @@ public:
                 minEstimatedReusableTokens = minEstimatedReusableTokens.has_value()
                     ? std::min(*minEstimatedReusableTokens, windowEstimatedReusableTokens)
                     : windowEstimatedReusableTokens;
-                if (!mKvCacheManager.getBlockManager().getWindowSizeMetadata(windowSize).isSWA)
-                {
-                    minNonSwaEstimatedReusableTokens = minNonSwaEstimatedReusableTokens.has_value()
-                        ? std::min(*minNonSwaEstimatedReusableTokens, windowEstimatedReusableTokens)
-                        : windowEstimatedReusableTokens;
-                }
             }
 
             TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu required blocks %i for %i window size",
@@ -149,11 +131,7 @@ public:
             }
             blocksIfScheduled[windowSize] = scheduledTotal;
         }
-        if (minNonSwaEstimatedReusableTokens.has_value())
-        {
-            req.setEstimatedReusableTokens(*minNonSwaEstimatedReusableTokens);
-        }
-        else if (minEstimatedReusableTokens.has_value())
+        if (minEstimatedReusableTokens.has_value())
         {
             req.setEstimatedReusableTokens(*minEstimatedReusableTokens);
         }

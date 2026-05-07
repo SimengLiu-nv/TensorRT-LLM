@@ -772,6 +772,13 @@ struct PrefixReuseSummary
     SizeType32 latestRealValueEndToken{0};
     SizeType32 trailingRealValueBlocks{0};
     SizeType32 trailingRealValueTokens{0};
+    SizeType32 rawCandidateMatchedTokens{0};
+    SizeType32 rawCandidateMatchBlocks{0};
+    SizeType32 safeMatchBlocks{0};
+    SizeType32 firstMissBlockIdx{-1};
+    SizeType32 firstMissPrefixTokens{0};
+    SizeType32 firstMissBlockTokens{0};
+    bool stoppedByMaxMatchedTokens{false};
 };
 
 // The WindowBlockManager manages the metadata of KVCacheBlocks.
@@ -1223,6 +1230,12 @@ private:
         SizeType32 latestRealValueEndToken{0};
         SizeType32 trailingRealValueBlocks{0};
         SizeType32 trailingRealValueTokens{0};
+        SizeType32 rawCandidateMatchedTokens{0};
+        SizeType32 rawCandidateMatchBlocks{0};
+        SizeType32 firstMissBlockIdx{-1};
+        SizeType32 firstMissPrefixTokens{0};
+        SizeType32 firstMissBlockTokens{0};
+        bool stoppedByMaxMatchedTokens{false};
     };
 
     struct SwaDebugHistory
