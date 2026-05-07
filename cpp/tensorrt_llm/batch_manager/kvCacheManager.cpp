@@ -83,6 +83,12 @@ bool isSwaReuseAnchorProtectionEnabled() noexcept
     return isTruthyEnvVar("TLLM_VSWA_PROTECT_REUSE_ANCHORS") || isTruthyEnvVar("TRTLLM_VSWA_PROTECT_REUSE_ANCHORS");
 }
 
+bool isSwaFullContextReuseProbeEnabled() noexcept
+{
+    return isTruthyEnvVar("TLLM_VSWA_FULL_CONTEXT_REUSE_PROBE")
+        || isTruthyEnvVar("TRTLLM_VSWA_FULL_CONTEXT_REUSE_PROBE");
+}
+
 char const* logBool(bool value) noexcept
 {
     return value ? "true" : "false";
@@ -284,6 +290,11 @@ SizeType32 getFirstRealBlockIdxForWindow(
     // SWA context only needs a bounded physical tail, but the request still
     // has a full logical block table. Blocks before firstRealBlockIdx remain
     // placeholders and are aliased when context block offsets are copied.
+    if (metadata.isSWA && isSwaFullContextReuseProbeEnabled())
+    {
+        return 0;
+    }
+
     auto const logicalInputLength = std::min(inputLength, metadata.maxTokenNum + metadata.temporaryAttentionWindow);
     auto const logicalBlocks = tc::ceilDiv(logicalInputLength, tokensPerBlock);
     if (!metadata.isSWA || metadata.temporaryAttentionWindow <= 0)
@@ -3899,9 +3910,11 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
         auto const metadata = mBlockManager.getWindowSizeMetadata(windowSize);
         auto const chunkSize = req.mMaxNewTokens;
         auto const maxDraftTokensToAdd = req.getNumDraftTokens();
-        auto const promptCacheLen
-            = std::min((isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + maxDraftTokensToAdd,
-                  windowSize + chunkSize)
+        auto const requestedPromptCacheLen
+            = (isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + maxDraftTokensToAdd;
+        auto const promptCacheLen = ((metadata.isSWA && isSwaFullContextReuseProbeEnabled())
+                                            ? requestedPromptCacheLen
+                                            : std::min(requestedPromptCacheLen, windowSize + chunkSize))
             + mSinkBubbleLength;
         auto const numSharedBlocks = promptCacheLen / getTokensPerBlock();
         auto const numUnSharedTokens = promptCacheLen % getTokensPerBlock();
@@ -4119,12 +4132,15 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
     auto const metadata = mBlockManager.getWindowSizeMetadata(windowSize);
     auto const temporaryAttentionWindow = metadata.temporaryAttentionWindow;
 
-    SizeType32 const numContextBlocks
-        = (std::min(req.mPromptLen, windowSize + temporaryAttentionWindow) + mSinkBubbleLength) / getTokensPerBlock();
+    auto const contextTokenLimit = (metadata.isSWA && isSwaFullContextReuseProbeEnabled())
+        ? req.mPromptLen
+        : std::min(req.mPromptLen, windowSize + temporaryAttentionWindow);
+    SizeType32 const numContextBlocks = (contextTokenLimit + mSinkBubbleLength) / getTokensPerBlock();
 
-    SizeType32 const numTotalBlocksPerBeam = tc::ceilDiv(
-        std::min(req.mPromptLen + req.mMaxNewTokens, windowSize + temporaryAttentionWindow) + mSinkBubbleLength,
-        getTokensPerBlock());
+    auto const totalTokenLimit = (metadata.isSWA && isSwaFullContextReuseProbeEnabled())
+        ? req.mPromptLen + req.mMaxNewTokens
+        : std::min(req.mPromptLen + req.mMaxNewTokens, windowSize + temporaryAttentionWindow);
+    SizeType32 const numTotalBlocksPerBeam = tc::ceilDiv(totalTokenLimit + mSinkBubbleLength, getTokensPerBlock());
 
     SizeType32 const numGenBlocksPerBeam = numTotalBlocksPerBeam - numContextBlocks;
 
