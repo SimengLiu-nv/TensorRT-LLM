@@ -68,6 +68,11 @@ bool isKvCacheReuseDebugLoggingEnabled() noexcept
         || isTruthyEnvVar("TRTLLM_VSWA_REUSE_PROOF_LOG");
 }
 
+bool isSwaReuseAnchorProtectionEnabled() noexcept
+{
+    return isTruthyEnvVar("TLLM_VSWA_PROTECT_REUSE_ANCHORS") || isTruthyEnvVar("TRTLLM_VSWA_PROTECT_REUSE_ANCHORS");
+}
+
 char const* logBool(bool value) noexcept
 {
     return value ? "true" : "false";
@@ -1119,6 +1124,45 @@ void WindowBlockManager::updateSwaDebugNewestRealBlock(
             "previousBlockId=%d previousPrefixTokens=%d primaryUsedBlocks=%d primaryFreeBlocks=%d primaryMaxBlocks=%d",
             mLogPrefix.c_str(), reason, block->getBlockId(), prefixTokens, logBool(hadValidAnchor), previousBlockId,
             previousPrefixTokens, primaryUsedBlocks, primaryFreeBlocks, getNumPrimaryBlocks());
+    }
+}
+
+void WindowBlockManager::protectSwaReuseAnchor(BlockPtr const& block, SizeType32 prefixTokens, char const* reason)
+{
+    if (!isSwaReuseAnchorProtectionEnabled() || !mIsSWA || !block || block->isPlaceholder())
+    {
+        return;
+    }
+
+    auto constexpr kProtectedPriority = executor::KvCacheRetentionConfig::kMaxRetentionPriority;
+    auto const previousPriority = block->getPriority();
+    auto const wasFree = !block->hasRefs();
+    if (previousPriority >= kProtectedPriority && !block->getDurationMs().has_value())
+    {
+        return;
+    }
+
+    if (wasFree)
+    {
+        mEvictionPolicy->claimBlock(block, kProtectedPriority, std::nullopt);
+        mEvictionPolicy->releaseBlock(block);
+    }
+    else
+    {
+        block->setPriority(kProtectedPriority);
+        block->setDurationMs(std::nullopt);
+        block->setExpirationTime(std::nullopt);
+    }
+
+    if (isKvCacheReuseDebugLoggingEnabled())
+    {
+        auto const primaryFreeBlocks = getNumFreeBlocks();
+        auto const primaryUsedBlocks = getNumPrimaryBlocks() - primaryFreeBlocks;
+        TLLM_LOG_INFO(
+            "[kv-reuse-debug] %s::swa-protect-anchor reason=%s blockId=%d prefixTokens=%d wasFree=%s "
+            "previousPriority=%d newPriority=%d primaryUsedBlocks=%d primaryFreeBlocks=%d primaryMaxBlocks=%d",
+            mLogPrefix.c_str(), reason, block->getBlockId(), prefixTokens, logBool(wasFree), previousPriority,
+            kProtectedPriority, primaryUsedBlocks, primaryFreeBlocks, getNumPrimaryBlocks());
     }
 }
 
@@ -2910,6 +2954,7 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                         ++debugOowAnchorHits;
                         ++mSwaDebugHistory.oowPlaceholderAnchorHits;
                         updateSwaDebugNewestRealBlock(*existing, prefixEndTokens, "store-oow-placeholder-anchor");
+                        protectSwaReuseAnchor(*existing, prefixEndTokens, "store-oow-placeholder-anchor");
                     }
                     TLLM_LOG_DEBUG("%s::storeBlocks - OOW placeholder at %zu, found anchor block %d in trie",
                         mLogPrefix.c_str(), i, (*existing)->getBlockId());
@@ -2980,6 +3025,7 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                 ++debugExistingReal;
                 ++mSwaDebugHistory.existingRealStores;
                 updateSwaDebugNewestRealBlock(*existing, prefixEndTokens, "store-existing-real");
+                protectSwaReuseAnchor(*existing, prefixEndTokens, "store-existing-real");
             }
             TLLM_LOG_DEBUG("%s::storeBlocks - Block %d: slot occupied by %d, skipping", mLogPrefix.c_str(), bid,
                 (*existing)->getBlockId());
@@ -3011,6 +3057,7 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                 ++debugRealInserted;
                 ++mSwaDebugHistory.realStores;
                 updateSwaDebugNewestRealBlock(block, prefixEndTokens, "store-new-real");
+                protectSwaReuseAnchor(block, prefixEndTokens, "store-new-real");
             }
         }
 

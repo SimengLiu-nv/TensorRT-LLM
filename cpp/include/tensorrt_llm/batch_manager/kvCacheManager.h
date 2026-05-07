@@ -1243,6 +1243,8 @@ private:
 
     void updateSwaDebugNewestRealBlock(BlockPtr const& block, SizeType32 prefixTokens, char const* reason);
 
+    void protectSwaReuseAnchor(BlockPtr const& block, SizeType32 prefixTokens, char const* reason);
+
     void noteSwaDebugEvictedBlock(BlockPtr const& block, char const* reason);
 
     //! \brief Find the reusable prefix, including SWA traversal-only anchors.
