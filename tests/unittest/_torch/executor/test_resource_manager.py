@@ -711,6 +711,7 @@ class TestResourceManager(unittest.TestCase):
             self) -> None:
 
         class NoCpMapping:
+            cp_config: dict[str, object] = {}
 
             def has_cp_helix(self) -> bool:
                 return False
