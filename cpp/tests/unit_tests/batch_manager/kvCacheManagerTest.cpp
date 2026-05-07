@@ -8870,8 +8870,8 @@ TEST_F(KVCacheManagerTest, VSWAContextReuseKeepsOOWBlocksMaterializedDuringGener
     auto constexpr blocksInPrimaryPool = 16;
     auto const stream = std::make_shared<tr::CudaStream>();
     tr::SamplingConfig const samplingConfig{kVSWA_BEAM_WIDTH};
-    auto kvCacheManager = makeVSWAManager(
-        blocksInPrimaryPool, /*enableBlockReuse=*/true, stream, /*swaContextReuse=*/true);
+    auto kvCacheManager
+        = makeVSWAManager(blocksInPrimaryPool, /*enableBlockReuse=*/true, stream, /*swaContextReuse=*/true);
     auto const onlyWindowSize = theOnlyWindowSize(*kvCacheManager);
 
     auto inputTokens0 = std::make_shared<VecTokens>(11);
@@ -8893,6 +8893,20 @@ TEST_F(KVCacheManagerTest, VSWAContextReuseKeepsOOWBlocksMaterializedDuringGener
     EXPECT_EQ(seq0.getNumFrontBlocksRemoved(onlyWindowSize), 0);
     EXPECT_TRUE(std::none_of(cacheBlockIds.begin(), cacheBlockIds.end(),
         [](auto const blockId) { return blockId == KVCacheBlock::kPlaceholderBlockId; }));
+
+    auto const offsetDims = kvCacheManager->getOffsetTableDimensions();
+    auto kvCacheBlockOffsets = tr::BufferManager::cpu(
+        tr::ITensor::makeShape({offsetDims.numPools, kVSWA_BEAM_WIDTH, 2, offsetDims.maxBlocksPerSeq}),
+        tr::TRTDataType<tk::KVCacheIndex>::value);
+    auto const compactGenerationBlockCount = kvCacheManager->copyBlockOffsets(*kvCacheBlockOffsets, 0, 0);
+    EXPECT_EQ(
+        compactGenerationBlockCount, tc::ceilDiv(kVSWA_ATTENTION_WINDOW, kVSWA_TOKENS_PER_BLOCK) + kSWAExtraBlock);
+    EXPECT_LT(compactGenerationBlockCount, static_cast<SizeType32>(cacheBlockIds.size()));
+
+    auto const fullContextBlockCount
+        = kvCacheManager->copyBlockOffsets(*kvCacheBlockOffsets, 0, 0, /*useSwaCyclicSlots=*/false,
+            /*useSwaContextSlots=*/true);
+    EXPECT_EQ(fullContextBlockCount, static_cast<SizeType32>(cacheBlockIds.size()));
 
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager->removeSequence(0, llmRequest0)));
 
