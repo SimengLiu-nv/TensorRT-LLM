@@ -2181,9 +2181,12 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
         result.blockKeys, mEnablePartialReuse, mCopyOnPartialReuse, sequence.getCurrentPrepopulatedPromptLen());
     result.totalMatchedTokens = reuseMatches.totalMatchedTokens;
 
+    SizeType32 matchedPrefixTokens = 0;
     for (int bi = 0; bi < result.numSharedContextBlocks && bi < static_cast<int>(reuseMatches.matches.size()); ++bi)
     {
         auto const& match = reuseMatches.matches[bi];
+        auto const matchEndPrefixTokens = matchedPrefixTokens + match.numMatchedTokens;
+        bool const matchedRealSwaAnchor = mIsSWA && match.block && !match.block->isPlaceholder();
         if (isRecurrentState())
         {
             TLLM_CHECK(match.isPartialMatch == false);
@@ -2196,6 +2199,11 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
         claimed.isTraversalOnly = match.isTraversalOnly;
         if (match.isTraversalOnly || (mIsSWA && bi < result.firstRealBlockIdx))
         {
+            if (matchedRealSwaAnchor)
+            {
+                updateSwaDebugNewestRealBlock(match.block, matchEndPrefixTokens, "claim-oow-reuse-real");
+                protectSwaReuseAnchor(match.block, matchEndPrefixTokens, "claim-oow-reuse-real");
+            }
             // The prefix is reusable for traversal, but this SWA block is outside
             // the active attention window for this sequence. Keep a logical slot
             // in the sequence without claiming or allocating physical KV memory.
@@ -2203,6 +2211,7 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
             claimed.isPlaceholder = true;
             claimed.isTraversalOnly = true;
             result.claimedBlocks.push_back(std::move(claimed));
+            matchedPrefixTokens = matchEndPrefixTokens;
             continue;
         }
 
@@ -2326,6 +2335,16 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
             }
         }
 
+        if (matchedRealSwaAnchor)
+        {
+            // Keep the bounded recent-anchor set aligned with branches that
+            // requests actually reuse, not only with the order anchors are
+            // stored. Run after claimBlock so request retention does not
+            // immediately overwrite the protection.
+            updateSwaDebugNewestRealBlock(matchingBlock, matchEndPrefixTokens, "claim-reuse-real");
+            protectSwaReuseAnchor(matchingBlock, matchEndPrefixTokens, "claim-reuse-real");
+        }
+        matchedPrefixTokens = matchEndPrefixTokens;
         result.claimedBlocks.push_back(std::move(claimed));
     }
 
