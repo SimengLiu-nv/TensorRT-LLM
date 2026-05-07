@@ -1265,7 +1265,38 @@ void WindowBlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequ
         beam0Blocks.push_back(allocatedBlocks[bi]);
     }
     blockKeys.resize(beam0Blocks.size());
-    (void) storeBlocks(std::move(blockKeys), beam0Blocks);
+    if (mIsSWA && isKvCacheReuseDebugLoggingEnabled())
+    {
+        SizeType32 realInputBlocks = 0;
+        SizeType32 placeholderInputBlocks = 0;
+        SizeType32 realInputBlocksInTree = 0;
+        for (auto const& block : beam0Blocks)
+        {
+            if (block->isPlaceholder())
+            {
+                ++placeholderInputBlocks;
+            }
+            else
+            {
+                ++realInputBlocks;
+                if (blockInRadixTree(block))
+                {
+                    ++realInputBlocksInTree;
+                }
+            }
+        }
+        TLLM_LOG_INFO(
+            "[kv-reuse-debug] %s::storeContextBlocks-input request=%lu window=%d isSWA=%s "
+            "uniqueTokens=%zu usableUniqueTokens=%d contextCurrentPosition=%d contextRemainingLength=%d "
+            "blockKeys=%zu allocatedBlocks=%zu beam0Blocks=%zu realInputBlocks=%d placeholderInputBlocks=%d "
+            "realInputBlocksInTree=%d frontBlocksRemoved=%d",
+            mLogPrefix.c_str(), llmRequest.mRequestId, mWindowSize, logBool(mIsSWA), uniqueTokens.size(),
+            usableUniqueTokenCount, llmRequest.getContextCurrentPosition(), llmRequest.getContextRemainingLength(),
+            blockKeys.size(), allocatedBlocks.size(), beam0Blocks.size(), realInputBlocks, placeholderInputBlocks,
+            realInputBlocksInTree, sequence.getNumFrontBlocksRemoved(mWindowSize));
+    }
+    (void) storeBlocks(
+        std::move(blockKeys), beam0Blocks, /*pinBlocks=*/false, llmRequest.mRequestId, "storeContextBlocks");
 }
 
 void WindowBlockManager::createBlockScalePools(SizeType32 quantBlockSize)
@@ -2776,7 +2807,8 @@ void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
 }
 
 std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::storeBlocks(
-    std::vector<BlockKey> blockKeys, std::vector<BlockPtr> const& blocks, bool pinBlocks)
+    std::vector<BlockKey> blockKeys, std::vector<BlockPtr> const& blocks, bool pinBlocks,
+    std::optional<LlmRequest::RequestIdType> debugRequestId, char const* debugCaller)
 {
     SizeType32 numBlocksStoredForReuse = 0;
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
@@ -2808,6 +2840,14 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
     SizeType32 debugOowPlaceholders = 0;
     SizeType32 debugOowAnchorHits = 0;
     SizeType32 debugOowAnchorMisses = 0;
+    SizeType32 debugInputRealBlocks = 0;
+    SizeType32 debugInputPlaceholders = 0;
+    SizeType32 debugInputRealInTree = 0;
+    SizeType32 debugInputRealNotInTree = 0;
+    SizeType32 debugFirstInputRealBlockIdx = -1;
+    SizeType32 debugLastInputRealBlockIdx = -1;
+    SizeType32 debugFirstInputRealPrefixTokens = 0;
+    SizeType32 debugLastInputRealPrefixTokens = 0;
 
     for (std::size_t i = 0; i < nodeMatches.exactMatches.size() && i < numBlocks; ++i)
     {
@@ -2815,6 +2855,32 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
         auto const& block = blocks[i];
         auto const& blockKey = blockKeys[i];
         prefixEndTokens += static_cast<SizeType32>(blockKey.uniqueTokens.size());
+        if (mIsSWA)
+        {
+            if (block->isPlaceholder())
+            {
+                ++debugInputPlaceholders;
+            }
+            else
+            {
+                ++debugInputRealBlocks;
+                if (debugFirstInputRealBlockIdx < 0)
+                {
+                    debugFirstInputRealBlockIdx = static_cast<SizeType32>(i);
+                    debugFirstInputRealPrefixTokens = prefixEndTokens;
+                }
+                debugLastInputRealBlockIdx = static_cast<SizeType32>(i);
+                debugLastInputRealPrefixTokens = prefixEndTokens;
+                if (blockInRadixTree(block))
+                {
+                    ++debugInputRealInTree;
+                }
+                else
+                {
+                    ++debugInputRealNotInTree;
+                }
+            }
+        }
 
         if (block->isPlaceholder())
         {
@@ -2988,15 +3054,22 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
     {
         auto const primaryFreeBlocks = getNumFreeBlocks();
         auto const primaryUsedBlocks = getNumPrimaryBlocks() - primaryFreeBlocks;
+        auto const debugRequestIdValue = debugRequestId.value_or(std::numeric_limits<LlmRequest::RequestIdType>::max());
         TLLM_LOG_INFO(
-            "[kv-reuse-debug] %s::storeBlocks-swa-summary blockKeys=%zu blocks=%zu realInserted=%d "
+            "[kv-reuse-debug] %s::storeBlocks-swa-summary request=%lu caller=%s blockKeys=%zu blocks=%zu "
+            "inputRealBlocks=%d inputPlaceholders=%d inputRealInTree=%d inputRealNotInTree=%d "
+            "firstInputRealBlockIdx=%d firstInputRealPrefixTokens=%d lastInputRealBlockIdx=%d "
+            "lastInputRealPrefixTokens=%d realInserted=%d "
             "existingReal=%d oowPlaceholders=%d oowAnchorHits=%d oowAnchorMisses=%d storedThisCall=%d "
             "newestValid=%s newestBlockId=%d newestPrefixTokens=%d realStores=%llu existingRealStores=%llu "
             "oowPlaceholdersTotal=%llu oowAnchorHitsTotal=%llu oowAnchorMissesTotal=%llu evictedStoredBlocks=%llu "
             "evictedNewestBlocks=%llu trackedRealPrefixes=%zu oowDetachReplacementsTotal=%llu primaryUsedBlocks=%d "
             "primaryFreeBlocks=%d primaryMaxBlocks=%d",
-            mLogPrefix.c_str(), blockKeys.size(), blocks.size(), debugRealInserted, debugExistingReal,
-            debugOowPlaceholders, debugOowAnchorHits, debugOowAnchorMisses, numBlocksStoredForReuse,
+            mLogPrefix.c_str(), debugRequestIdValue, debugCaller ? debugCaller : "unknown", blockKeys.size(),
+            blocks.size(), debugInputRealBlocks, debugInputPlaceholders, debugInputRealInTree, debugInputRealNotInTree,
+            debugFirstInputRealBlockIdx, debugFirstInputRealPrefixTokens, debugLastInputRealBlockIdx,
+            debugLastInputRealPrefixTokens, debugRealInserted, debugExistingReal, debugOowPlaceholders,
+            debugOowAnchorHits, debugOowAnchorMisses, numBlocksStoredForReuse,
             logBool(mSwaDebugHistory.newestRealAnchorValid), mSwaDebugHistory.newestRealBlockId,
             mSwaDebugHistory.newestRealPrefixTokens, static_cast<unsigned long long>(mSwaDebugHistory.realStores),
             static_cast<unsigned long long>(mSwaDebugHistory.existingRealStores),
@@ -3302,7 +3375,8 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
     {
         // store all blocks
         TLLM_LOG_DEBUG("%s::storeNewBlock - store all blocks", mLogPrefix.c_str());
-        (void) storeBlocks(std::move(blockKeys), beam0Blocks);
+        (void) storeBlocks(
+            std::move(blockKeys), beam0Blocks, /*pinBlocks=*/false, sequence.getRequestId(), "storeNewBlock-short");
         return;
     }
 
@@ -3314,7 +3388,8 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
     if (prevBlock->isPlaceholder() || prevBlock->getPrevBlock() == nullptr)
     {
         TLLM_LOG_DEBUG("%s::storeNewBlock - store all blocks", mLogPrefix.c_str());
-        (void) storeBlocks(std::move(blockKeys), beam0Blocks);
+        (void) storeBlocks(std::move(blockKeys), beam0Blocks, /*pinBlocks=*/false, sequence.getRequestId(),
+            "storeNewBlock-prev-missing");
         return;
     }
 
@@ -3324,7 +3399,8 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
         return;
     }
     TLLM_LOG_DEBUG("%s::storeNewBlock - store the last block", mLogPrefix.c_str());
-    (void) storeBlocks(std::move(blockKeys), beam0Blocks);
+    (void) storeBlocks(
+        std::move(blockKeys), beam0Blocks, /*pinBlocks=*/false, sequence.getRequestId(), "storeNewBlock-last");
 }
 
 std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
@@ -3366,7 +3442,8 @@ std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
         beam0Blocks.push_back(seqBlocks[bi]);
     }
 
-    auto [numStored, pinnedBlockIds] = storeBlocks(std::move(blockKeys), beam0Blocks, pinBlocks);
+    auto [numStored, pinnedBlockIds]
+        = storeBlocks(std::move(blockKeys), beam0Blocks, pinBlocks, llmRequest->mRequestId, "storeBlocksForReuse");
 
     return pinnedBlockIds;
 }
@@ -3410,8 +3487,8 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
             beam0Blocks.push_back(allocatedBlocks[bi]);
         }
 
-        auto [numBlocksStoredForReuse, pinnedBlockIds]
-            = storeBlocks(std::move(blockKeys), beam0Blocks, /*pinBlocks=*/false);
+        auto [numBlocksStoredForReuse, pinnedBlockIds] = storeBlocks(
+            std::move(blockKeys), beam0Blocks, /*pinBlocks=*/false, llmRequest->mRequestId, "releaseBlocks");
         TLLM_LOG_DEBUG("%s::releaseBlocks Request %lu, %d blocks stored for reuse", mLogPrefix.c_str(),
             sequence.getRequestId(), numBlocksStoredForReuse);
     }
@@ -4146,8 +4223,7 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
                 "inReuseTree=%s releaseToFront=%s newestValid=%s newestBlockId=%d newestPrefixTokens=%d "
                 "oowDetachReplacements=%llu primaryUsedBlocks=%d primaryFreeBlocks=%d primaryMaxBlocks=%d",
                 mLogPrefix.c_str(), requestId, outOfWindowBlockIdx, outOfWindowBlock->getBlockId(), prefixTokens,
-                logBool(oowBlockInReuseTree), logBool(!oowBlockInReuseTree),
-                logBool(mSwaDebugHistory.newestRealAnchorValid),
+                logBool(oowBlockInReuseTree), logBool(false), logBool(mSwaDebugHistory.newestRealAnchorValid),
                 mSwaDebugHistory.newestRealBlockId, mSwaDebugHistory.newestRealPrefixTokens,
                 static_cast<unsigned long long>(mSwaDebugHistory.oowDetachReplacements), primaryUsedBlocks,
                 primaryFreeBlocks, getNumPrimaryBlocks());
@@ -4173,11 +4249,7 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
         }
         if (!outOfWindowBlock->hasRefs())
         {
-            // SWA context FMHA can allocate many transient in-window blocks that are
-            // intentionally replaced by traversal-only placeholders once they slide
-            // out of window. Recycle those non-reusable blocks before cached SWA
-            // anchors so temporary context allocation does not evict useful tails.
-            mEvictionPolicy->releaseBlock(outOfWindowBlock, mIsSWA && !oowBlockInReuseTree);
+            mEvictionPolicy->releaseBlock(outOfWindowBlock);
         }
     }
 

@@ -1142,8 +1142,9 @@ public:
     //!        when the anchor still exists, and continues past missing SWA anchors.
     //! \param pinBlocks If true, increment ref count for blocks while storing.
     //! \return Pair of (num blocks stored for reuse, vector of pinned block IDs).
-    [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(
-        std::vector<BlockKey> blockKeys, std::vector<BlockPtr> const& blocks, bool pinBlocks = false);
+    [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(std::vector<BlockKey> blockKeys,
+        std::vector<BlockPtr> const& blocks, bool pinBlocks = false,
+        std::optional<LlmRequest::RequestIdType> debugRequestId = std::nullopt, char const* debugCaller = nullptr);
 
     [[nodiscard]] bool verifyQueueIntegrity() const;
 
@@ -1529,9 +1530,11 @@ public:
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
     [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(std::vector<BlockKey> blockKeys,
-        std::vector<BlockPtr> const& blocks, SizeType32 windowSize, bool pinBlocks = false)
+        std::vector<BlockPtr> const& blocks, SizeType32 windowSize, bool pinBlocks = false,
+        std::optional<LlmRequest::RequestIdType> debugRequestId = std::nullopt, char const* debugCaller = nullptr)
     {
-        return mWindowBlockManagers.at(windowSize).storeBlocks(std::move(blockKeys), blocks, pinBlocks);
+        return mWindowBlockManagers.at(windowSize)
+            .storeBlocks(std::move(blockKeys), blocks, pinBlocks, debugRequestId, debugCaller);
     }
 
     [[nodiscard]] bool verifyQueueIntegrity(SizeType32 windowSize) const;
