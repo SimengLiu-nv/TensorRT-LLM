@@ -4557,11 +4557,12 @@ void KVCacheManager::addSequenceBatch(
             auto const reusablePrepopulatedLen
                 = hasNonSwaWindow[i] ? minNonSwaPrepopulatedLen[i] : minPrepopulatedLen[i];
             // There is still one request-level prepopulated cursor shared by
-            // full-attention and SWA layers. Mixed full+SWA models select the
-            // non-SWA prefix when present; otherwise the bounded SWA tail would
-            // cap full-attention reuse and force unnecessary context recompute.
+            // full-attention and SWA layers. It must remain safe for every
+            // window; otherwise the executor can skip tokens whose SWA tail is
+            // not backed by real KV blocks. Scheduler accounting may still use
+            // the non-SWA estimate before this authoritative cursor is set.
             auto const swaSafePrepopulatedLen = hasSwaWindow[i] ? minSwaPrepopulatedLen[i] : reusablePrepopulatedLen;
-            auto const selectedPrepopulatedLen = reusablePrepopulatedLen;
+            auto const selectedPrepopulatedLen = std::min(reusablePrepopulatedLen, swaSafePrepopulatedLen);
             if (logKvReuseDebug)
             {
                 auto const smallestSwaWindow = getSmallestSwaWindow(mBlockManager.getWindowSizesMetadata());
