@@ -141,6 +141,11 @@ public:
         NB_OVERRIDE_PURE(storeBlocksForReuse, requestId, llmRequest, pinBlocks);
     }
 
+    void storeNewBlock(tb::LlmRequest const& llmRequest) override
+    {
+        NB_OVERRIDE_PURE(storeNewBlock, llmRequest);
+    }
+
     tbk::GenerationRequest const& getSequence(tb::LlmRequest::RequestIdType requestId) const override
     {
         NB_OVERRIDE_PURE(getSequence, requestId);
@@ -452,6 +457,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             },
             nb::arg("request_infos"), nb::arg("llm_requests"))
         .def("remove_sequence", &BaseKVCacheManager::removeSequence, nb::call_guard<nb::gil_scoped_release>())
+        .def("store_new_block", &BaseKVCacheManager::storeNewBlock, nb::arg("llm_request"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("pin_blocks", &BaseKVCacheManager::pinBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence,
             nb::call_guard<nb::gil_scoped_release>())

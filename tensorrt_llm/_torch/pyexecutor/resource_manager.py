@@ -333,6 +333,7 @@ class KVCacheManager(BaseResourceManager):
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
+        self._swa_context_reuse = kv_cache_config.optimization_target == "context_reuse"
         self.pp_layers, self.num_layers = get_pp_layers(
             num_layers,
             mapping,
@@ -543,7 +544,6 @@ class KVCacheManager(BaseResourceManager):
         self._stream = execution_stream if execution_stream is not None else torch.cuda.Stream(
         )
         logger.info(f"[KVCacheManager] execution_stream: {self._stream}")
-        swa_context_reuse = kv_cache_config.optimization_target == "context_reuse"
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
@@ -561,7 +561,7 @@ class KVCacheManager(BaseResourceManager):
             'cache_type': kv_cache_type,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
-            'swa_context_reuse': swa_context_reuse,
+            'swa_context_reuse': self._swa_context_reuse,
             'kv_connector_manager': self.kv_connector_manager,
             'enable_indexer_k_cache': enable_indexer_k_cache,
             'indexer_k_cache_quant_block_size':
@@ -741,8 +741,12 @@ class KVCacheManager(BaseResourceManager):
                         # Skip allocating KV cache at decode for inactive helix ranks.
                         continue
                 self.impl.add_token(req.py_request_id)
+                if self._swa_context_reuse:
+                    self.impl.store_new_block(req)
                 for _ in range(get_draft_token_length(req)):
                     self.impl.add_token(req.py_request_id)
+                    if self._swa_context_reuse:
+                        self.impl.store_new_block(req)
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
             self.impl.refresh_blocks()

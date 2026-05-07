@@ -4561,8 +4561,7 @@ void KVCacheManager::addToken(RequestIdType requestId, bool detachSwaFrontBlocks
     // TODO: add streamLLM support
     auto& sequence = getSequence(requestId);
     sequence.addNewTokens(1);
-    auto const effectiveDetachSwaFrontBlocks = detachSwaFrontBlocks && !isSwaContextReuseEnabled();
-    mBlockManager.adjustBlocksIfNeeded(sequence, effectiveDetachSwaFrontBlocks);
+    mBlockManager.adjustBlocksIfNeeded(sequence, detachSwaFrontBlocks);
 }
 
 void KVCacheManager::copyLinearAttentionBlock(LlmRequest const& llmRequest)
@@ -5079,10 +5078,9 @@ SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSl
                     std::memcpy(dstPtr + dstIndex, srcPtr + srcIndex, copyChunkSize);
                     if (metadata.isSWA && useSwaCyclicSlots)
                     {
-                        // SWA stores only a bounded physical tail. For context
-                        // FMHA, fill every logical page-table slot by aliasing
-                        // it back into that valid cyclic tail; generation keeps
-                        // the compact cyclic view.
+                        // SWA kernels index a bounded cyclic tail. For context
+                        // FMHA, fill every logical page-table slot by aliasing it
+                        // back into that valid cyclic tail.
                         auto const firstActiveBlockIdx = sequence.getNumFrontBlocksRemoved(ws);
                         auto const maxBlocksPerSeq = static_cast<SizeType32>(srcShape.d[3]);
                         auto const contextCyclicBlockCount
