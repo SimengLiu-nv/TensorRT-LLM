@@ -4561,7 +4561,8 @@ void KVCacheManager::addToken(RequestIdType requestId, bool detachSwaFrontBlocks
     // TODO: add streamLLM support
     auto& sequence = getSequence(requestId);
     sequence.addNewTokens(1);
-    mBlockManager.adjustBlocksIfNeeded(sequence, detachSwaFrontBlocks);
+    auto const effectiveDetachSwaFrontBlocks = detachSwaFrontBlocks && !isSwaContextReuseEnabled();
+    mBlockManager.adjustBlocksIfNeeded(sequence, effectiveDetachSwaFrontBlocks);
 }
 
 void KVCacheManager::copyLinearAttentionBlock(LlmRequest const& llmRequest)

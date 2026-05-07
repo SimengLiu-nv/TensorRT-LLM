@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -480,8 +480,8 @@ TEST(SerializeUtilsTest, VectorResponses)
 
 TEST(SerializeUtilsTest, KvCacheConfig)
 {
-    texec::KvCacheConfig kvCacheConfig(
-        true, 10, std::vector(1, 100), 2, 0.1, 10000, 0.5, 50, 1024, false, false, true, 77);
+    texec::KvCacheConfig kvCacheConfig(true, 10, std::vector(1, 100), 2, 0.1, 10000, 0.5, 50, 1024, false, false, true,
+        77, std::nullopt, 0, texec::KvCacheConfig::kGenerationOptimizationTarget);
     auto kvCacheConfig2 = serializeDeserialize(kvCacheConfig);
 
     EXPECT_EQ(kvCacheConfig.getEnableBlockReuse(), kvCacheConfig2.getEnableBlockReuse());
@@ -497,6 +497,7 @@ TEST(SerializeUtilsTest, KvCacheConfig)
     EXPECT_EQ(kvCacheConfig.getEventBufferMaxSize(), kvCacheConfig2.getEventBufferMaxSize());
     EXPECT_EQ(kvCacheConfig.getUseUvm(), kvCacheConfig2.getUseUvm());
     EXPECT_EQ(kvCacheConfig.getAttentionDpEventsGatherPeriodMs(), kvCacheConfig2.getAttentionDpEventsGatherPeriodMs());
+    EXPECT_EQ(kvCacheConfig.getOptimizationTarget(), kvCacheConfig2.getOptimizationTarget());
 }
 
 TEST(SerializeUtilsTest, SchedulerConfig)

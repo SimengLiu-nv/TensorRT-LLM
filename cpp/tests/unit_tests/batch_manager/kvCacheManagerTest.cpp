@@ -8832,13 +8832,15 @@ TokenIdType constexpr kVSWA_FIRST_TOKEN = 1000;
 // Factory: construct and allocate a KVCacheManager for VSWA tests.
 // numLayers=2, numHeads=2, sizePerHead=64, tokensPerBlock=4, attentionWindow=8,
 // maxNumSequences=8, beamWidth=1, sinkTokenLength=0, maxSequenceLength=128.
-std::unique_ptr<KVCacheManager> makeVSWAManager(
-    SizeType32 blocksInPrimaryPool, bool enableBlockReuse, std::shared_ptr<tr::CudaStream> const& stream)
+std::unique_ptr<KVCacheManager> makeVSWAManager(SizeType32 blocksInPrimaryPool, bool enableBlockReuse,
+    std::shared_ptr<tr::CudaStream> const& stream, bool swaContextReuse = false)
 {
     auto const blocksPerWindow = BlocksPerWindow{{kVSWA_ATTENTION_WINDOW, {blocksInPrimaryPool, 0}}};
     auto mgr = std::make_unique<KVCacheManager>(2, 2, 64, kVSWA_TOKENS_PER_BLOCK, blocksPerWindow, 8, kVSWA_BEAM_WIDTH,
         std::vector<SizeType32>{kVSWA_ATTENTION_WINDOW}, std::nullopt, nvinfer1::DataType::kHALF, 0, stream,
-        kVSWA_MAX_SEQUENCE_LENGTH, enableBlockReuse);
+        kVSWA_MAX_SEQUENCE_LENGTH, enableBlockReuse, CacheType::kSELF, std::nullopt, nullptr,
+        /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true, nullptr, /*enableIndexerKCache=*/false,
+        /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0, std::nullopt, swaContextReuse);
     mgr->allocatePools(false);
     return mgr;
 }
@@ -8862,6 +8864,47 @@ std::unique_ptr<KVCacheManager> makeSmallWindowManager(
     return mgr;
 }
 } // namespace
+
+TEST_F(KVCacheManagerTest, VSWAContextReuseKeepsOOWBlocksMaterializedDuringGeneration)
+{
+    auto constexpr blocksInPrimaryPool = 16;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    tr::SamplingConfig const samplingConfig{kVSWA_BEAM_WIDTH};
+    auto kvCacheManager = makeVSWAManager(
+        blocksInPrimaryPool, /*enableBlockReuse=*/true, stream, /*swaContextReuse=*/true);
+    auto const onlyWindowSize = theOnlyWindowSize(*kvCacheManager);
+
+    auto inputTokens0 = std::make_shared<VecTokens>(11);
+    std::iota(inputTokens0->begin(), inputTokens0->end(), kVSWA_FIRST_TOKEN);
+    auto llmRequest0
+        = std::make_shared<LlmRequest>(0, kVSWA_MAX_NEW_TOKENS, inputTokens0, samplingConfig, kVSWA_IS_STREAMING);
+    addSequenceForTest(*kvCacheManager, 0, 11, kVSWA_BEAM_WIDTH, llmRequest0);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest0);
+    kvCacheManager->storeContextBlocks(*llmRequest0);
+
+    llmRequest0->addNewToken(kVSWA_FIRST_TOKEN + 11, kVSWA_BEAM_IDX);
+    kvCacheManager->addToken(0);
+    llmRequest0->addNewToken(kVSWA_FIRST_TOKEN + 12, kVSWA_BEAM_IDX);
+    kvCacheManager->addToken(0);
+
+    auto const& seq0 = kvCacheManager->getSequence(0);
+    auto const& cacheBlockIds = seq0.getCacheBlockIds(onlyWindowSize).at(kVSWA_BEAM_IDX);
+    EXPECT_EQ(seq0.getNumFrontBlocksRemoved(onlyWindowSize), 0);
+    EXPECT_TRUE(std::none_of(cacheBlockIds.begin(), cacheBlockIds.end(),
+        [](auto const blockId) { return blockId == KVCacheBlock::kPlaceholderBlockId; }));
+
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager->removeSequence(0, llmRequest0)));
+
+    auto inputTokens1 = std::make_shared<VecTokens>(13);
+    std::iota(inputTokens1->begin(), inputTokens1->end(), kVSWA_FIRST_TOKEN);
+    auto llmRequest1
+        = std::make_shared<LlmRequest>(1, kVSWA_MAX_NEW_TOKENS, inputTokens1, samplingConfig, kVSWA_IS_STREAMING);
+    addSequenceForTest(*kvCacheManager, 1, 13, kVSWA_BEAM_WIDTH, llmRequest1);
+    EXPECT_EQ(llmRequest1->getContextCurrentPosition(), 3 * kVSWA_TOKENS_PER_BLOCK);
+
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager->removeSequence(1, llmRequest1)));
+}
 
 // Verify that a non-stolen OOW block (hasRefs() == 0 at releaseBlocks time) is
 // stored in the reuse trie and can be reused by a subsequent sequence.

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,30 +31,12 @@
 #include "tensorrt_llm/runtime/tllmBuffers.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include <cstdint>
-#include <cstdlib>
 
 using namespace tensorrt_llm::runtime;
 namespace tk = tensorrt_llm::kernels;
 
 namespace tensorrt_llm::batch_manager
 {
-
-namespace
-{
-
-bool isTruthyEnvVar(char const* name) noexcept
-{
-    auto const* value = std::getenv(name);
-    return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
-}
-
-bool isSwaFullContextReuseProbeEnabled() noexcept
-{
-    return isTruthyEnvVar("TLLM_VSWA_FULL_CONTEXT_REUSE_PROBE")
-        || isTruthyEnvVar("TRTLLM_VSWA_FULL_CONTEXT_REUSE_PROBE");
-}
-
-} // namespace
 
 TransformerBuffers::TransformerBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLen,
@@ -375,7 +357,7 @@ void TransformerBuffers::copyKvBlockOffsets(RequestVector const& contextRequests
             auto const requestId = llmReq->mRequestId;
             auto const isContextRequest = llmReq->isContextInitState();
             auto const beamWidth = isContextRequest ? contextBeamWidth : llmReq->getBeamWidthByIter();
-            auto const useSwaCyclicSlots = !(isContextRequest && isSwaFullContextReuseProbeEnabled());
+            auto const useSwaCyclicSlots = !(isContextRequest && kvCacheManager->isSwaContextReuseEnabled());
             auto const maxBeamBlockCount = kvCacheManager->copyBlockOffsets(*kvCacheBlockOffsetsHost, numSequences,
                 requestId, useSwaCyclicSlots, /*useSwaContextSlots=*/isContextRequest);
             maxBlockCount = std::max(maxBlockCount, maxBeamBlockCount);
