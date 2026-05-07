@@ -661,6 +661,30 @@ TEST_F(KVCacheManagerTest, BlockManagerTestWindowSizeToShare)
             result.begin(), result.end(), 0.0f, [](float sum, auto const& kv) { return sum + kv.second; });
         EXPECT_NEAR(sumShares, 1.0f, 1e-6f);
     }
+
+    // Context-reuse target gives SWA windows memory for the full prompt history.
+    {
+        std::map<SizeType32, std::vector<SizeType32>> windowSizeToLayers{
+            {128, {0}},
+            {131072, {1}},
+        };
+        std::map<SizeType32, SizeType32> cacheSizePerTokenPerWindow{{128, 1}, {131072, 1}};
+        TempAttentionWindowInputs tempAttentionWindowInputs{
+            true,
+            131071,
+            20000,
+        };
+
+        auto contextReuseResult = BlockManager::calculateWindowSizeToShare(windowSizeToLayers,
+            cacheSizePerTokenPerWindow, tempAttentionWindowInputs, KvCacheConfig::kContextReuseOptimizationTarget);
+        EXPECT_NEAR(contextReuseResult.at(128), 131071.0f / (131071.0f + 131072.0f), 1e-6f);
+        EXPECT_NEAR(contextReuseResult.at(131072), 131072.0f / (131071.0f + 131072.0f), 1e-6f);
+
+        auto generationResult = BlockManager::calculateWindowSizeToShare(windowSizeToLayers, cacheSizePerTokenPerWindow,
+            tempAttentionWindowInputs, KvCacheConfig::kGenerationOptimizationTarget);
+        EXPECT_NEAR(generationResult.at(128), 20128.0f / (20128.0f + 131072.0f), 1e-6f);
+        EXPECT_NEAR(generationResult.at(131072), 131072.0f / (20128.0f + 131072.0f), 1e-6f);
+    }
 }
 
 TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByBlockKeysTest)

@@ -4,8 +4,8 @@ import math
 import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
-                    Set, Tuple, Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, Optional,
+                    Sequence, Set, Tuple, Union)
 
 import torch
 from mpi4py import MPI
@@ -76,8 +76,14 @@ def _derive_window_size_shares(
     cache_size_bytes_per_token_per_window: Dict[int, int],
     max_input_len: Optional[int] = None,
     max_num_tokens: Optional[int] = None,
+    optimization_target: Literal["context_reuse",
+                                 "generation"] = "context_reuse",
 ) -> Dict[int, float]:
     """Allocate VSWA memory in proportion to each window's effective KV footprint."""
+    if optimization_target not in ("context_reuse", "generation"):
+        raise ValueError(
+            f"optimization_target must be 'context_reuse' or 'generation', got {optimization_target}"
+        )
     if len(window_size_to_layers) == 1:
         window_size = next(iter(window_size_to_layers))
         return {window_size: 1.0}
@@ -94,7 +100,10 @@ def _derive_window_size_shares(
         if max_input_len is not None and max_num_tokens is not None and max_input_len > window_size:
             temporary_attention_window = max(
                 0, min(max_num_tokens, max_input_len - window_size))
-        effective_window_size = window_size + temporary_attention_window
+        if optimization_target == "context_reuse" and max_input_len is not None and max_input_len > window_size:
+            effective_window_size = max_input_len
+        else:
+            effective_window_size = window_size + temporary_attention_window
         window_size_to_contribution[window_size] = float(
             effective_window_size) * cache_size_bytes_per_token
 
@@ -534,6 +543,7 @@ class KVCacheManager(BaseResourceManager):
         self._stream = execution_stream if execution_stream is not None else torch.cuda.Stream(
         )
         logger.info(f"[KVCacheManager] execution_stream: {self._stream}")
+        swa_context_reuse = kv_cache_config.optimization_target == "context_reuse"
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
@@ -551,6 +561,7 @@ class KVCacheManager(BaseResourceManager):
             'cache_type': kv_cache_type,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
+            'swa_context_reuse': swa_context_reuse,
             'kv_connector_manager': self.kv_connector_manager,
             'enable_indexer_k_cache': enable_indexer_k_cache,
             'indexer_k_cache_quant_block_size':
@@ -1553,6 +1564,7 @@ class KVCacheManager(BaseResourceManager):
                 cache_size_bytes_per_token_per_window,
                 max_input_len=self.max_seq_len - 1,
                 max_num_tokens=self.max_num_tokens,
+                optimization_target=kv_cache_config.optimization_target,
             )
             window_size_shares = [
                 window_size_to_share[window_size]

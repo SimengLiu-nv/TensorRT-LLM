@@ -312,12 +312,11 @@ std::vector<SizeType32> getReuseSafeWindowOrder(std::map<SizeType32, WindowSizeM
 }
 
 SizeType32 getFirstRealBlockIdxForWindow(
-    WindowSizeMetadata const& metadata, SizeType32 inputLength, SizeType32 tokensPerBlock)
+    WindowSizeMetadata const& metadata, SizeType32 inputLength, SizeType32 tokensPerBlock, bool swaContextReuse)
 {
-    // SWA context only needs a bounded physical tail, but the request still
-    // has a full logical block table. Blocks before firstRealBlockIdx remain
-    // placeholders and are aliased when context block offsets are copied.
-    if (metadata.isSWA && isSwaFullContextReuseProbeEnabled())
+    // Generation-optimized SWA keeps only a bounded physical tail. Context-reuse
+    // mode materializes the full prefix so future requests can reuse it.
+    if (metadata.isSWA && swaContextReuse)
     {
         return 0;
     }
@@ -808,8 +807,12 @@ bool KVCacheBlock::isLeaf() const
 std::map<SizeType32, float> BlockManager::calculateWindowSizeToShare(
     std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers,
     std::map<SizeType32, SizeType32> const& windowSizeToCacheSizePerToken,
-    std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs)
+    std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, std::string const& optimizationTarget)
 {
+    TLLM_CHECK_WITH_INFO(executor::KvCacheConfig::isValidOptimizationTarget(optimizationTarget),
+        "kv_cache_config.optimization_target must be one of '%s' or '%s', got '%s'",
+        executor::KvCacheConfig::kContextReuseOptimizationTarget,
+        executor::KvCacheConfig::kGenerationOptimizationTarget, optimizationTarget.c_str());
     if (windowSizeToLayers.size() == 1)
     {
         return {{windowSizeToLayers.begin()->first, 1.0f}};
@@ -831,7 +834,11 @@ std::map<SizeType32, float> BlockManager::calculateWindowSizeToShare(
                 tempAttentionWindowInputs->maxNumTokens, tempAttentionWindowInputs->maxInputLen - windowSize);
             temporaryAttentionWindow = std::max(temporaryAttentionWindow, SizeType32{0});
         }
-        auto const effectiveWindowSize = windowSize + temporaryAttentionWindow;
+        auto const useFullInputForWindow
+            = optimizationTarget == executor::KvCacheConfig::kContextReuseOptimizationTarget
+            && tempAttentionWindowInputs && tempAttentionWindowInputs->maxInputLen > windowSize;
+        auto const effectiveWindowSize
+            = useFullInputForWindow ? tempAttentionWindowInputs->maxInputLen : windowSize + temporaryAttentionWindow;
         windowSizeToContribution[windowSize]
             = static_cast<double>(effectiveWindowSize) * static_cast<double>(cacheSizePerToken);
     }
@@ -3860,12 +3867,13 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     SizeType32 sinkTokenLength, int64_t stream, runtime::SizeType32 maxSequenceLength, bool enableBlockReuse,
     CacheType cacheType, bool enablePartialReuse, bool copyOnPartialReuse, bool enableIndexerKCache,
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
-    std::optional<LinearAttentionMetadata> linearAttentionMetadata)
+    std::optional<LinearAttentionMetadata> linearAttentionMetadata, bool swaContextReuse)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype, sinkTokenLength,
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength,
         enableBlockReuse, cacheType, std::nullopt, nullptr, enablePartialReuse, copyOnPartialReuse, nullptr,
-        enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata)
+        enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata,
+        swaContextReuse)
 {
 }
 
@@ -3878,13 +3886,13 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
-    std::optional<LinearAttentionMetadata> linearAttentionMetadata)
+    std::optional<LinearAttentionMetadata> linearAttentionMetadata, bool swaContextReuse)
     : KVCacheManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences, maxBeamWidth,
         maxAttentionWindowVec, tempAttentionWindowInputs, dtype, sinkTokenLength,
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength,
         enableBlockReuse, cacheType, secondaryOffloadMinPriority, eventManager, enablePartialReuse, copyOnPartialReuse,
         kvCacheConnectorManager, enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim,
-        linearAttentionMetadata)
+        linearAttentionMetadata, swaContextReuse)
 {
 }
 
@@ -3897,7 +3905,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
-    std::optional<LinearAttentionMetadata> linearAttentionMetadata)
+    std::optional<LinearAttentionMetadata> linearAttentionMetadata, bool swaContextReuse)
     : mMaxBeamWidth(maxBeamWidth)
     , mDataType(dtype)
     , mMaxAttentionWindow(*std::max_element(maxAttentionWindowVec.begin(), maxAttentionWindowVec.end()))
@@ -3911,6 +3919,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
           indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata)
     // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
     , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
+    , mSwaContextReuse{swaContextReuse}
 {
     // When num_layers < len(maxAttentionWindowVec), not all window sizes in the
     // repeating pattern are used. Update mMaxAttentionWindow to the actual
@@ -3925,6 +3934,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
 
     TLLM_CHECK(mSinkBlockTokenLength % tokensPerBlock == 0);
     TLLM_LOG_DEBUG("KV cache block reuse is %s", mEnableBlockReuse ? "enabled" : "disabled");
+    TLLM_LOG_DEBUG("SWA context reuse is %s", mSwaContextReuse ? "enabled" : "disabled");
     mSequences.reserve(maxNumSequences);
 }
 
@@ -3937,13 +3947,19 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
-    std::optional<LinearAttentionMetadata> linearAttentionMetadata)
+    std::optional<LinearAttentionMetadata> linearAttentionMetadata, bool swaContextReuse)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype, sinkTokenLength,
         std::move(stream), maxSequenceLength, enableBlockReuse, cacheType, secondaryOffloadMinPriority,
         std::move(eventManager), enablePartialReuse, copyOnPartialReuse, std::move(kvCacheConnectorManager),
-        enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata)
+        enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata,
+        swaContextReuse)
 {
+}
+
+bool KVCacheManager::isSwaContextReuseEnabled() const
+{
+    return mSwaContextReuse || isSwaFullContextReuseProbeEnabled();
 }
 
 void KVCacheManager::allocatePools(bool useUvm)
@@ -4053,13 +4069,13 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
     if ((req.isContextInitState() && req.isFirstContextChunk()) || req.isDisaggGenerationInitState())
     {
         auto const metadata = mBlockManager.getWindowSizeMetadata(windowSize);
+        auto const swaContextReuse = metadata.isSWA && isSwaContextReuseEnabled();
         auto const chunkSize = req.mMaxNewTokens;
         auto const maxDraftTokensToAdd = req.getNumDraftTokens();
         auto const requestedPromptCacheLen
             = (isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + maxDraftTokensToAdd;
-        auto const promptCacheLen = ((metadata.isSWA && isSwaFullContextReuseProbeEnabled())
-                                            ? requestedPromptCacheLen
-                                            : std::min(requestedPromptCacheLen, windowSize + chunkSize))
+        auto const promptCacheLen
+            = (swaContextReuse ? requestedPromptCacheLen : std::min(requestedPromptCacheLen, windowSize + chunkSize))
             + mSinkBubbleLength;
         auto const numSharedBlocks = promptCacheLen / getTokensPerBlock();
         auto const numUnSharedTokens = promptCacheLen % getTokensPerBlock();
@@ -4080,7 +4096,8 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
                         ? mBlockManager.analyzePrefixReuse(req.getUniqueTokens(0), req, windowSize)
                         : analyzePrefixReuse(req.getUniqueTokens(0), req));
             auto const numReusableBlocks = summary.reusableBlocksAllocated;
-            auto const promptInputLen = (metadata.isSWA && isSwaFullContextBlockBudgetProbeEnabled())
+            auto const promptInputLen
+                = (swaContextReuse || (metadata.isSWA && isSwaFullContextBlockBudgetProbeEnabled()))
                 ? std::min(req.mPromptLen, requestedPromptCacheLen)
                 : std::min(req.mPromptLen, windowSize + chunkSize);
             // Sequence insertion ignores the last prompt token because its KV cannot be recovered.
@@ -4278,13 +4295,13 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
 
     auto const metadata = mBlockManager.getWindowSizeMetadata(windowSize);
     auto const temporaryAttentionWindow = metadata.temporaryAttentionWindow;
+    auto const swaContextReuse = metadata.isSWA && isSwaContextReuseEnabled();
 
-    auto const contextTokenLimit = (metadata.isSWA && isSwaFullContextReuseProbeEnabled())
-        ? req.mPromptLen
-        : std::min(req.mPromptLen, windowSize + temporaryAttentionWindow);
+    auto const contextTokenLimit
+        = swaContextReuse ? req.mPromptLen : std::min(req.mPromptLen, windowSize + temporaryAttentionWindow);
     SizeType32 const numContextBlocks = (contextTokenLimit + mSinkBubbleLength) / getTokensPerBlock();
 
-    auto const totalTokenLimit = (metadata.isSWA && isSwaFullContextReuseProbeEnabled())
+    auto const totalTokenLimit = swaContextReuse
         ? req.mPromptLen + req.mMaxNewTokens
         : std::min(req.mPromptLen + req.mMaxNewTokens, windowSize + temporaryAttentionWindow);
     SizeType32 const numTotalBlocksPerBeam = tc::ceilDiv(totalTokenLimit + mSinkBubbleLength, getTokensPerBlock());
@@ -4708,6 +4725,7 @@ void KVCacheManager::addSequenceBatch(
         auto const metadata = mBlockManager.getWindowSizeMetadata(windowSize);
         auto const maxTokenNum = metadata.maxTokenNum;
         auto const temporaryAttentionWindow = metadata.temporaryAttentionWindow;
+        auto const swaContextReuse = metadata.isSWA && isSwaContextReuseEnabled();
 
         // Compute per-sequence effective input length for this window
         std::vector<SizeType32> inputLengths(n);
@@ -4718,7 +4736,8 @@ void KVCacheManager::addSequenceBatch(
             auto const inputLength = std::get<1>(requestInfos[i]);
             inputLengths[i] = std::min(inputLength, maxTokenNum + temporaryAttentionWindow);
             numContextBlocksVec[i] = tc::ceilDiv(inputLengths[i], getTokensPerBlock());
-            firstRealBlockIdxVec[i] = getFirstRealBlockIdxForWindow(metadata, inputLength, getTokensPerBlock());
+            firstRealBlockIdxVec[i]
+                = getFirstRealBlockIdxForWindow(metadata, inputLength, getTokensPerBlock(), swaContextReuse);
             sequences[i]->setNumFrontBlocksRemoved(windowSize, firstRealBlockIdxVec[i]);
         }
 
@@ -5316,9 +5335,10 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
     }
     else
     {
-        windowSizeToShare = BlockManager::calculateWindowSizeToShare(
-            windowSizeToLayers, cacheSizeBytesPerTokenPerWindow, tempAttentionWindowInputs);
-        TLLM_LOG_DEBUG("Using derived proportional allocation of memory to each effective window size.");
+        windowSizeToShare = BlockManager::calculateWindowSizeToShare(windowSizeToLayers,
+            cacheSizeBytesPerTokenPerWindow, tempAttentionWindowInputs, config.getOptimizationTarget());
+        TLLM_LOG_DEBUG("Using derived proportional allocation of memory to each effective window size for target %s.",
+            config.getOptimizationTarget().c_str());
     }
 
     std::vector<SizeType32> blocksPrimary;

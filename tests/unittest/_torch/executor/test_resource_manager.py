@@ -618,6 +618,33 @@ class TestResourceManager(unittest.TestCase):
             max_num_tokens=20000,
         )
 
+        expected_swa_share = 131071.0 / (131071.0 + 131072.0)
+        expected_full_share = 131072.0 / (131071.0 + 131072.0)
+        self.assertAlmostEqual(window_size_to_share[128], expected_swa_share)
+        self.assertAlmostEqual(window_size_to_share[131072],
+                               expected_full_share)
+
+    def test_gpt_oss_vswa_generation_shares_include_chunked_prefill_window(
+            self) -> None:
+        num_layers_per_window = 32
+        window_size_to_layers = {
+            128: list(range(num_layers_per_window)),
+            131072: list(range(num_layers_per_window,
+                               num_layers_per_window * 2)),
+        }
+        cache_size_bytes_per_token_per_window = {
+            128: 1024,
+            131072: 1024,
+        }
+
+        window_size_to_share = _derive_window_size_shares(
+            window_size_to_layers,
+            cache_size_bytes_per_token_per_window,
+            max_input_len=131071,
+            max_num_tokens=20000,
+            optimization_target="generation",
+        )
+
         expected_swa_share = 20128.0 / (20128.0 + 131072.0)
         expected_full_share = 131072.0 / (20128.0 + 131072.0)
         self.assertAlmostEqual(window_size_to_share[128], expected_swa_share)

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,6 +48,11 @@ TEST(KvCacheConfigTest, validInputs)
         {
             auto kvCacheConfig = KvCacheConfig(true, 100, std::vector(1, 1000), 1000, 0.1);
         }
+        {
+            auto kvCacheConfig = KvCacheConfig(true, 100, std::vector(1, 1000), 1000, 0.1, std::nullopt, std::nullopt,
+                std::nullopt, 0, true, true, false, 5, std::nullopt, 0, KvCacheConfig::kGenerationOptimizationTarget);
+            EXPECT_EQ(kvCacheConfig.getOptimizationTarget(), KvCacheConfig::kGenerationOptimizationTarget);
+        }
     }
 }
 
@@ -89,4 +94,9 @@ TEST(KvCacheConfigTest, invalidInputs)
     // free gpu memory fraction
     testInvalid(true, std::nullopt, std::nullopt, std::nullopt, -0.1);
     testInvalid(true, std::nullopt, std::nullopt, std::nullopt, 1.1);
+
+    // invalid optimization target
+    EXPECT_THROW((KvCacheConfig(true, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                     std::nullopt, std::nullopt, 0, true, true, false, 5, std::nullopt, 0, "invalid")),
+        TllmException);
 }

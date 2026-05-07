@@ -1480,12 +1480,15 @@ public:
     //!          Would Return:  {1024: 0.0345, 4096: 0.4138, 8192: 0.5517} [sums to 1.0].
     //!          If paged context FMHA needs a temporary attention window, SWA contribution uses
     //!          (window size + temporary attention window) so the pool can hold chunked prefill.
+    //!          When optimizing for context reuse, SWA contribution uses max input length so SWA
+    //!          windows receive enough memory for reusable context anchors.
     //!          See: TEST_F(KVCacheManagerTest, BlockManagerTestWindowSizeToShare).
     //! \return Map<windowSize, share> where share is a float between 0 and 1. Shares sum to 1.0.
     static std::map<SizeType32, float> calculateWindowSizeToShare(
         std::map<SizeType32, std::vector<SizeType32>> const& uniqueWindowSizeToLayers,
         std::map<SizeType32, SizeType32> const& cacheSizePerTokenPerWindowSize,
-        std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs = std::nullopt);
+        std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs = std::nullopt,
+        std::string const& optimizationTarget = executor::KvCacheConfig::kDefaultOptimizationTarget);
 
     void allocatePools(bool useUvm);
 
@@ -2013,6 +2016,11 @@ public:
 
     [[nodiscard]] virtual bool isEnablePartialReuse() const = 0;
 
+    [[nodiscard]] virtual bool isSwaContextReuseEnabled() const
+    {
+        return false;
+    }
+
     [[nodiscard]] virtual bool isEnableIndexerKCache() const = 0;
     [[nodiscard]] virtual SizeType32 getIndexerKCacheIndexHeadDim() const = 0;
     [[nodiscard]] virtual SizeType32 getIndexerKCacheQuantBlockSize() const = 0;
@@ -2175,7 +2183,7 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt, bool swaContextReuse = true);
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -2189,7 +2197,7 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt, bool swaContextReuse = true);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -2203,7 +2211,7 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt, bool swaContextReuse = true);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -2213,7 +2221,7 @@ public:
         CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true, bool copyOnpartialReuse = true,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt, bool swaContextReuse = true);
 
     ~KVCacheManager() override = default;
 
@@ -2387,6 +2395,8 @@ public:
         return mBlockManager.isEnablePartialReuse();
     }
 
+    [[nodiscard]] bool isSwaContextReuseEnabled() const override;
+
     [[nodiscard]] bool isEnableIndexerKCache() const override
     {
         return mBlockManager.isEnableIndexerKCache();
@@ -2552,6 +2562,8 @@ private:
     std::unordered_map<LlmRequest::RequestIdType, GenerationRequest> mSequences;
     // Whether to cache KV pages for reuse
     bool mEnableBlockReuse;
+    // Whether SWA context requests materialize full prompt cache blocks for future context reuse.
+    bool mSwaContextReuse;
     // Mutex to protect access to mSequences
     mutable std::mutex mSequencesMtx;
     // buffers for static tensors, will be created after allocating pools
