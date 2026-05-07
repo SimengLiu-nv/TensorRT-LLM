@@ -656,6 +656,7 @@ class TestResourceManager(unittest.TestCase):
             self) -> None:
 
         class NoCpMapping:
+            cp_config: dict[str, object] = {}
 
             def has_cp_helix(self) -> bool:
                 return False
@@ -729,8 +730,21 @@ class TestResourceManager(unittest.TestCase):
                 self.calls.append(("store_new_block", request.py_request_id,
                                    None))
 
+            def sync_transfer_manager_with_buffer_manager(self) -> None:
+                self.calls.append(("sync_transfer_manager_with_buffer_manager",
+                                   None, None))
+
             def refresh_blocks(self) -> None:
                 self.calls.append(("refresh_blocks", None, None))
+
+        class ScheduledBatchStub:
+
+            def __init__(self, request: LlmRequest) -> None:
+                self.generation_requests = [request]
+                self.context_requests: list[LlmRequest] = []
+
+            def reset_context_requests(self) -> None:
+                pass
 
         request = SimpleNamespace(
             py_request_id=7,
@@ -740,8 +754,7 @@ class TestResourceManager(unittest.TestCase):
             py_num_accepted_draft_tokens_indices=[],
             py_draft_tokens=None,
         )
-        scheduled_batch = SimpleNamespace(generation_requests=[request],
-                                          context_requests=[])
+        scheduled_batch = ScheduledBatchStub(request)
 
         kv_cache_manager = KVCacheManager.__new__(KVCacheManager)
         kv_cache_manager.is_draft = False
@@ -750,20 +763,22 @@ class TestResourceManager(unittest.TestCase):
         kv_cache_manager.kv_connector_manager = None
         kv_cache_manager._swa_context_reuse = True
 
-        kv_cache_manager.update_resources(scheduled_batch)
+        kv_cache_manager.prepare_resources(scheduled_batch)
 
         self.assertEqual(kv_cache_manager.impl.calls, [
-            ("add_token", 7, True),
+            ("sync_transfer_manager_with_buffer_manager", None, None),
             ("store_new_block", 7, None),
+            ("add_token", 7, True),
             ("refresh_blocks", None, None),
         ])
 
         kv_cache_manager.impl = RecordingKvCacheImpl()
         kv_cache_manager._swa_context_reuse = False
 
-        kv_cache_manager.update_resources(scheduled_batch)
+        kv_cache_manager.prepare_resources(scheduled_batch)
 
         self.assertEqual(kv_cache_manager.impl.calls, [
+            ("sync_transfer_manager_with_buffer_manager", None, None),
             ("add_token", 7, True),
             ("refresh_blocks", None, None),
         ])

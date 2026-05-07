@@ -8884,11 +8884,11 @@ TEST_F(KVCacheManagerTest, VSWAContextReuseStoresOOWBlocksBeforeDetachDuringGene
     kvCacheManager->storeContextBlocks(*llmRequest0);
 
     llmRequest0->addNewToken(kVSWA_FIRST_TOKEN + 11, kVSWA_BEAM_IDX);
-    kvCacheManager->addToken(0);
     kvCacheManager->storeNewBlock(*llmRequest0);
+    kvCacheManager->addToken(0);
     llmRequest0->addNewToken(kVSWA_FIRST_TOKEN + 12, kVSWA_BEAM_IDX);
-    kvCacheManager->addToken(0);
     kvCacheManager->storeNewBlock(*llmRequest0);
+    kvCacheManager->addToken(0);
 
     auto const& seq0 = kvCacheManager->getSequence(0);
     EXPECT_GT(seq0.getNumFrontBlocksRemoved(onlyWindowSize), 0);

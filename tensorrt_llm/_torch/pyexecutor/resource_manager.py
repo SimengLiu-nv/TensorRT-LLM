@@ -740,13 +740,13 @@ class KVCacheManager(BaseResourceManager):
                         req.py_helix_is_inactive_rank = True
                         # Skip allocating KV cache at decode for inactive helix ranks.
                         continue
-                self.impl.add_token(req.py_request_id)
                 if self._swa_context_reuse:
                     self.impl.store_new_block(req)
+                self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
-                    self.impl.add_token(req.py_request_id)
                     if self._swa_context_reuse:
                         self.impl.store_new_block(req)
+                    self.impl.add_token(req.py_request_id)
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
             self.impl.refresh_blocks()
