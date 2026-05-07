@@ -89,6 +89,12 @@ bool isSwaFullContextReuseProbeEnabled() noexcept
         || isTruthyEnvVar("TRTLLM_VSWA_FULL_CONTEXT_REUSE_PROBE");
 }
 
+bool isSwaFullContextBlockBudgetProbeEnabled() noexcept
+{
+    return isTruthyEnvVar("TLLM_VSWA_FULL_CONTEXT_BLOCK_BUDGET_PROBE")
+        || isTruthyEnvVar("TRTLLM_VSWA_FULL_CONTEXT_BLOCK_BUDGET_PROBE");
+}
+
 char const* logBool(bool value) noexcept
 {
     return value ? "true" : "false";
@@ -3935,7 +3941,9 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
                         ? mBlockManager.analyzePrefixReuse(req.getUniqueTokens(0), req, windowSize)
                         : analyzePrefixReuse(req.getUniqueTokens(0), req));
             auto const numReusableBlocks = summary.reusableBlocksAllocated;
-            auto const promptInputLen = std::min(req.mPromptLen, windowSize + chunkSize);
+            auto const promptInputLen = (metadata.isSWA && isSwaFullContextBlockBudgetProbeEnabled())
+                ? std::min(req.mPromptLen, requestedPromptCacheLen)
+                : std::min(req.mPromptLen, windowSize + chunkSize);
             // Sequence insertion ignores the last prompt token because its KV cannot be recovered.
             // When the prompt lands exactly on a block boundary, counting reusable full blocks from
             // all unique tokens can over-credit one extra shared block.
