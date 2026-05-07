@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <limits>
 #include <map>
@@ -87,13 +88,31 @@ char const* logBool(bool value) noexcept
     return value ? "true" : "false";
 }
 
-bool shouldLogReuseSummaryOnce(
-    char const* scope, tensorrt_llm::batch_manager::LlmRequest::RequestIdType requestId, SizeType32 windowSize)
+std::string formatWindowMetadataForLog(std::map<SizeType32, WindowSizeMetadata> const& metadataByWindow)
+{
+    std::ostringstream os;
+    bool first = true;
+    for (auto const& [windowSize, metadata] : metadataByWindow)
+    {
+        if (!first)
+        {
+            os << ",";
+        }
+        first = false;
+        os << windowSize << ":" << (metadata.isSWA ? "swa" : "full") << ":max=" << metadata.maxTokenNum
+           << ":tmp=" << metadata.temporaryAttentionWindow;
+    }
+    return os.str();
+}
+
+bool shouldLogReuseSummaryOnce(char const* scope, tensorrt_llm::batch_manager::LlmRequest::RequestIdType requestId,
+    SizeType32 windowSize, void const* owner = nullptr)
 {
     static std::mutex sMutex;
     static auto* sLoggedKeys = new std::unordered_set<std::string>();
 
-    auto const key = std::string(scope) + ":" + std::to_string(requestId) + ":" + std::to_string(windowSize);
+    auto const key = std::string(scope) + ":" + std::to_string(reinterpret_cast<std::uintptr_t>(owner)) + ":"
+        + std::to_string(requestId) + ":" + std::to_string(windowSize);
     std::scoped_lock lock(sMutex);
     return sLoggedKeys->insert(key).second;
 }
@@ -3889,18 +3908,21 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
                         : 0.0);
             }
             if (isKvCacheReuseSummaryLoggingEnabled()
-                && shouldLogReuseSummaryOnce("getNeededBlocksOneStep", req.mRequestId, windowSize))
+                && shouldLogReuseSummaryOnce("getNeededBlocksOneStep", req.mRequestId, windowSize, this))
             {
+                auto const windowSet = formatWindowMetadataForLog(mBlockManager.getWindowSizesMetadata());
                 TLLM_LOG_INFO(
-                    "[kv-reuse-summary] KVCacheManager::getNeededBlocksOneStep request=%lu window=%d isSWA=%s "
+                    "[kv-reuse-summary] KVCacheManager::getNeededBlocksOneStep manager=%p windowSet=%s "
+                    "request=%lu window=%d isSWA=%s "
                     "returnBlocks=%d requiredBeforeReuse=%d numSharedBlocks=%d promptInputLen=%d "
                     "maxRecoverableSharedBlocks=%d reusableSharedBlocks=%d reusableBlocksAllocated=%d "
                     "reusableBlocksAll=%d totalMatchedTokens=%d estimatedReusableTokens=%d "
                     "contextCurrentPosition=%d",
-                    req.mRequestId, windowSize, logBool(metadata.isSWA), numRequiredBlocks,
-                    numRequiredBlocksBeforeReuse, numSharedBlocks, promptInputLen, maxRecoverableSharedBlocks,
-                    reusableSharedBlocks, summary.reusableBlocksAllocated, summary.reusableBlocksAll,
-                    summary.totalMatchedTokens, req.getEstimatedReusableTokens(), req.getContextCurrentPosition());
+                    static_cast<void const*>(this), windowSet.c_str(), req.mRequestId, windowSize,
+                    logBool(metadata.isSWA), numRequiredBlocks, numRequiredBlocksBeforeReuse, numSharedBlocks,
+                    promptInputLen, maxRecoverableSharedBlocks, reusableSharedBlocks, summary.reusableBlocksAllocated,
+                    summary.reusableBlocksAll, summary.totalMatchedTokens, req.getEstimatedReusableTokens(),
+                    req.getContextCurrentPosition());
             }
         }
         else if (logKvReuseDebug)
@@ -4174,19 +4196,21 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
     }
 
     if (isKvCacheReuseSummaryLoggingEnabled()
-        && shouldLogReuseSummaryOnce("getRemainingBlocksToCompletion", req.mRequestId, windowSize))
+        && shouldLogReuseSummaryOnce("getRemainingBlocksToCompletion", req.mRequestId, windowSize, this))
     {
+        auto const windowSet = formatWindowMetadataForLog(mBlockManager.getWindowSizesMetadata());
         TLLM_LOG_INFO(
-            "[kv-reuse-summary] KVCacheManager::getRemainingBlocksToCompletion request=%lu window=%d isSWA=%s "
+            "[kv-reuse-summary] KVCacheManager::getRemainingBlocksToCompletion manager=%p windowSet=%s "
+            "request=%lu window=%d isSWA=%s "
             "returnBlocks=%d promptLen=%d maxNewTokens=%d numContextBlocks=%d numTotalBlocksPerBeam=%d "
             "numGenBlocksPerBeam=%d numAllocBlocksPerBeam=%d reusableContextBlocks=%d "
             "reusableBlocksAllocated=%d reusableBlocksAll=%d totalMatchedTokens=%d estimatedReusableTokens=%d "
             "effectiveContextBlocks=%d numExtraBlocksPerBeam=%d contextCurrentPosition=%d",
-            req.mRequestId, windowSize, logBool(metadata.isSWA), remainingBlocks, req.mPromptLen, req.mMaxNewTokens,
-            numContextBlocks, numTotalBlocksPerBeam, numGenBlocksPerBeam, numAllocBlocksPerBeam,
-            numReusableContextBlocks, numReusableBlocksAllocated, numReusableBlocksAll, summaryTotalMatchedTokens,
-            req.getEstimatedReusableTokens(), effectiveContextBlocks, numExtraBlocksPerBeam,
-            req.getContextCurrentPosition());
+            static_cast<void const*>(this), windowSet.c_str(), req.mRequestId, windowSize, logBool(metadata.isSWA),
+            remainingBlocks, req.mPromptLen, req.mMaxNewTokens, numContextBlocks, numTotalBlocksPerBeam,
+            numGenBlocksPerBeam, numAllocBlocksPerBeam, numReusableContextBlocks, numReusableBlocksAllocated,
+            numReusableBlocksAll, summaryTotalMatchedTokens, req.getEstimatedReusableTokens(), effectiveContextBlocks,
+            numExtraBlocksPerBeam, req.getContextCurrentPosition());
     }
 
     logKvCacheBlockQueryReturn(
@@ -4483,6 +4507,39 @@ void KVCacheManager::addSequenceBatch(
                         ? 100.0 * static_cast<double>(primaryUsedBlocks) / static_cast<double>(primaryMaxBlocks)
                         : 0.0);
             }
+            if (logKvReuseSummary
+                && shouldLogReuseSummaryOnce(
+                    "addSequenceBatchWindow", llmRequests[i].get().mRequestId, windowSize, this))
+            {
+                auto const promptLen = llmRequests[i].get().getPromptLen();
+                auto const physicalContextBlocks = numContextBlocksVec[i] - firstRealBlockIdxVec[i];
+                auto const currentMinNonSwaPrepopulatedLen
+                    = hasNonSwaWindow[i] ? minNonSwaPrepopulatedLen[i] : static_cast<SizeType32>(-1);
+                auto const currentMinSwaPrepopulatedLen
+                    = hasSwaWindow[i] ? minSwaPrepopulatedLen[i] : static_cast<SizeType32>(-1);
+                auto const primaryMaxBlocks = mBlockManager.getNumPrimaryBlocks(windowSize);
+                auto const primaryFreeBlocks = mBlockManager.getNumFreeBlocks(windowSize);
+                auto const primaryUsedBlocks = primaryMaxBlocks - primaryFreeBlocks;
+                auto const windowSet = formatWindowMetadataForLog(mBlockManager.getWindowSizesMetadata());
+                TLLM_LOG_INFO(
+                    "[kv-reuse-summary] KVCacheManager::addSequenceBatch window-result manager=%p windowSet=%s "
+                    "request=%lu window=%d isSWA=%s promptLen=%d inputLength=%d effectiveInputLength=%d "
+                    "temporaryAttentionWindow=%d maxTokenNum=%d tokensPerBlock=%d numContextBlocks=%d "
+                    "firstRealBlockIdx=%d physicalContextBlocks=%d windowPrepopulatedLen=%d "
+                    "minAllPrepopulatedLen=%d hasNonSwaWindow=%s minNonSwaPrepopulatedLen=%d hasSwaWindow=%s "
+                    "minSwaPrepopulatedLen=%d allocTotalDelta=%d allocNewDelta=%d reusedDelta=%d missedDelta=%d "
+                    "primaryUsedBlocks=%d primaryFreeBlocks=%d primaryMaxBlocks=%d primaryUsedPct=%.2f",
+                    static_cast<void const*>(this), windowSet.c_str(), llmRequests[i].get().mRequestId, windowSize,
+                    logBool(metadata.isSWA), promptLen, std::get<1>(requestInfos[i]), inputLengths[i],
+                    temporaryAttentionWindow, maxTokenNum, getTokensPerBlock(), numContextBlocksVec[i],
+                    firstRealBlockIdxVec[i], physicalContextBlocks, stats.prepopulatedLen, minPrepopulatedLen[i],
+                    logBool(hasNonSwaWindow[i]), currentMinNonSwaPrepopulatedLen, logBool(hasSwaWindow[i]),
+                    currentMinSwaPrepopulatedLen, stats.allocTotalDelta, stats.allocNewDelta, stats.reusedDelta,
+                    stats.missedDelta, primaryUsedBlocks, primaryFreeBlocks, primaryMaxBlocks,
+                    primaryMaxBlocks > 0
+                        ? 100.0 * static_cast<double>(primaryUsedBlocks) / static_cast<double>(primaryMaxBlocks)
+                        : 0.0);
+            }
             totalAllocTotalDelta[i] += stats.allocTotalDelta;
             totalAllocNewDelta[i] += stats.allocNewDelta;
             totalReusedDelta[i] += stats.reusedDelta;
@@ -4542,7 +4599,7 @@ void KVCacheManager::addSequenceBatch(
             }
             if (logKvReuseSummary
                 && shouldLogReuseSummaryOnce(
-                    "addSequenceBatchSelect", llmRequest.mRequestId, static_cast<SizeType32>(-1)))
+                    "addSequenceBatchSelect", llmRequest.mRequestId, static_cast<SizeType32>(-1), this))
             {
                 auto const smallestSwaWindow = getSmallestSwaWindow(mBlockManager.getWindowSizesMetadata());
                 auto const fullAttentionPrepopulatedLen
@@ -4559,19 +4616,21 @@ void KVCacheManager::addSequenceBatch(
                     : 0;
                 auto const swaWouldLowerTokens
                     = reusablePrepopulatedLen - std::min(reusablePrepopulatedLen, swaSafePrepopulatedLen);
+                auto const windowSet = formatWindowMetadataForLog(mBlockManager.getWindowSizesMetadata());
                 TLLM_LOG_INFO(
-                    "[kv-reuse-summary] KVCacheManager::addSequenceBatch select request=%lu promptLen=%d "
+                    "[kv-reuse-summary] KVCacheManager::addSequenceBatch select manager=%p windowSet=%s "
+                    "request=%lu promptLen=%d "
                     "tokensPerBlock=%d hasNonSwaWindow=%s hasSwaWindow=%s fullAttentionPrepopulatedLen=%d "
                     "swaPrepopulatedLen=%d minAllPrepopulatedLen=%d reusablePrepopulatedLen=%d "
                     "swaSafePrepopulatedLen=%d smallestSwaWindow=%d selectedPrepopulatedLen=%d "
                     "uncachedSuffix=%d cappedPrepopulatedLen=%d cappedUncachedSuffix=%d capWouldApply=%s "
                     "swaWouldLowerTokens=%d totalAllocTotalDelta=%d totalAllocNewDelta=%d totalReusedDelta=%d "
                     "totalMissedDelta=%d",
-                    llmRequest.mRequestId, llmRequest.getPromptLen(), getTokensPerBlock(), logBool(hasNonSwaWindow[i]),
-                    logBool(hasSwaWindow[i]), fullAttentionPrepopulatedLen, swaPrepopulatedLen, minPrepopulatedLen[i],
-                    reusablePrepopulatedLen, swaSafePrepopulatedLen,
-                    smallestSwaWindow.value_or(static_cast<SizeType32>(-1)), selectedPrepopulatedLen, uncachedSuffix,
-                    cappedPrepopulatedLen, cappedUncachedSuffix,
+                    static_cast<void const*>(this), windowSet.c_str(), llmRequest.mRequestId, llmRequest.getPromptLen(),
+                    getTokensPerBlock(), logBool(hasNonSwaWindow[i]), logBool(hasSwaWindow[i]),
+                    fullAttentionPrepopulatedLen, swaPrepopulatedLen, minPrepopulatedLen[i], reusablePrepopulatedLen,
+                    swaSafePrepopulatedLen, smallestSwaWindow.value_or(static_cast<SizeType32>(-1)),
+                    selectedPrepopulatedLen, uncachedSuffix, cappedPrepopulatedLen, cappedUncachedSuffix,
                     logBool(cappedPrepopulatedLen < reusablePrepopulatedLen), swaWouldLowerTokens,
                     totalAllocTotalDelta[i], totalAllocNewDelta[i], totalReusedDelta[i], totalMissedDelta[i]);
             }
