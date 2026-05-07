@@ -4129,13 +4129,13 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
             continue;
         }
 
+        bool const oowBlockInReuseTree = mIsSWA && blockInRadixTree(outOfWindowBlock);
         if (mIsSWA && isKvCacheReuseDebugLoggingEnabled())
         {
             ++mSwaDebugHistory.oowDetachReplacements;
             auto const prefixTokens = outOfWindowBlockIdx * mTokensPerBlock
                 + static_cast<SizeType32>(outOfWindowBlock->getUniqueTokens().size());
-            auto const inReuseTree = blockInRadixTree(outOfWindowBlock);
-            if (inReuseTree)
+            if (oowBlockInReuseTree)
             {
                 updateSwaDebugNewestRealBlock(outOfWindowBlock, prefixTokens, "detach-oow-real-still-stored");
             }
@@ -4143,10 +4143,11 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
             auto const primaryUsedBlocks = getNumPrimaryBlocks() - primaryFreeBlocks;
             TLLM_LOG_INFO(
                 "[kv-reuse-debug] %s::swa-oow-replace request=%lu blockIdx=%d blockId=%d prefixTokens=%d "
-                "inReuseTree=%s newestValid=%s newestBlockId=%d newestPrefixTokens=%d oowDetachReplacements=%llu "
-                "primaryUsedBlocks=%d primaryFreeBlocks=%d primaryMaxBlocks=%d",
+                "inReuseTree=%s releaseToFront=%s newestValid=%s newestBlockId=%d newestPrefixTokens=%d "
+                "oowDetachReplacements=%llu primaryUsedBlocks=%d primaryFreeBlocks=%d primaryMaxBlocks=%d",
                 mLogPrefix.c_str(), requestId, outOfWindowBlockIdx, outOfWindowBlock->getBlockId(), prefixTokens,
-                logBool(inReuseTree), logBool(mSwaDebugHistory.newestRealAnchorValid),
+                logBool(oowBlockInReuseTree), logBool(!oowBlockInReuseTree),
+                logBool(mSwaDebugHistory.newestRealAnchorValid),
                 mSwaDebugHistory.newestRealBlockId, mSwaDebugHistory.newestRealPrefixTokens,
                 static_cast<unsigned long long>(mSwaDebugHistory.oowDetachReplacements), primaryUsedBlocks,
                 primaryFreeBlocks, getNumPrimaryBlocks());
@@ -4172,7 +4173,11 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
         }
         if (!outOfWindowBlock->hasRefs())
         {
-            mEvictionPolicy->releaseBlock(outOfWindowBlock);
+            // SWA context FMHA can allocate many transient in-window blocks that are
+            // intentionally replaced by traversal-only placeholders once they slide
+            // out of window. Recycle those non-reusable blocks before cached SWA
+            // anchors so temporary context allocation does not evict useful tails.
+            mEvictionPolicy->releaseBlock(outOfWindowBlock, mIsSWA && !oowBlockInReuseTree);
         }
     }
 
