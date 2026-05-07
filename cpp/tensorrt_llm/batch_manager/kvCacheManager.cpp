@@ -5070,28 +5070,31 @@ SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSl
             for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
             {
                 auto const beamBlockCount = cacheBlockIds[beamIdx].size();
-                SizeType32 copiedBlockCount = static_cast<SizeType32>(beamBlockCount);
-                if (metadata.isSWA && useSwaCyclicSlots && !useSwaContextSlots)
+                auto const copyChunkSize = beamBlockCount * sizeof(tk::KVCacheIndex);
+                for (auto xIdx : {kIdx, vIdx})
                 {
-                    auto const maxBlocksPerSeq = static_cast<SizeType32>(srcShape.d[3]);
-                    auto const generationCyclicBlockCount = tc::ceilDiv(ws, getTokensPerBlock()) + kSWAExtraBlock;
-                    auto const cyclicBlockCount = std::min(generationCyclicBlockCount, maxBlocksPerSeq);
-                    TLLM_CHECK_WITH_INFO(cyclicBlockCount > 0,
-                        "SWA cyclic block count must be positive for window size %d and tokens per block %d", ws,
-                        getTokensPerBlock());
-                    auto const firstActiveBlockIdx = sequence.getNumFrontBlocksRemoved(ws);
-                    auto const tailStartBlockIdx = beamBlockCount > static_cast<size_t>(cyclicBlockCount)
-                        ? beamBlockCount - cyclicBlockCount
-                        : 0;
-                    auto const startBlockIdx
-                        = std::max(static_cast<SizeType32>(tailStartBlockIdx), firstActiveBlockIdx);
-                    for (auto xIdx : {kIdx, vIdx})
+                    auto const srcIndex = tc::flat_index(srcShape.d, poolIdx, beamIdx, xIdx, 0);
+                    auto const dstIndex
+                        = tc::flat_index(dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, 0);
+                    std::memcpy(dstPtr + dstIndex, srcPtr + srcIndex, copyChunkSize);
+                    if (metadata.isSWA && useSwaCyclicSlots)
                     {
-                        auto const dstIndex
-                            = tc::flat_index(dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, 0);
-                        std::fill_n(dstPtr + dstIndex, cyclicBlockCount, tk::KVCacheIndex::nullIndex);
-                        for (SizeType32 blockIdx = startBlockIdx; blockIdx < static_cast<SizeType32>(beamBlockCount);
-                             ++blockIdx)
+                        // SWA stores only a bounded physical tail. For context
+                        // FMHA, fill every logical page-table slot by aliasing
+                        // it back into that valid cyclic tail; generation keeps
+                        // the compact cyclic view.
+                        auto const firstActiveBlockIdx = sequence.getNumFrontBlocksRemoved(ws);
+                        auto const maxBlocksPerSeq = static_cast<SizeType32>(srcShape.d[3]);
+                        auto const contextCyclicBlockCount
+                            = tc::ceilDiv(ws + metadata.temporaryAttentionWindow, getTokensPerBlock()) + kSWAExtraBlock;
+                        auto const generationCyclicBlockCount = tc::ceilDiv(ws, getTokensPerBlock()) + kSWAExtraBlock;
+                        auto const cyclicBlockCount = std::min(
+                            useSwaContextSlots ? contextCyclicBlockCount : generationCyclicBlockCount, maxBlocksPerSeq);
+                        TLLM_CHECK_WITH_INFO(cyclicBlockCount > 0,
+                            "SWA cyclic block count must be positive for window size %d and tokens per block %d", ws,
+                            getTokensPerBlock());
+                        for (SizeType32 blockIdx = firstActiveBlockIdx;
+                             blockIdx < static_cast<SizeType32>(beamBlockCount); ++blockIdx)
                         {
                             auto const cyclicBlockIdx = blockIdx % cyclicBlockCount;
                             auto const srcBlockIndex = tc::flat_index(srcShape.d, poolIdx, beamIdx, xIdx, blockIdx);
@@ -5099,62 +5102,22 @@ SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSl
                                 dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, cyclicBlockIdx);
                             dstPtr[dstBlockIndex] = srcPtr[srcBlockIndex];
                         }
-                    }
-                    copiedBlockCount = cyclicBlockCount;
-                }
-                else
-                {
-                    auto const copyChunkSize = beamBlockCount * sizeof(tk::KVCacheIndex);
-                    for (auto xIdx : {kIdx, vIdx})
-                    {
-                        auto const srcIndex = tc::flat_index(srcShape.d, poolIdx, beamIdx, xIdx, 0);
-                        auto const dstIndex
-                            = tc::flat_index(dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, 0);
-                        std::memcpy(dstPtr + dstIndex, srcPtr + srcIndex, copyChunkSize);
-                        if (metadata.isSWA && useSwaCyclicSlots)
+                        if (useSwaContextSlots)
                         {
-                            // SWA stores only a bounded physical tail. For context
-                            // FMHA, fill every logical page-table slot by aliasing
-                            // it back into that valid cyclic tail.
-                            auto const firstActiveBlockIdx = sequence.getNumFrontBlocksRemoved(ws);
-                            auto const maxBlocksPerSeq = static_cast<SizeType32>(srcShape.d[3]);
-                            auto const contextCyclicBlockCount
-                                = tc::ceilDiv(ws + metadata.temporaryAttentionWindow, getTokensPerBlock())
-                                + kSWAExtraBlock;
-                            auto const generationCyclicBlockCount
-                                = tc::ceilDiv(ws, getTokensPerBlock()) + kSWAExtraBlock;
-                            auto const cyclicBlockCount
-                                = std::min(useSwaContextSlots ? contextCyclicBlockCount : generationCyclicBlockCount,
-                                    maxBlocksPerSeq);
-                            TLLM_CHECK_WITH_INFO(cyclicBlockCount > 0,
-                                "SWA cyclic block count must be positive for window size %d and tokens per block %d",
-                                ws, getTokensPerBlock());
-                            for (SizeType32 blockIdx = firstActiveBlockIdx;
-                                 blockIdx < static_cast<SizeType32>(beamBlockCount); ++blockIdx)
+                            for (SizeType32 blockIdx = 0; blockIdx < static_cast<SizeType32>(beamBlockCount);
+                                 ++blockIdx)
                             {
                                 auto const cyclicBlockIdx = blockIdx % cyclicBlockCount;
-                                auto const srcBlockIndex = tc::flat_index(srcShape.d, poolIdx, beamIdx, xIdx, blockIdx);
-                                auto const dstBlockIndex = tc::flat_index(
+                                auto const srcBlockIndex = tc::flat_index(
                                     dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, cyclicBlockIdx);
-                                dstPtr[dstBlockIndex] = srcPtr[srcBlockIndex];
-                            }
-                            if (useSwaContextSlots)
-                            {
-                                for (SizeType32 blockIdx = 0; blockIdx < static_cast<SizeType32>(beamBlockCount);
-                                     ++blockIdx)
-                                {
-                                    auto const cyclicBlockIdx = blockIdx % cyclicBlockCount;
-                                    auto const srcBlockIndex = tc::flat_index(
-                                        dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, cyclicBlockIdx);
-                                    auto const dstBlockIndex = tc::flat_index(
-                                        dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, blockIdx);
-                                    dstPtr[dstBlockIndex] = dstPtr[srcBlockIndex];
-                                }
+                                auto const dstBlockIndex = tc::flat_index(
+                                    dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, blockIdx);
+                                dstPtr[dstBlockIndex] = dstPtr[srcBlockIndex];
                             }
                         }
                     }
                 }
-                maxBlockCount = std::max(maxBlockCount, copiedBlockCount);
+                maxBlockCount = std::max<SizeType32>(maxBlockCount, static_cast<SizeType32>(beamBlockCount));
             }
         }
     }
