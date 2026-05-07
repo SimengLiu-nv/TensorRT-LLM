@@ -1252,11 +1252,19 @@ private:
         std::uint64_t evictedStoredBlocks{0};
         std::uint64_t evictedNewestBlocks{0};
         std::unordered_map<KVCacheBlock::IdType, SizeType32> realBlockPrefixTokens;
+        std::list<KVCacheBlock::IdType> recentProtectedAnchors;
+        std::unordered_map<KVCacheBlock::IdType,
+            std::pair<executor::RetentionPriority, std::optional<std::chrono::milliseconds>>>
+            recentProtectedOriginalRetention;
     };
 
     void updateSwaDebugNewestRealBlock(BlockPtr const& block, SizeType32 prefixTokens, char const* reason);
 
     void protectSwaReuseAnchor(BlockPtr const& block, SizeType32 prefixTokens, char const* reason);
+
+    void protectRecentSwaReuseAnchor(BlockPtr const& block, SizeType32 prefixTokens, char const* reason);
+
+    void forgetRecentSwaReuseAnchor(KVCacheBlock::IdType blockId);
 
     void noteSwaDebugEvictedBlock(BlockPtr const& block, char const* reason);
 

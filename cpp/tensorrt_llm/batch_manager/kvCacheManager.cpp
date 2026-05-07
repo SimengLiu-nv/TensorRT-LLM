@@ -83,6 +83,27 @@ bool isSwaReuseAnchorProtectionEnabled() noexcept
     return isTruthyEnvVar("TLLM_VSWA_PROTECT_REUSE_ANCHORS") || isTruthyEnvVar("TRTLLM_VSWA_PROTECT_REUSE_ANCHORS");
 }
 
+bool isSwaRecentReuseAnchorProtectionEnabled() noexcept
+{
+    return isTruthyEnvVar("TLLM_VSWA_PROTECT_RECENT_REUSE_ANCHORS")
+        || isTruthyEnvVar("TRTLLM_VSWA_PROTECT_RECENT_REUSE_ANCHORS");
+}
+
+SizeType32 getSwaRecentReuseAnchorProtectionBlocks() noexcept
+{
+    auto const* value = std::getenv("TRTLLM_VSWA_RECENT_REUSE_ANCHOR_BLOCKS");
+    if (value == nullptr)
+    {
+        value = std::getenv("TLLM_VSWA_RECENT_REUSE_ANCHOR_BLOCKS");
+    }
+    if (value == nullptr || value[0] == '\0')
+    {
+        return 256;
+    }
+    auto const parsed = std::atoi(value);
+    return parsed > 0 ? parsed : 256;
+}
+
 bool isSwaFullContextReuseProbeEnabled() noexcept
 {
     return isTruthyEnvVar("TLLM_VSWA_FULL_CONTEXT_REUSE_PROBE")
@@ -1176,6 +1197,7 @@ void WindowBlockManager::updateSwaDebugNewestRealBlock(
     }
 
     mSwaDebugHistory.realBlockPrefixTokens[block->getBlockId()] = prefixTokens;
+    protectRecentSwaReuseAnchor(block, prefixTokens, reason);
 
     bool const hadValidAnchor = mSwaDebugHistory.newestRealAnchorValid;
     bool const advancesPrefix = !hadValidAnchor || prefixTokens > mSwaDebugHistory.newestRealPrefixTokens;
@@ -1200,6 +1222,12 @@ void WindowBlockManager::updateSwaDebugNewestRealBlock(
             mLogPrefix.c_str(), reason, block->getBlockId(), prefixTokens, logBool(hadValidAnchor), previousBlockId,
             previousPrefixTokens, primaryUsedBlocks, primaryFreeBlocks, getNumPrimaryBlocks());
     }
+}
+
+void WindowBlockManager::forgetRecentSwaReuseAnchor(KVCacheBlock::IdType blockId)
+{
+    mSwaDebugHistory.recentProtectedAnchors.remove(blockId);
+    mSwaDebugHistory.recentProtectedOriginalRetention.erase(blockId);
 }
 
 void WindowBlockManager::protectSwaReuseAnchor(BlockPtr const& block, SizeType32 prefixTokens, char const* reason)
@@ -1241,6 +1269,97 @@ void WindowBlockManager::protectSwaReuseAnchor(BlockPtr const& block, SizeType32
     }
 }
 
+void WindowBlockManager::protectRecentSwaReuseAnchor(BlockPtr const& block, SizeType32 prefixTokens, char const* reason)
+{
+    if (!isSwaRecentReuseAnchorProtectionEnabled() || !mIsSWA || !block || block->isPlaceholder())
+    {
+        return;
+    }
+
+    auto constexpr kProtectedPriority = executor::KvCacheRetentionConfig::kMaxRetentionPriority;
+    auto const blockId = block->getBlockId();
+    auto& originalRetention = mSwaDebugHistory.recentProtectedOriginalRetention;
+    if (originalRetention.find(blockId) == originalRetention.end())
+    {
+        originalRetention.emplace(blockId, std::make_pair(block->getPriority(), block->getDurationMs()));
+    }
+
+    auto& protectedAnchors = mSwaDebugHistory.recentProtectedAnchors;
+    protectedAnchors.remove(blockId);
+    protectedAnchors.push_back(blockId);
+
+    auto const wasFree = !block->hasRefs();
+    if (wasFree)
+    {
+        mEvictionPolicy->claimBlock(block, kProtectedPriority, std::nullopt);
+        mEvictionPolicy->releaseBlock(block);
+    }
+    else
+    {
+        block->setPriority(kProtectedPriority);
+        block->setDurationMs(std::nullopt);
+        block->setExpirationTime(std::nullopt);
+    }
+
+    auto const maxProtectedAnchors = getSwaRecentReuseAnchorProtectionBlocks();
+    while (static_cast<SizeType32>(protectedAnchors.size()) > maxProtectedAnchors)
+    {
+        auto const oldBlockId = protectedAnchors.front();
+        protectedAnchors.pop_front();
+        auto originalIt = originalRetention.find(oldBlockId);
+        if (originalIt == originalRetention.end())
+        {
+            continue;
+        }
+
+        auto oldBlock = getBlockById(oldBlockId);
+        auto const oldPriority = originalIt->second.first;
+        auto const oldDurationMs = originalIt->second.second;
+        originalRetention.erase(originalIt);
+        if (!oldBlock || oldBlock->isPlaceholder())
+        {
+            continue;
+        }
+
+        bool const oldWasFree = !oldBlock->hasRefs();
+        if (oldWasFree)
+        {
+            mEvictionPolicy->claimBlock(oldBlock, oldPriority, oldDurationMs);
+            mEvictionPolicy->releaseBlock(oldBlock);
+        }
+        else
+        {
+            oldBlock->setPriority(oldPriority);
+            oldBlock->setDurationMs(oldDurationMs);
+            oldBlock->setExpirationTime(std::nullopt);
+        }
+
+        if (isKvCacheReuseDebugLoggingEnabled())
+        {
+            auto const primaryFreeBlocks = getNumFreeBlocks();
+            auto const primaryUsedBlocks = getNumPrimaryBlocks() - primaryFreeBlocks;
+            TLLM_LOG_INFO(
+                "[kv-reuse-debug] %s::swa-unprotect-recent-anchor reason=%s blockId=%d restoredPriority=%d "
+                "protectedAnchors=%zu maxProtectedAnchors=%d primaryUsedBlocks=%d primaryFreeBlocks=%d "
+                "primaryMaxBlocks=%d",
+                mLogPrefix.c_str(), reason, oldBlockId, oldPriority, protectedAnchors.size(), maxProtectedAnchors,
+                primaryUsedBlocks, primaryFreeBlocks, getNumPrimaryBlocks());
+        }
+    }
+
+    if (isKvCacheReuseDebugLoggingEnabled())
+    {
+        auto const primaryFreeBlocks = getNumFreeBlocks();
+        auto const primaryUsedBlocks = getNumPrimaryBlocks() - primaryFreeBlocks;
+        TLLM_LOG_INFO(
+            "[kv-reuse-debug] %s::swa-protect-recent-anchor reason=%s blockId=%d prefixTokens=%d wasFree=%s "
+            "protectedPriority=%d protectedAnchors=%zu maxProtectedAnchors=%d primaryUsedBlocks=%d "
+            "primaryFreeBlocks=%d primaryMaxBlocks=%d",
+            mLogPrefix.c_str(), reason, blockId, prefixTokens, logBool(wasFree), kProtectedPriority,
+            protectedAnchors.size(), maxProtectedAnchors, primaryUsedBlocks, primaryFreeBlocks, getNumPrimaryBlocks());
+    }
+}
+
 void WindowBlockManager::noteSwaDebugEvictedBlock(BlockPtr const& block, char const* reason)
 {
     if (!mIsSWA || !block || block->isPlaceholder() || block->getUniqueTokens().empty())
@@ -1259,6 +1378,7 @@ void WindowBlockManager::noteSwaDebugEvictedBlock(BlockPtr const& block, char co
     {
         mSwaDebugHistory.realBlockPrefixTokens.erase(prefixIt);
     }
+    forgetRecentSwaReuseAnchor(block->getBlockId());
     if (wasNewest)
     {
         ++mSwaDebugHistory.evictedNewestBlocks;
