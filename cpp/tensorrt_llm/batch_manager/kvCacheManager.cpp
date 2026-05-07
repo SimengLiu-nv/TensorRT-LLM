@@ -4967,6 +4967,21 @@ void KVCacheManager::storeNewBlock(LlmRequest const& llmRequest)
     {
         return;
     }
+
+    // A newly generated block can only become reusable after the request reaches
+    // the next full-block boundary. Reject non-boundary tokens before iterating
+    // the per-window managers.
+    auto const& uniqueTokens = llmRequest.getUniqueTokens(0);
+    if (uniqueTokens.empty())
+    {
+        return;
+    }
+    auto const usableSize = static_cast<SizeType32>(uniqueTokens.size()) - 1;
+    if (usableSize % getTokensPerBlock() != 0)
+    {
+        return;
+    }
+
     mBlockManager.storeNewBlock(sequence, llmRequest);
 }
 

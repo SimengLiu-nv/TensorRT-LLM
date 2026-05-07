@@ -741,10 +741,13 @@ class KVCacheManager(BaseResourceManager):
                         # Skip allocating KV cache at decode for inactive helix ranks.
                         continue
                 if self._swa_context_reuse:
+                    # Preserve a completed SWA block before add_token can detach
+                    # it from the active sliding-window sequence.
                     self.impl.store_new_block(req)
                 self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     if self._swa_context_reuse:
+                        # Same ordering for speculative draft tokens.
                         self.impl.store_new_block(req)
                     self.impl.add_token(req.py_request_id)
 
