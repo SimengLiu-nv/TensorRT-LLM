@@ -118,21 +118,39 @@ bool shouldLogReuseSummaryOnce(char const* scope, tensorrt_llm::batch_manager::L
 }
 
 void logKvCacheBlockQueryReturn(char const* functionName, tensorrt_llm::batch_manager::LlmRequest const& req,
-    SizeType32 windowSize, SizeType32 returnBlocks, char const* returnPath) noexcept
+    SizeType32 windowSize, SizeType32 returnBlocks, char const* returnPath, void const* manager = nullptr,
+    char const* windowSet = "") noexcept
 {
-    if (!isKvCacheReuseDebugLoggingEnabled())
+    bool const logDebug = isKvCacheReuseDebugLoggingEnabled();
+    bool const logSummary = isKvCacheReuseSummaryLoggingEnabled();
+    if (!logDebug && !logSummary)
     {
         return;
     }
 
-    TLLM_LOG_INFO(
-        "[kv-reuse-debug] %s return request=%lu window=%d returnBlocks=%d path=%s "
-        "estimatedReusableTokens=%d contextInit=%s firstContextChunk=%s disaggGenInit=%s generationInProgress=%s "
-        "contextFinished=%s promptLen=%d maxNewTokens=%d contextCurrentPosition=%d",
-        functionName, req.mRequestId, windowSize, returnBlocks, returnPath, req.getEstimatedReusableTokens(),
-        logBool(req.isContextInitState()), logBool(req.isFirstContextChunk()),
-        logBool(req.isDisaggGenerationInitState()), logBool(req.isGenerationInProgressState()),
-        logBool(req.isContextFinished()), req.mPromptLen, req.mMaxNewTokens, req.getContextCurrentPosition());
+    if (logDebug)
+    {
+        TLLM_LOG_INFO(
+            "[kv-reuse-debug] %s return request=%lu window=%d returnBlocks=%d path=%s "
+            "estimatedReusableTokens=%d contextInit=%s firstContextChunk=%s disaggGenInit=%s generationInProgress=%s "
+            "contextFinished=%s promptLen=%d maxNewTokens=%d contextCurrentPosition=%d",
+            functionName, req.mRequestId, windowSize, returnBlocks, returnPath, req.getEstimatedReusableTokens(),
+            logBool(req.isContextInitState()), logBool(req.isFirstContextChunk()),
+            logBool(req.isDisaggGenerationInitState()), logBool(req.isGenerationInProgressState()),
+            logBool(req.isContextFinished()), req.mPromptLen, req.mMaxNewTokens, req.getContextCurrentPosition());
+    }
+
+    if (logSummary)
+    {
+        TLLM_LOG_INFO(
+            "[kv-reuse-summary] %s return manager=%p windowSet=%s request=%lu window=%d returnBlocks=%d path=%s "
+            "estimatedReusableTokens=%d contextInit=%s firstContextChunk=%s disaggGenInit=%s generationInProgress=%s "
+            "contextFinished=%s promptLen=%d maxNewTokens=%d contextCurrentPosition=%d",
+            functionName, manager, windowSet, req.mRequestId, windowSize, returnBlocks, returnPath,
+            req.getEstimatedReusableTokens(), logBool(req.isContextInitState()), logBool(req.isFirstContextChunk()),
+            logBool(req.isDisaggGenerationInitState()), logBool(req.isGenerationInProgressState()),
+            logBool(req.isContextFinished()), req.mPromptLen, req.mMaxNewTokens, req.getContextCurrentPosition());
+    }
 }
 
 struct ClaimBlockCounts
@@ -3867,6 +3885,14 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
     // Default to zero; overwritten below when block reuse is active for a first-chunk context request.
     req.setEstimatedReusableTokens(0);
     bool const logKvReuseDebug = isKvCacheReuseDebugLoggingEnabled();
+    bool const logKvReuseSummary = isKvCacheReuseSummaryLoggingEnabled();
+    auto const returnLogWindowSet
+        = logKvReuseSummary ? formatWindowMetadataForLog(mBlockManager.getWindowSizesMetadata()) : std::string{};
+    auto const logReturn = [&](SizeType32 returnBlocks, char const* returnPath)
+    {
+        logKvCacheBlockQueryReturn("KVCacheManager::getNeededBlocksOneStep", req, windowSize, returnBlocks, returnPath,
+            static_cast<void const*>(this), returnLogWindowSet.c_str());
+    };
 
     if ((req.isContextInitState() && req.isFirstContextChunk()) || req.isDisaggGenerationInitState())
     {
@@ -3991,8 +4017,7 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
                 getTokensPerBlock(), mSinkBubbleLength, promptCacheLen, numSharedBlocks, numUnSharedTokens,
                 numUnSharedBlocks, numRequiredBlocks);
         }
-        logKvCacheBlockQueryReturn(
-            "KVCacheManager::getNeededBlocksOneStep", req, windowSize, numRequiredBlocks, "context-init");
+        logReturn(numRequiredBlocks, "context-init");
         return numRequiredBlocks;
     }
 
@@ -4001,8 +4026,7 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
         if (isCrossKv())
         {
             constexpr SizeType32 kReturnBlocks = 0;
-            logKvCacheBlockQueryReturn(
-                "KVCacheManager::getNeededBlocksOneStep", req, windowSize, kReturnBlocks, "generation-cross-kv");
+            logReturn(kReturnBlocks, "generation-cross-kv");
             return kReturnBlocks;
         }
 
@@ -4016,21 +4040,19 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
         if (numNextTokens > mBlockManager.getWindowSizeMetadata(windowSize).maxTokenNum)
         {
             constexpr SizeType32 kReturnBlocks = 0;
-            logKvCacheBlockQueryReturn(
-                "KVCacheManager::getNeededBlocksOneStep", req, windowSize, kReturnBlocks, "generation-window-limit");
+            logReturn(kReturnBlocks, "generation-window-limit");
             return kReturnBlocks;
         }
 
         auto const numCurrBlocks = tc::ceilDiv(numCurrTokens, getTokensPerBlock());
         auto const numNextBlocks = tc::ceilDiv(numNextTokens, getTokensPerBlock());
         auto const numRequiredBlocks = (numNextBlocks - numCurrBlocks) * req.mSamplingConfig.beamWidth;
-        logKvCacheBlockQueryReturn(
-            "KVCacheManager::getNeededBlocksOneStep", req, windowSize, numRequiredBlocks, "generation");
+        logReturn(numRequiredBlocks, "generation");
         return numRequiredBlocks;
     }
 
     constexpr SizeType32 kReturnBlocks = 0;
-    logKvCacheBlockQueryReturn("KVCacheManager::getNeededBlocksOneStep", req, windowSize, kReturnBlocks, "default");
+    logReturn(kReturnBlocks, "default");
     return kReturnBlocks;
 }
 
@@ -4039,20 +4061,26 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
 {
     // Default to zero; overwritten below when block reuse is active for a first-chunk context request.
     req.setEstimatedReusableTokens(0);
+    bool const logKvReuseSummary = isKvCacheReuseSummaryLoggingEnabled();
+    auto const returnLogWindowSet
+        = logKvReuseSummary ? formatWindowMetadataForLog(mBlockManager.getWindowSizesMetadata()) : std::string{};
+    auto const logReturn = [&](SizeType32 returnBlocks, char const* returnPath)
+    {
+        logKvCacheBlockQueryReturn("KVCacheManager::getRemainingBlocksToCompletion", req, windowSize, returnBlocks,
+            returnPath, static_cast<void const*>(this), returnLogWindowSet.c_str());
+    };
 
     if (isCrossKv())
     {
         if (req.isContextInitState() && req.getContextCurrentPosition() == 0)
         {
             auto const remainingBlocks = tc::ceilDiv(req.getEncoderOutputLen(), getTokensPerBlock());
-            logKvCacheBlockQueryReturn("KVCacheManager::getRemainingBlocksToCompletion", req, windowSize,
-                remainingBlocks, "cross-kv-initial-context");
+            logReturn(remainingBlocks, "cross-kv-initial-context");
             return remainingBlocks;
         }
 
         constexpr SizeType32 kReturnBlocks = 0;
-        logKvCacheBlockQueryReturn("KVCacheManager::getRemainingBlocksToCompletion", req, windowSize, kReturnBlocks,
-            "cross-kv-after-initial-context");
+        logReturn(kReturnBlocks, "cross-kv-after-initial-context");
         return kReturnBlocks; // cross KV cache doesn't grow after the initial context phase
     }
 
@@ -4061,8 +4089,7 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
         if (req.isGenerationInProgressState())
         {
             constexpr SizeType32 kReturnBlocks = 0;
-            logKvCacheBlockQueryReturn("KVCacheManager::getRemainingBlocksToCompletion", req, windowSize, kReturnBlocks,
-                "recurrent-generation");
+            logReturn(kReturnBlocks, "recurrent-generation");
             return kReturnBlocks; // no need to allocate blocks for recurrent states during generation
         }
         else if (!req.isContextFinished())
@@ -4072,8 +4099,7 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
             if (seqIt != mSequences.end())
             {
                 constexpr SizeType32 kReturnBlocks = 0;
-                logKvCacheBlockQueryReturn("KVCacheManager::getRemainingBlocksToCompletion", req, windowSize,
-                    kReturnBlocks, "recurrent-existing-sequence");
+                logReturn(kReturnBlocks, "recurrent-existing-sequence");
                 return kReturnBlocks;
             }
             if (mEnableBlockReuse)
@@ -4081,13 +4107,11 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
                 auto const remainingBlocks
                     = req.getPromptLen() / mBlockManager.getLinearAttentionMetadata()->statesSnapshotInterval + 1
                     + (mBlockManager.getLinearAttentionMetadata()->saveLastSnapshot ? 1 : 0);
-                logKvCacheBlockQueryReturn("KVCacheManager::getRemainingBlocksToCompletion", req, windowSize,
-                    remainingBlocks, "recurrent-context-reuse");
+                logReturn(remainingBlocks, "recurrent-context-reuse");
                 return remainingBlocks;
             }
             constexpr SizeType32 kReturnBlocks = 1;
-            logKvCacheBlockQueryReturn("KVCacheManager::getRemainingBlocksToCompletion", req, windowSize, kReturnBlocks,
-                "recurrent-context-no-reuse");
+            logReturn(kReturnBlocks, "recurrent-context-no-reuse");
             return kReturnBlocks;
         }
     }
@@ -4293,8 +4317,7 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
             logBool(summaryStoppedByMaxMatchedTokens));
     }
 
-    logKvCacheBlockQueryReturn(
-        "KVCacheManager::getRemainingBlocksToCompletion", req, windowSize, remainingBlocks, "normal");
+    logReturn(remainingBlocks, "normal");
     return remainingBlocks;
 }
 
