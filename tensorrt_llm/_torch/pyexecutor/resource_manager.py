@@ -742,15 +742,22 @@ class KVCacheManager(BaseResourceManager):
                         continue
                 if self._swa_context_reuse:
                     # Preserve a completed SWA block before add_token can detach
-                    # it from the active sliding-window sequence while keeping
-                    # one Python/C++ manager call per generated token.
-                    self.impl.store_new_block_and_add_token(req)
+                    # it from the active sliding-window sequence. Most generated
+                    # tokens are not block boundaries, so keep those on the plain
+                    # add_token path.
+                    if self._should_store_new_block_before_add(req):
+                        self.impl.store_new_block_and_add_token(req)
+                    else:
+                        self.impl.add_token(req.py_request_id)
                 else:
                     self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     if self._swa_context_reuse:
                         # Same ordering for speculative draft tokens.
-                        self.impl.store_new_block_and_add_token(req)
+                        if self._should_store_new_block_before_add(req):
+                            self.impl.store_new_block_and_add_token(req)
+                        else:
+                            self.impl.add_token(req.py_request_id)
                     else:
                         self.impl.add_token(req.py_request_id)
 
@@ -764,6 +771,12 @@ class KVCacheManager(BaseResourceManager):
     def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
         return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
             request)
+
+    def _should_store_new_block_before_add(self, request: LlmRequest) -> bool:
+        num_tokens = request.get_num_tokens(0)
+        if num_tokens <= 0:
+            return False
+        return (num_tokens - 1) % self.tokens_per_block == 0
 
     def add_dummy_requests(
         self,

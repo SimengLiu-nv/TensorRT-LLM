@@ -758,6 +758,7 @@ class TestResourceManager(unittest.TestCase):
             py_num_accepted_draft_tokens=0,
             py_num_accepted_draft_tokens_indices=[],
             py_draft_tokens=None,
+            get_num_tokens=lambda beam: 33,
         )
         scheduled_batch = ScheduledBatchStub(request)
 
@@ -767,12 +768,24 @@ class TestResourceManager(unittest.TestCase):
         kv_cache_manager.impl = RecordingKvCacheImpl()
         kv_cache_manager.kv_connector_manager = None
         kv_cache_manager._swa_context_reuse = True
+        kv_cache_manager.tokens_per_block = 32
 
         kv_cache_manager.prepare_resources(scheduled_batch)
 
         self.assertEqual(kv_cache_manager.impl.calls, [
             ("sync_transfer_manager_with_buffer_manager", None, None),
             ("store_new_block_and_add_token", 7, True),
+            ("refresh_blocks", None, None),
+        ])
+
+        request.get_num_tokens = lambda beam: 34
+        kv_cache_manager.impl = RecordingKvCacheImpl()
+
+        kv_cache_manager.prepare_resources(scheduled_batch)
+
+        self.assertEqual(kv_cache_manager.impl.calls, [
+            ("sync_transfer_manager_with_buffer_manager", None, None),
+            ("add_token", 7, True),
             ("refresh_blocks", None, None),
         ])
 
