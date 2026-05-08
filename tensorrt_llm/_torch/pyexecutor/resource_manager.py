@@ -776,7 +776,7 @@ class KVCacheManager(BaseResourceManager):
         num_tokens = request.get_num_tokens(0)
         if num_tokens <= 0:
             return False
-        return (num_tokens - 1) % self.tokens_per_block == 0
+        return num_tokens % self.tokens_per_block == 0
 
     def add_dummy_requests(
         self,

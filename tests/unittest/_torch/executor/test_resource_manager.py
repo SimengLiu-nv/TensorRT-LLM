@@ -758,7 +758,7 @@ class TestResourceManager(unittest.TestCase):
             py_num_accepted_draft_tokens=0,
             py_num_accepted_draft_tokens_indices=[],
             py_draft_tokens=None,
-            get_num_tokens=lambda beam: 33,
+            get_num_tokens=lambda beam: 32,
         )
         scheduled_batch = ScheduledBatchStub(request)
 
@@ -778,7 +778,7 @@ class TestResourceManager(unittest.TestCase):
             ("refresh_blocks", None, None),
         ])
 
-        request.get_num_tokens = lambda beam: 34
+        request.get_num_tokens = lambda beam: 33
         kv_cache_manager.impl = RecordingKvCacheImpl()
 
         kv_cache_manager.prepare_resources(scheduled_batch)
