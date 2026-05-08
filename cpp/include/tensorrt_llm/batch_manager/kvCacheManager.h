@@ -1986,6 +1986,18 @@ public:
         addToken(llmRequest.mRequestId, detachSwaFrontBlocks);
     }
 
+    //! \brief Store newly reusable blocks and add one generation token for each request.
+    //! \details Keeps the same per-request store-before-detach ordering as storeNewBlockAndAddToken, while allowing
+    //!          Python callers to cross into C++ once for a batch of generation updates.
+    virtual void storeNewBlocksAndAddTokens(
+        std::vector<std::reference_wrapper<LlmRequest const>> const& llmRequests, bool detachSwaFrontBlocks = true)
+    {
+        for (auto const& llmRequest : llmRequests)
+        {
+            storeNewBlockAndAddToken(llmRequest.get(), detachSwaFrontBlocks);
+        }
+    }
+
     /// @brief Get the number of tokens for a request at KVCacheManager's sight. Sometimes it is different from
     /// LlmRequest::getNumTokens.
     [[nodiscard]] virtual SizeType32 getTokenCount(LlmRequest::RequestIdType requestId) const = 0;

@@ -728,6 +728,7 @@ class KVCacheManager(BaseResourceManager):
             # `add_sequence_batch` due to KV cache reuse, so we rebuild the context request lists here.
             scheduled_batch.reset_context_requests()
 
+            swa_generation_requests: list[LlmRequest] = []
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
                     # Distribute the decode blocks across CP ranks in a round-robin manner.
@@ -741,18 +742,22 @@ class KVCacheManager(BaseResourceManager):
                         # Skip allocating KV cache at decode for inactive helix ranks.
                         continue
                 if self._swa_context_reuse:
-                    # Preserve a completed SWA block before add_token can detach
-                    # it from the active sliding-window sequence while keeping
-                    # one Python/C++ manager call per generated token.
-                    self.impl.store_new_block_and_add_token(req)
+                    # Preserve completed SWA blocks before add_token can detach
+                    # them from the active sliding-window sequence. The C++
+                    # batch method keeps the same per-request ordering while
+                    # avoiding one Python/C++ transition per generated token.
+                    swa_generation_requests.append(req)
                 else:
                     self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     if self._swa_context_reuse:
                         # Same ordering for speculative draft tokens.
-                        self.impl.store_new_block_and_add_token(req)
+                        swa_generation_requests.append(req)
                     else:
                         self.impl.add_token(req.py_request_id)
+            if swa_generation_requests:
+                self.impl.store_new_blocks_and_add_tokens(
+                    swa_generation_requests)
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
             self.impl.refresh_blocks()

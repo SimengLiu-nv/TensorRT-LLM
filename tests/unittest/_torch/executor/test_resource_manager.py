@@ -735,6 +735,15 @@ class TestResourceManager(unittest.TestCase):
                                    request.py_request_id,
                                    detach_swa_front_blocks))
 
+            def store_new_blocks_and_add_tokens(
+                    self,
+                    requests: list[LlmRequest],
+                    detach_swa_front_blocks: bool = True) -> None:
+                self.calls.append(("store_new_blocks_and_add_tokens",
+                                   tuple(request.py_request_id
+                                         for request in requests),
+                                   detach_swa_front_blocks))
+
             def sync_transfer_manager_with_buffer_manager(self) -> None:
                 self.calls.append(("sync_transfer_manager_with_buffer_manager",
                                    None, None))
@@ -772,7 +781,7 @@ class TestResourceManager(unittest.TestCase):
 
         self.assertEqual(kv_cache_manager.impl.calls, [
             ("sync_transfer_manager_with_buffer_manager", None, None),
-            ("store_new_block_and_add_token", 7, True),
+            ("store_new_blocks_and_add_tokens", (7, ), True),
             ("refresh_blocks", None, None),
         ])
 

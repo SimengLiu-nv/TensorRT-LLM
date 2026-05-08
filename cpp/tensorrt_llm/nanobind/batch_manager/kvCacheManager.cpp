@@ -436,6 +436,23 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("detach_swa_front_blocks") = true, nb::call_guard<nb::gil_scoped_release>())
         .def("store_new_block_and_add_token", &BaseKVCacheManager::storeNewBlockAndAddToken, nb::arg("llm_request"),
             nb::arg("detach_swa_front_blocks") = true, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "store_new_blocks_and_add_tokens",
+            [](tbk::BaseKVCacheManager& self, nb::list llmRequestsList, bool detachSwaFrontBlocks)
+            {
+                // Marshal Python request objects while the GIL is held, then run the per-request
+                // store/add sequence in C++ with the GIL released.
+                std::vector<std::reference_wrapper<tb::LlmRequest const>> llmRequests;
+                llmRequests.reserve(nb::len(llmRequestsList));
+                for (size_t i = 0; i < nb::len(llmRequestsList); ++i)
+                {
+                    llmRequests.push_back(std::cref(nb::cast<tb::LlmRequest const&>(llmRequestsList[i])));
+                }
+
+                nb::gil_scoped_release release;
+                self.storeNewBlocksAndAddTokens(llmRequests, detachSwaFrontBlocks);
+            },
+            nb::arg("llm_requests"), nb::arg("detach_swa_front_blocks") = true)
         .def("get_token_count", &BaseKVCacheManager::getTokenCount, nb::arg("request_id"))
         .def(
             "add_sequence_batch",
