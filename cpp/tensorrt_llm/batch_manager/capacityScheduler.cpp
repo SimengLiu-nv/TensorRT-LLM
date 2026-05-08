@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 
+#include <map>
 #include <tuple>
 
 namespace tensorrt_llm::batch_manager
@@ -37,6 +38,7 @@ struct PrefixReuseSchedulingSummaries
 {
     std::optional<kv_cache_manager::PrefixReuseSummary> skipSummary;
     std::optional<kv_cache_manager::PrefixReuseSummary> blockBudgetSummary;
+    kv_cache_manager::PrefixReuseSummaryByWindow blockBudgetSummariesByWindow;
 };
 
 bool shouldPreferSchedulingSummary(kv_cache_manager::PrefixReuseSummary const& candidateSummary, bool candidateIsSwa,
@@ -78,6 +80,7 @@ PrefixReuseSchedulingSummaries analyzePrefixReuseForScheduling(
         }
 
         auto summary = blockManager.analyzePrefixReuse(uniqueTokens, req, windowSize);
+        result.blockBudgetSummariesByWindow.emplace(windowSize, summary);
         if (!result.skipSummary.has_value()
             || shouldPreferSchedulingSummary(summary, metadata.isSWA, *result.skipSummary, *selectedSummaryIsSwa))
         {
@@ -372,12 +375,13 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                 {
                     // Check block availability using the cached summary when available.
                     // enoughAvailableBlocks is check-only (no decrement) — safe if cross check fails.
-                    bool enoughBlocks = reservedBlocks.enoughAvailableBlocks(*req, summaries.blockBudgetSummary);
+                    bool enoughBlocks = reservedBlocks.enoughAvailableBlocks(
+                        *req, summaries.blockBudgetSummary, summaries.blockBudgetSummariesByWindow);
                     bool enoughCrossBlocks = true;
                     if (reservedCrossBlocks)
                     {
-                        enoughCrossBlocks
-                            = reservedCrossBlocks->enoughAvailableBlocks(*req, crossSummaries.blockBudgetSummary);
+                        enoughCrossBlocks = reservedCrossBlocks->enoughAvailableBlocks(
+                            *req, crossSummaries.blockBudgetSummary, crossSummaries.blockBudgetSummariesByWindow);
                     }
                     bool reqHasLora = req->getLoraTaskId().has_value();
                     bool isNewTask = reqHasLora && !uniqTaskIds.count(req->getLoraTaskId().value());
@@ -416,7 +420,8 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
     RequestVector& scheduledRequests, kv_cache_manager::MaxUtilizationScheduledBlocksManager& blocksManager,
     OptionalRef<BasePeftCacheManager const> peftCacheManager, SizeType32& numScheduledPeftPages,
     std::unordered_set<uint64_t>& seenTaskIds,
-    std::optional<kv_cache_manager::PrefixReuseSummary> const& cachedSummary);
+    std::optional<kv_cache_manager::PrefixReuseSummary> const& cachedSummary,
+    kv_cache_manager::PrefixReuseSummaryByWindow const& cachedSummariesByWindow);
 
 std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
     kv_cache_manager::BaseKVCacheManager& kvCacheManager, OptionalRef<BasePeftCacheManager const> peftCacheManager,
@@ -485,7 +490,8 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
         }
 
         bool const wasScheduled = trySchedulingRequestMaxUtilization(req, mMaxNumRequests, scheduledRequests,
-            scheduledBlocksManager, peftCacheManager, numScheduledPeftPages, seenTaskIds, summaries.blockBudgetSummary);
+            scheduledBlocksManager, peftCacheManager, numScheduledPeftPages, seenTaskIds, summaries.blockBudgetSummary,
+            summaries.blockBudgetSummariesByWindow);
         if (wasScheduled)
         {
             TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu -> start", req->mRequestId);
@@ -519,7 +525,8 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
 bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, SizeType32 maxNumRequests,
     RequestVector& scheduledRequests, kv_cache_manager::MaxUtilizationScheduledBlocksManager& blocksManager,
     OptionalRef<BasePeftCacheManager const> peftCacheManager, SizeType32& numScheduledPeftPages,
-    std::unordered_set<uint64_t>& seenTaskIds, std::optional<kv_cache_manager::PrefixReuseSummary> const& cachedSummary)
+    std::unordered_set<uint64_t>& seenTaskIds, std::optional<kv_cache_manager::PrefixReuseSummary> const& cachedSummary,
+    kv_cache_manager::PrefixReuseSummaryByWindow const& cachedSummariesByWindow)
 {
     if (scheduledRequests.size() < static_cast<std::size_t>(maxNumRequests))
     {
@@ -530,8 +537,8 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
         TLLM_LOG_DEBUG(
             "MaxUtilizationScheduler: request ID %lu required peft pages: %i", req->mRequestId, numRequiredPeftPages);
         // Use the cached summary when available to avoid a redundant tree walk
-        auto const scheduledBlocksIfFitsKvCache
-            = blocksManager.prepareNewNumberOfBlocksIfWeEndUpScheduling(*req, cachedSummary);
+        auto const scheduledBlocksIfFitsKvCache = blocksManager.prepareNewNumberOfBlocksIfWeEndUpScheduling(
+            *req, cachedSummary, cachedSummariesByWindow);
         bool fitsPeft
             = (peftCacheManager ? numRequiredPeftPages + numScheduledPeftPages <= peftCacheManager->getMaxDevicePages()
                                 : true);

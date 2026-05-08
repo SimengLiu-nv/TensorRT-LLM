@@ -27,6 +27,20 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+using PrefixReuseSummaryByWindow = std::map<tensorrt_llm::runtime::SizeType32, PrefixReuseSummary>;
+
+inline std::optional<PrefixReuseSummary> getCachedPrefixReuseSummaryForWindow(
+    tensorrt_llm::runtime::SizeType32 windowSize, std::optional<PrefixReuseSummary> const& cachedSummary,
+    PrefixReuseSummaryByWindow const& cachedSummariesByWindow)
+{
+    auto const iter = cachedSummariesByWindow.find(windowSize);
+    if (iter != cachedSummariesByWindow.end())
+    {
+        return iter->second;
+    }
+    return cachedSummary;
+}
+
 class NoEvictScheduledBlocksManager
 {
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -40,15 +54,18 @@ public:
 
     /// @brief  Check whether enough blocks are available for the request.
     /// Caches the per-window block counts for a subsequent commitBlocks() call.
-    bool enoughAvailableBlocks(
-        LlmRequest const& req, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt)
+    bool enoughAvailableBlocks(LlmRequest const& req,
+        std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt,
+        PrefixReuseSummaryByWindow const& cachedSummariesByWindow = {})
     {
         mCachedNeededBlocks.clear();
         std::optional<SizeType32> minEstimatedReusableTokens;
         bool enough = true;
         for (auto const& [windowSize, availableBlocks] : mAvailableBlocks)
         {
-            auto const needed = mKvCacheManager.getRemainingBlocksToCompletion(req, windowSize, cachedSummary);
+            auto const cachedWindowSummary
+                = getCachedPrefixReuseSummaryForWindow(windowSize, cachedSummary, cachedSummariesByWindow);
+            auto const needed = mKvCacheManager.getRemainingBlocksToCompletion(req, windowSize, cachedWindowSummary);
             if (windowSize != LinearAttentionMetadata::kRecurrentStates)
             {
                 auto const windowEstimatedReusableTokens = req.getEstimatedReusableTokens();
@@ -103,14 +120,17 @@ public:
     }
 
     std::optional<std::map<SizeType32, SizeType32>> prepareNewNumberOfBlocksIfWeEndUpScheduling(
-        LlmRequest const& req, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt)
+        LlmRequest const& req, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt,
+        PrefixReuseSummaryByWindow const& cachedSummariesByWindow = {})
     {
         std::map<SizeType32, SizeType32> blocksIfScheduled;
         std::optional<SizeType32> minEstimatedReusableTokens;
         for (auto const& [windowSize, numScheduled] : mNumScheduledBlocks)
         {
+            auto const cachedWindowSummary
+                = getCachedPrefixReuseSummaryForWindow(windowSize, cachedSummary, cachedSummariesByWindow);
             auto const required
-                = mKvCacheManager.getNeededBlocksOneStep(req, mTwoStepsLookAhead, windowSize, cachedSummary);
+                = mKvCacheManager.getNeededBlocksOneStep(req, mTwoStepsLookAhead, windowSize, cachedWindowSummary);
             if (windowSize != LinearAttentionMetadata::kRecurrentStates)
             {
                 auto const windowEstimatedReusableTokens = req.getEstimatedReusableTokens();
