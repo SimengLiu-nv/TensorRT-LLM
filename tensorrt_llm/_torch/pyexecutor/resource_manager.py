@@ -544,6 +544,7 @@ class KVCacheManager(BaseResourceManager):
         )
         logger.info(f"[KVCacheManager] execution_stream: {self._stream}")
         swa_context_reuse = kv_cache_config.optimization_target == "context_reuse"
+        self._swa_context_reuse = swa_context_reuse
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
