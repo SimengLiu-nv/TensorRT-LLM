@@ -742,14 +742,17 @@ class KVCacheManager(BaseResourceManager):
                         continue
                 if self._swa_context_reuse:
                     # Preserve a completed SWA block before add_token can detach
-                    # it from the active sliding-window sequence.
-                    self.impl.store_new_block(req)
-                self.impl.add_token(req.py_request_id)
+                    # it from the active sliding-window sequence while keeping
+                    # one Python/C++ manager call per generated token.
+                    self.impl.store_new_block_and_add_token(req)
+                else:
+                    self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     if self._swa_context_reuse:
                         # Same ordering for speculative draft tokens.
-                        self.impl.store_new_block(req)
-                    self.impl.add_token(req.py_request_id)
+                        self.impl.store_new_block_and_add_token(req)
+                    else:
+                        self.impl.add_token(req.py_request_id)
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
             self.impl.refresh_blocks()

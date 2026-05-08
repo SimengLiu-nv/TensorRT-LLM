@@ -4564,6 +4564,31 @@ void KVCacheManager::addToken(RequestIdType requestId, bool detachSwaFrontBlocks
     mBlockManager.adjustBlocksIfNeeded(sequence, detachSwaFrontBlocks);
 }
 
+void KVCacheManager::storeNewBlockAndAddToken(LlmRequest const& llmRequest, bool detachSwaFrontBlocks)
+{
+    // TODO: add streamLLM support
+    auto const requestId = llmRequest.mRequestId;
+    auto& sequence = getSequence(requestId);
+    if (sequence.getBeamWidth() <= 1 && mEnableBlockReuse)
+    {
+        // A newly generated block can only become reusable after the request reaches
+        // the next full-block boundary. Reject non-boundary tokens before iterating
+        // the per-window managers.
+        auto const& uniqueTokens = llmRequest.getUniqueTokens(0);
+        if (!uniqueTokens.empty())
+        {
+            auto const usableSize = static_cast<SizeType32>(uniqueTokens.size()) - 1;
+            if (usableSize % getTokensPerBlock() == 0)
+            {
+                mBlockManager.storeNewBlock(sequence, llmRequest);
+            }
+        }
+    }
+
+    sequence.addNewTokens(1);
+    mBlockManager.adjustBlocksIfNeeded(sequence, detachSwaFrontBlocks);
+}
+
 void KVCacheManager::copyLinearAttentionBlock(LlmRequest const& llmRequest)
 {
     auto& sequence = getSequence(llmRequest.mRequestId);

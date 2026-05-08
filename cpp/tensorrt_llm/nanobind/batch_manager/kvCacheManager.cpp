@@ -434,6 +434,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("window_size"), nb::arg("cached_summary") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("add_token", &BaseKVCacheManager::addToken, nb::arg("request_id"),
             nb::arg("detach_swa_front_blocks") = true, nb::call_guard<nb::gil_scoped_release>())
+        .def("store_new_block_and_add_token", &BaseKVCacheManager::storeNewBlockAndAddToken, nb::arg("llm_request"),
+            nb::arg("detach_swa_front_blocks") = true, nb::call_guard<nb::gil_scoped_release>())
         .def("get_token_count", &BaseKVCacheManager::getTokenCount, nb::arg("request_id"))
         .def(
             "add_sequence_batch",
