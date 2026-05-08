@@ -4562,12 +4562,6 @@ void KVCacheManager::addToken(RequestIdType requestId, bool detachSwaFrontBlocks
     auto& sequence = getSequence(requestId);
     sequence.addNewTokens(1);
     auto const effectiveDetachSwaFrontBlocks = detachSwaFrontBlocks && !isSwaContextReuseEnabled();
-    auto const isBlockBoundary = (sequence.getNumTokens() - 1) % getTokensPerBlock() == 0;
-    if (!effectiveDetachSwaFrontBlocks && !isBlockBoundary)
-    {
-        return;
-    }
-
     mBlockManager.adjustBlocksIfNeeded(sequence, effectiveDetachSwaFrontBlocks);
 }
 
