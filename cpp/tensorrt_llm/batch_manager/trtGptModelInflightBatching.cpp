@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -692,7 +692,10 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
         kvCacheConfig.getEventBufferMaxSize() > 0
             ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.getEventBufferMaxSize())
             : nullptr,
-        kvCacheConfig.getEnablePartialReuse(), kvCacheConfig.getCopyOnPartialReuse());
+        kvCacheConfig.getEnablePartialReuse(), kvCacheConfig.getCopyOnPartialReuse(), nullptr, false, 128, 0,
+        std::nullopt,
+        kvCacheConfig.getOptimizationTarget()
+            == tensorrt_llm::executor::KvCacheConfig::kContextReuseOptimizationTarget);
 
     reshapeKvTensors(kvCacheManager->getOffsetTableDimensions());
 

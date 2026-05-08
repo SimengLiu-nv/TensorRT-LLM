@@ -30,6 +30,8 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestSta
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     ChunkingPolicy,
     ContextChunkingConfig,
+    MaxUtilizationScheduledBlocksManager,
+    NoEvictScheduledBlocksManager,
     PyCapacityScheduler,
     PyMicroBatchScheduler,
     SimpleUnifiedScheduler,
@@ -145,6 +147,7 @@ class MockKVCacheManager:
         blocks_per_request: int = 5,
         is_variable_window: bool = False,
         enable_block_reuse: bool = False,
+        estimated_reusable_tokens_by_window: Optional[dict[int, int]] = None,
     ):
         self._window_sizes = window_sizes or [128]
         self._num_free_blocks = num_free_blocks
@@ -152,6 +155,7 @@ class MockKVCacheManager:
         self.is_variable_window = is_variable_window
         self.enable_block_reuse = enable_block_reuse
         self.max_attention_window_vec = self._window_sizes
+        self._estimated_reusable_tokens_by_window = estimated_reusable_tokens_by_window or {}
         self._scheduling_started = False
 
     def get_kv_cache_stats(self) -> MockKVCacheStats:
@@ -159,10 +163,22 @@ class MockKVCacheManager:
             num_free_blocks_per_window_size={ws: self._num_free_blocks for ws in self._window_sizes}
         )
 
-    def get_remaining_blocks_to_completion(self, req, window_size: int) -> int:
+    def get_remaining_blocks_to_completion(
+        self, req, window_size: int, cached_summary: Optional[MockPrefixReuseSummary] = None
+    ) -> int:
+        req.estimated_reusable_tokens = self._estimated_reusable_tokens_by_window.get(
+            window_size, 0)
         return self._blocks_per_request
 
-    def get_needed_blocks_one_step(self, req, two_step_lookahead: bool, window_size: int) -> int:
+    def get_needed_blocks_one_step(
+        self,
+        req,
+        two_step_lookahead: bool,
+        window_size: int,
+        cached_summary: Optional[MockPrefixReuseSummary] = None,
+    ) -> int:
+        req.estimated_reusable_tokens = self._estimated_reusable_tokens_by_window.get(
+            window_size, 0)
         return self._blocks_per_request
 
     def scheduling_has_free_blocks(self, total: int, window_size: int) -> bool:
@@ -2554,6 +2570,32 @@ class TestPyCapacitySchedulerKVCacheReuse:
     C++ ref: DelayDuplicate*, ReuseAware*, MaxUtilizationReuse*, NoReuse* tests
     in capacitySchedulerTest.cpp.
     """
+
+    def test_no_evict_vswa_estimated_reuse_uses_min_window_value(self):
+        kv = MockKVCacheManager(
+            window_sizes=[128, 131072],
+            estimated_reusable_tokens_by_window={128: 32, 131072: 96},
+        )
+        reserved_blocks = NoEvictScheduledBlocksManager(kv)
+        req = _make_request(0, prompt_len=128)
+
+        assert reserved_blocks.enough_available_blocks(req)
+        assert req.estimated_reusable_tokens == 32
+
+        reserved_blocks.decrement_reserved_blocks(req)
+        assert req.estimated_reusable_tokens == 32
+
+    def test_max_util_vswa_estimated_reuse_uses_min_window_value(self):
+        kv = MockKVCacheManager(
+            window_sizes=[128, 131072],
+            estimated_reusable_tokens_by_window={128: 32, 131072: 96},
+        )
+        scheduled_blocks = MaxUtilizationScheduledBlocksManager(
+            kv, two_steps_look_ahead=False)
+        req = _make_request(0, prompt_len=128)
+
+        assert scheduled_blocks.prepare_blocks_if_schedulable(req) is not None
+        assert req.estimated_reusable_tokens == 32
 
     def test_delay_duplicate_request(self):
         """C++ ref: DelayDuplicateRequest - identical requests delayed for reuse"""

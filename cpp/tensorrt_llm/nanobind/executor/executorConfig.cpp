@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -112,26 +112,29 @@ void initConfigBindings(nb::module_& m)
             self.getSinkTokenLength(), self.getFreeGpuMemoryFraction(), self.getHostCacheSize(),
             self.getCrossKvCacheFraction(), self.getSecondaryOffloadMinPriority(), self.getEventBufferMaxSize(),
             self.getEnablePartialReuse(), self.getCopyOnPartialReuse(), self.getUseUvm(),
-            self.getAttentionDpEventsGatherPeriodMs(), self.getMaxGpuTotalBytes());
+            self.getAttentionDpEventsGatherPeriodMs(), self.getMaxGpuTotalBytes(), self.getOptimizationTarget());
     };
     auto kvCacheConfigSetstate = [](tle::KvCacheConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 14)
+        if (state.size() != 14 && state.size() != 15)
         {
             throw std::runtime_error("Invalid state!");
         }
+        auto const optimizationTarget = state.size() == 15
+            ? nb::cast<std::string>(state[14])
+            : std::string{tle::KvCacheConfig::kDefaultOptimizationTarget};
         new (&self) tle::KvCacheConfig(nb::cast<bool>(state[0]), nb::cast<std::optional<SizeType32>>(state[1]),
             nb::cast<std::optional<std::vector<SizeType32>>>(state[2]), nb::cast<std::optional<SizeType32>>(state[3]),
             nb::cast<std::optional<float>>(state[4]), nb::cast<std::optional<size_t>>(state[5]),
             nb::cast<std::optional<float>>(state[6]), nb::cast<std::optional<tle::RetentionPriority>>(state[7]),
             nb::cast<size_t>(state[8]), nb::cast<bool>(state[9]), nb::cast<bool>(state[10]), nb::cast<bool>(state[11]),
-            nb::cast<SizeType32>(state[12]), std::nullopt, nb::cast<uint64_t>(state[13]));
+            nb::cast<SizeType32>(state[12]), std::nullopt, nb::cast<uint64_t>(state[13]), optimizationTarget);
     };
     nb::class_<tle::KvCacheConfig>(m, "KvCacheConfig")
         .def(nb::init<bool, std::optional<SizeType32> const&, std::optional<std::vector<SizeType32>> const&,
                  std::optional<SizeType32> const&, std::optional<float> const&, std::optional<size_t> const&,
                  std::optional<float> const&, std::optional<tle::RetentionPriority>, size_t const&, bool, bool, bool,
-                 SizeType32, std::optional<RuntimeDefaults> const&, uint64_t const&>(),
+                 SizeType32, std::optional<RuntimeDefaults> const&, uint64_t const&, std::string const&>(),
             nb::arg("enable_block_reuse") = true, nb::arg("max_tokens") = nb::none(),
             nb::arg("max_attention_window") = nb::none(), nb::arg("sink_token_length") = nb::none(),
             nb::arg("free_gpu_memory_fraction") = nb::none(), nb::arg("host_cache_size") = nb::none(),
@@ -139,7 +142,8 @@ void initConfigBindings(nb::module_& m)
             nb::arg("event_buffer_max_size") = 0, nb::kw_only(), nb::arg("enable_partial_reuse") = true,
             nb::arg("copy_on_partial_reuse") = true, nb::arg("use_uvm") = false,
             nb::arg("attention_dp_events_gather_period_ms") = 5, nb::arg("runtime_defaults") = nb::none(),
-            nb::arg("max_gpu_total_bytes") = 0)
+            nb::arg("max_gpu_total_bytes") = 0,
+            nb::arg("optimization_target") = tle::KvCacheConfig::kDefaultOptimizationTarget)
         .def_prop_rw(
             "enable_block_reuse", &tle::KvCacheConfig::getEnableBlockReuse, &tle::KvCacheConfig::setEnableBlockReuse)
         .def_prop_rw("max_tokens", &tle::KvCacheConfig::getMaxTokens, &tle::KvCacheConfig::setMaxTokens)
@@ -165,6 +169,8 @@ void initConfigBindings(nb::module_& m)
             &tle::KvCacheConfig::setAttentionDpEventsGatherPeriodMs)
         .def_prop_rw(
             "max_gpu_total_bytes", &tle::KvCacheConfig::getMaxGpuTotalBytes, &tle::KvCacheConfig::setMaxGpuTotalBytes)
+        .def_prop_rw("optimization_target", &tle::KvCacheConfig::getOptimizationTarget,
+            &tle::KvCacheConfig::setOptimizationTarget)
         .def("fill_empty_fields_from_runtime_defaults", &tle::KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults)
         .def("__getstate__", kvCacheConfigGetstate)
         .def("__setstate__", kvCacheConfigSetstate);

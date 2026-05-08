@@ -1,10 +1,9 @@
 import dataclasses
-import inspect
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Optional, Set, TypeAlias, TypeVar
+from typing import Optional, Set, TypeAlias
 
 from strenum import StrEnum
 
@@ -18,35 +17,6 @@ from ..llm_request import LlmRequest, LlmRequestState
 RequestList = list[LlmRequest]
 PrefixReuseSummary: TypeAlias = tb_internal.batch_manager.PrefixReuseSummary
 PrefixSummaryCache: TypeAlias = dict[int, PrefixReuseSummary]
-T = TypeVar("T")
-
-
-def _call_with_optional_summary(
-    fn: Callable[..., T],
-    *args: Any,
-    cached_summary: Optional[PrefixReuseSummary] = None,
-) -> T:
-    """Call ``fn(*args)`` and, if supported, pass ``cached_summary`` as a kwarg.
-
-    The nanobind binding for ``get_remaining_blocks_to_completion`` and
-    ``get_needed_blocks_one_step`` accepts ``cached_summary: PrefixReuseSummary | None = None``
-    so the C++ side can skip a redundant radix-tree walk. Test mocks may not
-    accept this kwarg yet; inspect the callable before passing it so real
-    ``TypeError`` exceptions from inside ``fn`` are not hidden.
-    """
-    if cached_summary is None:
-        return fn(*args)
-
-    try:
-        signature = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return fn(*args, cached_summary=cached_summary)
-    if not any(
-        param.name == "cached_summary" or param.kind == inspect.Parameter.VAR_KEYWORD
-        for param in signature.parameters.values()
-    ):
-        return fn(*args)
-    return fn(*args, cached_summary=cached_summary)
 
 
 SchedulerOutput = namedtuple(
@@ -1177,7 +1147,7 @@ class NoEvictScheduledBlocksManager:
     Python equivalent of C++ kv_cache_manager::NoEvictScheduledBlocksManager.
     Tracks available blocks per window size for GUARANTEED_NO_EVICT scheduling.
 
-    Reference: cpp/tensorrt_llm/batch_manager/scheduledBlocksManager.h:29-62
+    Reference: cpp/tensorrt_llm/batch_manager/scheduledBlocksManager.h
     """
 
     def __init__(self, kv_cache_manager):
@@ -1197,16 +1167,16 @@ class NoEvictScheduledBlocksManager:
 
         If ``cached_summary`` (a ``PrefixReuseSummary``) is provided, it is forwarded to
         ``get_remaining_blocks_to_completion`` so the C++ side skips re-walking the radix tree.
-        C++ reference: scheduledBlocksManager.h:40-46
+        C++ reference: scheduledBlocksManager.h
         """
+        estimated_reusable_tokens = []
         for window_size in self.available_blocks:
-            needed = _call_with_optional_summary(
-                self.kv_cache_manager.get_remaining_blocks_to_completion,
-                req,
-                window_size,
-                cached_summary=cached_summary,
-            )
+            needed = self.kv_cache_manager.get_remaining_blocks_to_completion(
+                req, window_size, cached_summary=cached_summary)
+            estimated_reusable_tokens.append(req.estimated_reusable_tokens)
             self.available_blocks[window_size] -= needed
+        if estimated_reusable_tokens:
+            req.estimated_reusable_tokens = min(estimated_reusable_tokens)
 
     def enough_available_blocks(
         self, req: LlmRequest, cached_summary: Optional[PrefixReuseSummary] = None
@@ -1216,18 +1186,19 @@ class NoEvictScheduledBlocksManager:
 
         If ``cached_summary`` (a ``PrefixReuseSummary``) is provided, it is forwarded to
         ``get_remaining_blocks_to_completion`` so the C++ side skips re-walking the radix tree.
-        C++ reference: scheduledBlocksManager.h:48-57
+        C++ reference: scheduledBlocksManager.h
         """
-        return all(
-            _call_with_optional_summary(
-                self.kv_cache_manager.get_remaining_blocks_to_completion,
-                req,
-                ws,
-                cached_summary=cached_summary,
-            )
-            <= avail
-            for ws, avail in self.available_blocks.items()
-        )
+        enough = True
+        estimated_reusable_tokens = []
+        for window_size, available_blocks in self.available_blocks.items():
+            needed = self.kv_cache_manager.get_remaining_blocks_to_completion(
+                req, window_size, cached_summary=cached_summary)
+            estimated_reusable_tokens.append(req.estimated_reusable_tokens)
+            if needed > available_blocks:
+                enough = False
+        if estimated_reusable_tokens:
+            req.estimated_reusable_tokens = min(estimated_reusable_tokens)
+        return enough
 
 
 class MaxUtilizationScheduledBlocksManager:
@@ -1235,7 +1206,7 @@ class MaxUtilizationScheduledBlocksManager:
     Python equivalent of C++ kv_cache_manager::MaxUtilizationScheduledBlocksManager.
     Tracks scheduled blocks per window size for MAX_UTILIZATION scheduling.
 
-    Reference: cpp/tensorrt_llm/batch_manager/scheduledBlocksManager.h:64-117
+    Reference: cpp/tensorrt_llm/batch_manager/scheduledBlocksManager.h
     """
 
     def __init__(self, kv_cache_manager, two_steps_look_ahead: bool):
@@ -1257,17 +1228,18 @@ class MaxUtilizationScheduledBlocksManager:
 
         If ``cached_summary`` (a ``PrefixReuseSummary``) is provided, it is forwarded to
         ``get_needed_blocks_one_step`` so the C++ side skips re-walking the radix tree.
-        C++ reference: scheduledBlocksManager.h:80-100
+        C++ reference: scheduledBlocksManager.h
         """
         blocks_if_scheduled = {}
+        estimated_reusable_tokens = []
         for window_size, num_scheduled in self.num_scheduled_blocks.items():
-            required = _call_with_optional_summary(
-                self.kv_cache_manager.get_needed_blocks_one_step,
+            required = self.kv_cache_manager.get_needed_blocks_one_step(
                 req,
                 self.two_steps_look_ahead,
                 window_size,
                 cached_summary=cached_summary,
             )
+            estimated_reusable_tokens.append(req.estimated_reusable_tokens)
             logger.debug(
                 f"MaxUtilizationScheduler: request ID {req.request_id} "
                 f"required blocks {required} for {window_size} window size"
@@ -1279,6 +1251,8 @@ class MaxUtilizationScheduledBlocksManager:
             if not has_free:
                 return None
             blocks_if_scheduled[window_size] = scheduled_total
+        if estimated_reusable_tokens:
+            req.estimated_reusable_tokens = min(estimated_reusable_tokens)
         return blocks_if_scheduled
 
     def update_scheduled_blocks(self, blocks: dict[int, int]) -> None:

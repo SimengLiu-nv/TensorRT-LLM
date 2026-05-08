@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,7 +28,8 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     std::optional<size_t> const& hostCacheSize, std::optional<FloatType> const& crossKvCacheFraction,
     std::optional<RetentionPriority> secondaryOffloadMinPriority, size_t eventBufferMaxSize, bool enablePartialReuse,
     bool copyOnPartialReuse, bool useUvm, SizeType32 attentionDpEventsGatherPeriodMs,
-    std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults, uint64_t const& maxGpuTotalBytes)
+    std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults, uint64_t const& maxGpuTotalBytes,
+    std::string const& optimizationTarget)
     : mEnableBlockReuse(enableBlockReuse)
     , mHostCacheSize(hostCacheSize)
     , mSecondaryOffloadMinPriority(secondaryOffloadMinPriority)
@@ -38,7 +39,9 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     , mUseUvm{useUvm}
     , mAttentionDpEventsGatherPeriodMs(attentionDpEventsGatherPeriodMs)
     , mMaxGpuTotalBytes{maxGpuTotalBytes}
+    , mOptimizationTarget{kDefaultOptimizationTarget}
 {
+    setOptimizationTarget(optimizationTarget);
     if (maxTokens)
     {
         setMaxTokens(maxTokens.value());
@@ -69,6 +72,11 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     }
     TLLM_CHECK_WITH_INFO(
         mAttentionDpEventsGatherPeriodMs > 0, "Attention DP events gather period must be greater than 0");
+}
+
+bool KvCacheConfig::isValidOptimizationTarget(std::string const& optimizationTarget) noexcept
+{
+    return optimizationTarget == kContextReuseOptimizationTarget || optimizationTarget == kGenerationOptimizationTarget;
 }
 
 bool KvCacheConfig::getEnableBlockReuse() const
@@ -139,6 +147,11 @@ SizeType32 KvCacheConfig::getAttentionDpEventsGatherPeriodMs() const
 uint64_t KvCacheConfig::getMaxGpuTotalBytes() const
 {
     return mMaxGpuTotalBytes;
+}
+
+std::string const& KvCacheConfig::getOptimizationTarget() const
+{
+    return mOptimizationTarget;
 }
 
 void KvCacheConfig::setEnableBlockReuse(bool enableBlockReuse)
@@ -226,6 +239,14 @@ void KvCacheConfig::setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEve
 void KvCacheConfig::setMaxGpuTotalBytes(uint64_t maxGpuTotalBytes)
 {
     mMaxGpuTotalBytes = maxGpuTotalBytes;
+}
+
+void KvCacheConfig::setOptimizationTarget(std::string const& optimizationTarget)
+{
+    TLLM_CHECK_WITH_INFO(isValidOptimizationTarget(optimizationTarget),
+        "kv_cache_config.optimization_target must be one of '%s' or '%s', got '%s'", kContextReuseOptimizationTarget,
+        kGenerationOptimizationTarget, optimizationTarget.c_str());
+    mOptimizationTarget = optimizationTarget;
 }
 
 void KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults)

@@ -1034,6 +1034,9 @@ class KvCacheConfig
 {
 public:
     static constexpr auto kDefaultGpuMemFraction = 0.9F;
+    static constexpr auto kContextReuseOptimizationTarget = "context_reuse";
+    static constexpr auto kGenerationOptimizationTarget = "generation";
+    static constexpr auto kDefaultOptimizationTarget = kContextReuseOptimizationTarget;
 
     explicit KvCacheConfig(bool enableBlockReuse = true, std::optional<SizeType32> const& maxTokens = std::nullopt,
         std::optional<std::vector<SizeType32>> const& maxAttentionWindowVec = std::nullopt,
@@ -1045,8 +1048,9 @@ public:
         bool enablePartialReuse = true, bool copyOnPartialReuse = true, bool useUvm = false,
         SizeType32 attentionDpEventsGatherPeriodMs = 5,
         std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt,
-        uint64_t const& maxGpuTotalBytes = 0);
+        uint64_t const& maxGpuTotalBytes = 0, std::string const& optimizationTarget = kDefaultOptimizationTarget);
 
+    [[nodiscard]] static bool isValidOptimizationTarget(std::string const& optimizationTarget) noexcept;
     [[nodiscard]] bool getEnableBlockReuse() const;
     [[nodiscard]] bool getEnablePartialReuse() const;
     [[nodiscard]] bool getCopyOnPartialReuse() const;
@@ -1061,6 +1065,7 @@ public:
     [[nodiscard]] bool getUseUvm() const;
     [[nodiscard]] SizeType32 getAttentionDpEventsGatherPeriodMs() const;
     [[nodiscard]] uint64_t getMaxGpuTotalBytes() const;
+    [[nodiscard]] std::string const& getOptimizationTarget() const;
 
     void setEnableBlockReuse(bool enableBlockReuse);
     void setEnablePartialReuse(bool enablePartialReuse);
@@ -1076,6 +1081,7 @@ public:
     void setUseUvm(bool useUvm);
     void setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEventsGatherPeriodMs);
     void setMaxGpuTotalBytes(uint64_t maxGpuTotalBytes);
+    void setOptimizationTarget(std::string const& optimizationTarget);
 
     void fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults);
 
@@ -1135,6 +1141,9 @@ private:
     /// If both mMaxGpuTotalBytes and mFreeGpuMemoryFraction are specified, memory corresponding to the minimum will
     /// be allocated.
     uint64_t mMaxGpuTotalBytes;
+
+    /// @brief Optimize SWA KV-cache behavior for either prompt context reuse or generation memory savings.
+    std::string mOptimizationTarget;
 };
 
 /// @brief Configuration class for the runtime perf knobs

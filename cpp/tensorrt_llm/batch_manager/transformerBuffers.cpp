@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -357,9 +357,9 @@ void TransformerBuffers::copyKvBlockOffsets(RequestVector const& contextRequests
             auto const requestId = llmReq->mRequestId;
             auto const isContextRequest = llmReq->isContextInitState();
             auto const beamWidth = isContextRequest ? contextBeamWidth : llmReq->getBeamWidthByIter();
+            auto const useSwaCyclicSlots = !(isContextRequest && kvCacheManager->isSwaContextReuseEnabled());
             auto const maxBeamBlockCount = kvCacheManager->copyBlockOffsets(*kvCacheBlockOffsetsHost, numSequences,
-                requestId, /*useSwaCyclicSlots=*/true,
-                /*useSwaContextSlots=*/isContextRequest);
+                requestId, useSwaCyclicSlots, /*useSwaContextSlots=*/isContextRequest);
             maxBlockCount = std::max(maxBlockCount, maxBeamBlockCount);
             if (crossKvCacheBlockOffsetsHost)
             {

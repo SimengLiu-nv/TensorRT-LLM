@@ -748,11 +748,37 @@ struct PrefixReuseSummary
     /// Used by the token budget (NoEvict) since all cached tokens avoid recompute.
     SizeType32 reusableBlocksAll{0};
 
+    /// Longest prefix length that can be safely skipped for this window.
+    /// For SWA this can include traversal-only out-of-window anchors that do
+    /// not own physical KV memory, but only after enough later matched tokens
+    /// make those anchors irrelevant to the active attention window.
+    SizeType32 totalMatchedTokens{0};
+
     /// First block key NOT found in the radix tree. std::nullopt means either all full
     /// prefix blocks matched (full prefix hit) or the request has no full block key to
     /// probe yet; a concrete BlockKey identifies the first missing full block.
     /// Used by the capacity scheduler's skip-check logic to decide whether to defer a request.
     std::optional<BlockKey> firstNewBlock{std::nullopt};
+
+    /// Debug-only accounting from the same radix walk. These fields are logged
+    /// behind TLLM_KV_CACHE_REUSE_DEBUG to distinguish real cached SWA blocks
+    /// from value-less traversal anchors.
+    SizeType32 exactNodesVisited{0};
+    SizeType32 realValueMatches{0};
+    SizeType32 valueLessTraversalNodes{0};
+    SizeType32 partialValueMatches{0};
+    SizeType32 latestMissingAnchorEndToken{0};
+    SizeType32 committedPrefixAfterMissingAnchor{0};
+    SizeType32 latestRealValueEndToken{0};
+    SizeType32 trailingRealValueBlocks{0};
+    SizeType32 trailingRealValueTokens{0};
+    SizeType32 rawCandidateMatchedTokens{0};
+    SizeType32 rawCandidateMatchBlocks{0};
+    SizeType32 safeMatchBlocks{0};
+    SizeType32 firstMissBlockIdx{-1};
+    SizeType32 firstMissPrefixTokens{0};
+    SizeType32 firstMissBlockTokens{0};
+    bool stoppedByMaxMatchedTokens{false};
 };
 
 // The WindowBlockManager manages the metadata of KVCacheBlocks.
@@ -1194,6 +1220,21 @@ private:
         std::vector<ReuseMatch> matches;
         SizeType32 totalMatchedTokens{0};
         std::optional<BlockKey> firstNewBlock{std::nullopt};
+        SizeType32 exactNodesVisited{0};
+        SizeType32 realValueMatches{0};
+        SizeType32 valueLessTraversalNodes{0};
+        SizeType32 partialValueMatches{0};
+        SizeType32 latestMissingAnchorEndToken{0};
+        SizeType32 committedPrefixAfterMissingAnchor{0};
+        SizeType32 latestRealValueEndToken{0};
+        SizeType32 trailingRealValueBlocks{0};
+        SizeType32 trailingRealValueTokens{0};
+        SizeType32 rawCandidateMatchedTokens{0};
+        SizeType32 rawCandidateMatchBlocks{0};
+        SizeType32 firstMissBlockIdx{-1};
+        SizeType32 firstMissPrefixTokens{0};
+        SizeType32 firstMissBlockTokens{0};
+        bool stoppedByMaxMatchedTokens{false};
     };
 
     //! \brief Find the reusable prefix, including SWA traversal-only anchors.
@@ -1407,12 +1448,15 @@ public:
     //!          Would Return:  {1024: 0.0345, 4096: 0.4138, 8192: 0.5517} [sums to 1.0].
     //!          If paged context FMHA needs a temporary attention window, SWA contribution uses
     //!          (window size + temporary attention window) so the pool can hold chunked prefill.
+    //!          When optimizing for context reuse, SWA contribution uses max input length so SWA
+    //!          windows receive enough memory for reusable context anchors.
     //!          See: TEST_F(KVCacheManagerTest, BlockManagerTestWindowSizeToShare).
     //! \return Map<windowSize, share> where share is a float between 0 and 1. Shares sum to 1.0.
     static std::map<SizeType32, float> calculateWindowSizeToShare(
         std::map<SizeType32, std::vector<SizeType32>> const& uniqueWindowSizeToLayers,
         std::map<SizeType32, SizeType32> const& cacheSizePerTokenPerWindowSize,
-        std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs = std::nullopt);
+        std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs = std::nullopt,
+        std::string const& optimizationTarget = executor::KvCacheConfig::kDefaultOptimizationTarget);
 
     void allocatePools(bool useUvm);
 
@@ -1504,6 +1548,16 @@ public:
     [[nodiscard]] SizeType32 getNumFreeBlocks() const
     {
         return sumWindows([](WindowBlockManager const& manager) { return manager.getNumFreeBlocks(); });
+    }
+
+    [[nodiscard]] SizeType32 getNumFreeBlocks(SizeType32 windowSize) const
+    {
+        return mWindowBlockManagers.at(windowSize).getNumFreeBlocks();
+    }
+
+    [[nodiscard]] SizeType32 getNumPrimaryBlocks(SizeType32 windowSize) const
+    {
+        return mWindowBlockManagers.at(windowSize).getNumPrimaryBlocks();
     }
 
     [[nodiscard]] bool schedulingHasFreeBlocks(SizeType32 numRequired, SizeType32 windowSize) const
@@ -1860,8 +1914,7 @@ public:
     [[nodiscard]] virtual OffsetTableDimensions getOffsetTableDimensions() const = 0;
 
     [[nodiscard]] virtual std::deque<executor::KVCacheEvent> getLatestEvents(
-        std::optional<std::chrono::milliseconds> timeout = std::nullopt) const
-        = 0;
+        std::optional<std::chrono::milliseconds> timeout = std::nullopt) const = 0;
 
     [[nodiscard]] virtual BlockManager const& getBlockManager() const = 0;
 
@@ -1871,8 +1924,7 @@ public:
     /// @param cachedSummary Optional pre-computed PrefixReuseSummary to avoid redundant radix tree walks.
     /// @return  The number of blocks
     [[nodiscard]] virtual SizeType32 getNeededBlocksOneStep(LlmRequest const& req, bool twoStepsLookAhead,
-        SizeType32 windowSize, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const
-        = 0;
+        SizeType32 windowSize, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const = 0;
 
     /// @brief  Function that computes the number of KV cache blocks needed to advance a request to completion (i.e. for
     /// maxNewTokens).
@@ -1880,8 +1932,7 @@ public:
     /// @param cachedSummary Optional pre-computed PrefixReuseSummary to avoid redundant radix tree walks.
     /// @return  The number of blocks
     [[nodiscard]] virtual SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize,
-        std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const
-        = 0;
+        std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const = 0;
 
     /// @brief Pin blocks associated with a request to prevent eviction.
     /// @param requestId The ID of the request whose blocks should be pinned.
@@ -1921,17 +1972,20 @@ public:
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getLayerToPoolMapping() const = 0;
 
     virtual void getBlockOffsetsOfBatch(
-        runtime::ITensor& output, SizeType32 firstBatchSlotIdx, SizeType32 batchSize, SizeType32 beamWidth) const
-        = 0;
+        runtime::ITensor& output, SizeType32 firstBatchSlotIdx, SizeType32 batchSize, SizeType32 beamWidth) const = 0;
 
     //! @return maxBlockCount of all beams
     virtual SizeType32 copyBlockOffsets(runtime::ITensor& output, SizeType32 outputSlotOffset,
-        LlmRequest::RequestIdType requestId, bool useSwaCyclicSlots = true, bool useSwaContextSlots = false) const
-        = 0;
+        LlmRequest::RequestIdType requestId, bool useSwaCyclicSlots = true, bool useSwaContextSlots = false) const = 0;
 
     [[nodiscard]] virtual bool isEnableBlockReuse() const = 0;
 
     [[nodiscard]] virtual bool isEnablePartialReuse() const = 0;
+
+    [[nodiscard]] virtual bool isSwaContextReuseEnabled() const
+    {
+        return false;
+    }
 
     [[nodiscard]] virtual bool isEnableIndexerKCache() const = 0;
     [[nodiscard]] virtual SizeType32 getIndexerKCacheIndexHeadDim() const = 0;
@@ -1948,8 +2002,7 @@ public:
     //! \brief Combined prefix reuse analysis — single radix tree walk.
     //! \details Collects firstNewBlock + reusableBlocksAllocated + reusableBlocksAll in one pass.
     [[nodiscard]] virtual PrefixReuseSummary analyzePrefixReuse(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
-        = 0;
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const = 0;
 
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
@@ -1966,17 +2019,15 @@ public:
 
     //! \brief Get the block ids of a request [per beam] **for a given window size block manager**
     [[nodiscard]] virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
-        LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
-        = 0;
+        LlmRequest::RequestIdType requestId, SizeType32 windowSize) const = 0;
 
     //! \brief Get the block ids of a batch of requests [per beam] **for a given window size block manager**
     [[nodiscard]] virtual std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
-        std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const
-        = 0;
+        std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const = 0;
 
     /// @brief Get the last block id (beam 0) for a given sequence and window size
-    [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const
-        = 0;
+    [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> getLastBlockId(
+        LlmRequest::RequestIdType requestId) const = 0;
 
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getUniquePrimaryPool() const = 0;
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
@@ -2074,8 +2125,7 @@ public:
     //! @param windowSize The attention window size this block belongs to.
     //! @return The retention priority of the block, or default priority if block not found.
     [[nodiscard]] virtual executor::RetentionPriority getPriorityByBlockId(
-        KVCacheBlock::IdType blockId, SizeType32 windowSize) const
-        = 0;
+        KVCacheBlock::IdType blockId, SizeType32 windowSize) const = 0;
 };
 
 class KVCacheManager : public BaseKVCacheManager
@@ -2099,7 +2149,7 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt, bool swaContextReuse = true);
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -2113,7 +2163,7 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt, bool swaContextReuse = true);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -2127,7 +2177,7 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt, bool swaContextReuse = true);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -2137,7 +2187,7 @@ public:
         CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true, bool copyOnpartialReuse = true,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt, bool swaContextReuse = true);
 
     ~KVCacheManager() override = default;
 
@@ -2311,6 +2361,8 @@ public:
         return mBlockManager.isEnablePartialReuse();
     }
 
+    [[nodiscard]] bool isSwaContextReuseEnabled() const override;
+
     [[nodiscard]] bool isEnableIndexerKCache() const override
     {
         return mBlockManager.isEnableIndexerKCache();
@@ -2476,6 +2528,8 @@ private:
     std::unordered_map<LlmRequest::RequestIdType, GenerationRequest> mSequences;
     // Whether to cache KV pages for reuse
     bool mEnableBlockReuse;
+    // Whether SWA context requests materialize full prompt cache blocks for future context reuse.
+    bool mSwaContextReuse;
     // Mutex to protect access to mSequences
     mutable std::mutex mSequencesMtx;
     // buffers for static tensors, will be created after allocating pools

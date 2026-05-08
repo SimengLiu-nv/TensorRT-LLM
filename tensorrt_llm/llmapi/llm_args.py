@@ -2395,6 +2395,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The maximum size in bytes of GPU memory that can be allocated for the KV cache. If both `max_gpu_total_bytes` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be allocated."
     )
+    optimization_target: Literal["context_reuse", "generation"] = Field(
+        default="context_reuse",
+        description=
+        "Optimization target for KV-cache allocation and SWA context materialization. "
+        "`context_reuse` keeps SWA context blocks reusable for future shared-prefix requests. "
+        "`generation` preserves the bounded-tail SWA cache behavior to save memory for low-reuse workloads."
+    )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     iteration_stats_interval: PositiveInt = Field(
@@ -2469,7 +2476,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             use_uvm=self.use_uvm,
             attention_dp_events_gather_period_ms=self.
             attention_dp_events_gather_period_ms,
-            max_gpu_total_bytes=self.max_gpu_total_bytes)
+            max_gpu_total_bytes=self.max_gpu_total_bytes,
+            optimization_target=self.optimization_target)
         return config
 
     @field_validator('free_gpu_memory_fraction')
