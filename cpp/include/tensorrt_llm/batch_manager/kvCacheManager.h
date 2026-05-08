@@ -1977,18 +1977,6 @@ public:
     /// still alias the full logical prompt; normal generation should keep the default true value.
     virtual void addToken(LlmRequest::RequestIdType requestId, bool detachSwaFrontBlocks = true) = 0;
 
-    //! rief Add one generation token for each request.
-    //! \details Allows Python callers to update a generation batch with one C++ transition while preserving the
-    //!          per-request addToken behavior.
-    virtual void addTokens(
-        std::vector<LlmRequest::RequestIdType> const& requestIds, bool detachSwaFrontBlocks = true)
-    {
-        for (auto const requestId : requestIds)
-        {
-            addToken(requestId, detachSwaFrontBlocks);
-        }
-    }
-
     /// @brief Get the number of tokens for a request at KVCacheManager's sight. Sometimes it is different from
     /// LlmRequest::getNumTokens.
     [[nodiscard]] virtual SizeType32 getTokenCount(LlmRequest::RequestIdType requestId) const = 0;

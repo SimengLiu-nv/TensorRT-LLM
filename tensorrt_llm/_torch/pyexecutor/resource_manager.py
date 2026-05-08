@@ -544,7 +544,6 @@ class KVCacheManager(BaseResourceManager):
         )
         logger.info(f"[KVCacheManager] execution_stream: {self._stream}")
         swa_context_reuse = kv_cache_config.optimization_target == "context_reuse"
-        self._swa_context_reuse = swa_context_reuse
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
@@ -729,7 +728,6 @@ class KVCacheManager(BaseResourceManager):
             # `add_sequence_batch` due to KV cache reuse, so we rebuild the context request lists here.
             scheduled_batch.reset_context_requests()
 
-            swa_context_reuse_generation_request_ids: list[int] = []
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
                     # Distribute the decode blocks across CP ranks in a round-robin manner.
@@ -742,24 +740,9 @@ class KVCacheManager(BaseResourceManager):
                         req.py_helix_is_inactive_rank = True
                         # Skip allocating KV cache at decode for inactive helix ranks.
                         continue
-                if self._swa_context_reuse:
-                    # Context-reuse mode keeps SWA front blocks attached so the
-                    # completed sequence can be stored for reuse on release,
-                    # matching full-attention behavior without per-token store
-                    # work.
-                    swa_context_reuse_generation_request_ids.append(
-                        req.py_request_id)
-                else:
-                    self.impl.add_token(req.py_request_id)
+                self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
-                    if self._swa_context_reuse:
-                        swa_context_reuse_generation_request_ids.append(
-                            req.py_request_id)
-                    else:
-                        self.impl.add_token(req.py_request_id)
-            if swa_context_reuse_generation_request_ids:
-                self.impl.add_tokens(swa_context_reuse_generation_request_ids,
-                                     False)
+                    self.impl.add_token(req.py_request_id)
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
             self.impl.refresh_blocks()
