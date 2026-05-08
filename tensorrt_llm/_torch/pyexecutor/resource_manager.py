@@ -333,7 +333,6 @@ class KVCacheManager(BaseResourceManager):
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
-        self._swa_context_reuse = kv_cache_config.optimization_target == "context_reuse"
         self.pp_layers, self.num_layers = get_pp_layers(
             num_layers,
             mapping,
@@ -544,6 +543,7 @@ class KVCacheManager(BaseResourceManager):
         self._stream = execution_stream if execution_stream is not None else torch.cuda.Stream(
         )
         logger.info(f"[KVCacheManager] execution_stream: {self._stream}")
+        swa_context_reuse = kv_cache_config.optimization_target == "context_reuse"
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
@@ -561,7 +561,7 @@ class KVCacheManager(BaseResourceManager):
             'cache_type': kv_cache_type,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
-            'swa_context_reuse': self._swa_context_reuse,
+            'swa_context_reuse': swa_context_reuse,
             'kv_connector_manager': self.kv_connector_manager,
             'enable_indexer_k_cache': enable_indexer_k_cache,
             'indexer_k_cache_quant_block_size':
@@ -728,7 +728,6 @@ class KVCacheManager(BaseResourceManager):
             # `add_sequence_batch` due to KV cache reuse, so we rebuild the context request lists here.
             scheduled_batch.reset_context_requests()
 
-            swa_generation_requests: list[LlmRequest] = []
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
                     # Distribute the decode blocks across CP ranks in a round-robin manner.
@@ -741,23 +740,9 @@ class KVCacheManager(BaseResourceManager):
                         req.py_helix_is_inactive_rank = True
                         # Skip allocating KV cache at decode for inactive helix ranks.
                         continue
-                if self._swa_context_reuse:
-                    # Preserve completed SWA blocks before add_token can detach
-                    # them from the active sliding-window sequence. The C++
-                    # batch method keeps the same per-request ordering while
-                    # avoiding one Python/C++ transition per generated token.
-                    swa_generation_requests.append(req)
-                else:
-                    self.impl.add_token(req.py_request_id)
+                self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
-                    if self._swa_context_reuse:
-                        # Same ordering for speculative draft tokens.
-                        swa_generation_requests.append(req)
-                    else:
-                        self.impl.add_token(req.py_request_id)
-            if swa_generation_requests:
-                self.impl.store_new_blocks_and_add_tokens(
-                    swa_generation_requests)
+                    self.impl.add_token(req.py_request_id)
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
             self.impl.refresh_blocks()

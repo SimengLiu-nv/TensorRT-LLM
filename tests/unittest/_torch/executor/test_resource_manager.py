@@ -3,7 +3,6 @@ import pathlib
 import subprocess
 import sys
 import unittest
-from types import SimpleNamespace
 from typing import NamedTuple, Tuple
 from unittest.mock import patch
 
@@ -656,7 +655,6 @@ class TestResourceManager(unittest.TestCase):
             self) -> None:
 
         class NoCpMapping:
-            cp_config: dict[str, object] = {}
 
             def has_cp_helix(self) -> bool:
                 return False
@@ -706,95 +704,6 @@ class TestResourceManager(unittest.TestCase):
 
         self.assertIsNotNone(requests)
         self.assertEqual(kv_cache_manager.impl.add_token_calls, [(0, True)] * 5)
-
-    def test_gpt_oss_vswa_context_reuse_generation_stores_new_blocks(
-            self) -> None:
-
-        class NoCpMapping:
-            cp_config: dict[str, object] = {}
-
-            def has_cp_helix(self) -> bool:
-                return False
-
-        class RecordingKvCacheImpl:
-
-            def __init__(self) -> None:
-                self.calls: list[tuple[str, int | None, bool | None]] = []
-
-            def add_token(self,
-                          request_id: int,
-                          detach_swa_front_blocks: bool = True) -> None:
-                self.calls.append(
-                    ("add_token", request_id, detach_swa_front_blocks))
-
-            def store_new_block_and_add_token(
-                    self,
-                    request: LlmRequest,
-                    detach_swa_front_blocks: bool = True) -> None:
-                self.calls.append(("store_new_block_and_add_token",
-                                   request.py_request_id,
-                                   detach_swa_front_blocks))
-
-            def store_new_blocks_and_add_tokens(
-                    self,
-                    requests: list[LlmRequest],
-                    detach_swa_front_blocks: bool = True) -> None:
-                self.calls.append(("store_new_blocks_and_add_tokens",
-                                   tuple(request.py_request_id
-                                         for request in requests),
-                                   detach_swa_front_blocks))
-
-            def sync_transfer_manager_with_buffer_manager(self) -> None:
-                self.calls.append(("sync_transfer_manager_with_buffer_manager",
-                                   None, None))
-
-            def refresh_blocks(self) -> None:
-                self.calls.append(("refresh_blocks", None, None))
-
-        class ScheduledBatchStub:
-
-            def __init__(self, request: LlmRequest) -> None:
-                self.generation_requests = [request]
-                self.context_requests: list[LlmRequest] = []
-
-            def reset_context_requests(self) -> None:
-                pass
-
-        request = SimpleNamespace(
-            py_request_id=7,
-            state=tensorrt_llm.bindings.LlmRequestState.GENERATION_IN_PROGRESS,
-            py_rewind_len=0,
-            py_num_accepted_draft_tokens=0,
-            py_num_accepted_draft_tokens_indices=[],
-            py_draft_tokens=None,
-        )
-        scheduled_batch = ScheduledBatchStub(request)
-
-        kv_cache_manager = KVCacheManager.__new__(KVCacheManager)
-        kv_cache_manager.is_draft = False
-        kv_cache_manager.mapping = NoCpMapping()
-        kv_cache_manager.impl = RecordingKvCacheImpl()
-        kv_cache_manager.kv_connector_manager = None
-        kv_cache_manager._swa_context_reuse = True
-
-        kv_cache_manager.prepare_resources(scheduled_batch)
-
-        self.assertEqual(kv_cache_manager.impl.calls, [
-            ("sync_transfer_manager_with_buffer_manager", None, None),
-            ("store_new_blocks_and_add_tokens", (7, ), True),
-            ("refresh_blocks", None, None),
-        ])
-
-        kv_cache_manager.impl = RecordingKvCacheImpl()
-        kv_cache_manager._swa_context_reuse = False
-
-        kv_cache_manager.prepare_resources(scheduled_batch)
-
-        self.assertEqual(kv_cache_manager.impl.calls, [
-            ("sync_transfer_manager_with_buffer_manager", None, None),
-            ("add_token", 7, True),
-            ("refresh_blocks", None, None),
-        ])
 
     @staticmethod
     def _create_model_config_for_kv_cache_manager() -> ModelConfigCpp:

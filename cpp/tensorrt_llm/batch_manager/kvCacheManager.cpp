@@ -4561,32 +4561,8 @@ void KVCacheManager::addToken(RequestIdType requestId, bool detachSwaFrontBlocks
     // TODO: add streamLLM support
     auto& sequence = getSequence(requestId);
     sequence.addNewTokens(1);
-    mBlockManager.adjustBlocksIfNeeded(sequence, detachSwaFrontBlocks);
-}
-
-void KVCacheManager::storeNewBlockAndAddToken(LlmRequest const& llmRequest, bool detachSwaFrontBlocks)
-{
-    // TODO: add streamLLM support
-    auto const requestId = llmRequest.mRequestId;
-    auto& sequence = getSequence(requestId);
-    if (sequence.getBeamWidth() <= 1 && mEnableBlockReuse)
-    {
-        // A newly generated block can only become reusable after the request reaches
-        // the next full-block boundary. Reject non-boundary tokens before iterating
-        // the per-window managers.
-        auto const& uniqueTokens = llmRequest.getUniqueTokens(0);
-        if (!uniqueTokens.empty())
-        {
-            auto const usableSize = static_cast<SizeType32>(uniqueTokens.size()) - 1;
-            if (usableSize % getTokensPerBlock() == 0)
-            {
-                mBlockManager.storeNewBlock(sequence, llmRequest);
-            }
-        }
-    }
-
-    sequence.addNewTokens(1);
-    mBlockManager.adjustBlocksIfNeeded(sequence, detachSwaFrontBlocks);
+    auto const effectiveDetachSwaFrontBlocks = detachSwaFrontBlocks && !isSwaContextReuseEnabled();
+    mBlockManager.adjustBlocksIfNeeded(sequence, effectiveDetachSwaFrontBlocks);
 }
 
 void KVCacheManager::copyLinearAttentionBlock(LlmRequest const& llmRequest)
@@ -4992,21 +4968,6 @@ void KVCacheManager::storeNewBlock(LlmRequest const& llmRequest)
     {
         return;
     }
-
-    // A newly generated block can only become reusable after the request reaches
-    // the next full-block boundary. Reject non-boundary tokens before iterating
-    // the per-window managers.
-    auto const& uniqueTokens = llmRequest.getUniqueTokens(0);
-    if (uniqueTokens.empty())
-    {
-        return;
-    }
-    auto const usableSize = static_cast<SizeType32>(uniqueTokens.size()) - 1;
-    if (usableSize % getTokensPerBlock() != 0)
-    {
-        return;
-    }
-
     mBlockManager.storeNewBlock(sequence, llmRequest);
 }
 
@@ -5118,9 +5079,10 @@ SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSl
                     std::memcpy(dstPtr + dstIndex, srcPtr + srcIndex, copyChunkSize);
                     if (metadata.isSWA && useSwaCyclicSlots)
                     {
-                        // SWA kernels index a bounded cyclic tail. For context
-                        // FMHA, fill every logical page-table slot by aliasing it
-                        // back into that valid cyclic tail.
+                        // SWA stores only a bounded physical tail. For context
+                        // FMHA, fill every logical page-table slot by aliasing
+                        // it back into that valid cyclic tail; generation keeps
+                        // the compact cyclic view.
                         auto const firstActiveBlockIdx = sequence.getNumFrontBlocksRemoved(ws);
                         auto const maxBlocksPerSeq = static_cast<SizeType32>(srcShape.d[3]);
                         auto const contextCyclicBlockCount

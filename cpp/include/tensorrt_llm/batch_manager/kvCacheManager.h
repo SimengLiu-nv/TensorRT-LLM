@@ -1977,27 +1977,6 @@ public:
     /// still alias the full logical prompt; normal generation should keep the default true value.
     virtual void addToken(LlmRequest::RequestIdType requestId, bool detachSwaFrontBlocks = true) = 0;
 
-    //! \brief Store any newly reusable block before adding one generation token.
-    //! \details This preserves the store-before-detach ordering needed by SWA context reuse while keeping Python callers
-    //!          to one manager call per generated token.
-    virtual void storeNewBlockAndAddToken(LlmRequest const& llmRequest, bool detachSwaFrontBlocks = true)
-    {
-        storeNewBlock(llmRequest);
-        addToken(llmRequest.mRequestId, detachSwaFrontBlocks);
-    }
-
-    //! \brief Store newly reusable blocks and add one generation token for each request.
-    //! \details Keeps the same per-request store-before-detach ordering as storeNewBlockAndAddToken, while allowing
-    //!          Python callers to cross into C++ once for a batch of generation updates.
-    virtual void storeNewBlocksAndAddTokens(
-        std::vector<std::reference_wrapper<LlmRequest const>> const& llmRequests, bool detachSwaFrontBlocks = true)
-    {
-        for (auto const& llmRequest : llmRequests)
-        {
-            storeNewBlockAndAddToken(llmRequest.get(), detachSwaFrontBlocks);
-        }
-    }
-
     /// @brief Get the number of tokens for a request at KVCacheManager's sight. Sometimes it is different from
     /// LlmRequest::getNumTokens.
     [[nodiscard]] virtual SizeType32 getTokenCount(LlmRequest::RequestIdType requestId) const = 0;
@@ -2364,9 +2343,6 @@ public:
 
     /// @brief Increase size for request with requestId. Allocate new KV cache block(s) if needed.
     void addToken(LlmRequest::RequestIdType requestId, bool detachSwaFrontBlocks = true) override;
-
-    //! \brief Store any newly reusable block before adding one generation token.
-    void storeNewBlockAndAddToken(LlmRequest const& llmRequest, bool detachSwaFrontBlocks = true) override;
 
     /// @brief LlmRequest::getNumTokens is out of sync with GenerationRequest when overlap scheduler is enabled.
     /// This function returns the correct number of tokens from GenerationRequest to keep the behavior consistent.

@@ -8865,7 +8865,7 @@ std::unique_ptr<KVCacheManager> makeSmallWindowManager(
 }
 } // namespace
 
-TEST_F(KVCacheManagerTest, VSWAContextReuseStoresOOWBlocksBeforeDetachDuringGeneration)
+TEST_F(KVCacheManagerTest, VSWAContextReuseKeepsOOWBlocksMaterializedDuringGeneration)
 {
     auto constexpr blocksInPrimaryPool = 16;
     auto const stream = std::make_shared<tr::CudaStream>();
@@ -8884,14 +8884,15 @@ TEST_F(KVCacheManagerTest, VSWAContextReuseStoresOOWBlocksBeforeDetachDuringGene
     kvCacheManager->storeContextBlocks(*llmRequest0);
 
     llmRequest0->addNewToken(kVSWA_FIRST_TOKEN + 11, kVSWA_BEAM_IDX);
-    kvCacheManager->storeNewBlock(*llmRequest0);
     kvCacheManager->addToken(0);
     llmRequest0->addNewToken(kVSWA_FIRST_TOKEN + 12, kVSWA_BEAM_IDX);
-    kvCacheManager->storeNewBlock(*llmRequest0);
     kvCacheManager->addToken(0);
 
     auto const& seq0 = kvCacheManager->getSequence(0);
-    EXPECT_GT(seq0.getNumFrontBlocksRemoved(onlyWindowSize), 0);
+    auto const& cacheBlockIds = seq0.getCacheBlockIds(onlyWindowSize).at(kVSWA_BEAM_IDX);
+    EXPECT_EQ(seq0.getNumFrontBlocksRemoved(onlyWindowSize), 0);
+    EXPECT_TRUE(std::none_of(cacheBlockIds.begin(), cacheBlockIds.end(),
+        [](auto const blockId) { return blockId == KVCacheBlock::kPlaceholderBlockId; }));
 
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager->removeSequence(0, llmRequest0)));
 
