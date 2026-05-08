@@ -429,6 +429,21 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("window_size"), nb::arg("cached_summary") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("add_token", &BaseKVCacheManager::addToken, nb::arg("request_id"),
             nb::arg("detach_swa_front_blocks") = true, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "add_tokens",
+            [](tbk::BaseKVCacheManager& self, nb::list requestIdsList, bool detachSwaFrontBlocks)
+            {
+                std::vector<tb::LlmRequest::RequestIdType> requestIds;
+                requestIds.reserve(nb::len(requestIdsList));
+                for (size_t i = 0; i < nb::len(requestIdsList); ++i)
+                {
+                    requestIds.push_back(nb::cast<tb::LlmRequest::RequestIdType>(requestIdsList[i]));
+                }
+
+                nb::gil_scoped_release release;
+                self.addTokens(requestIds, detachSwaFrontBlocks);
+            },
+            nb::arg("request_ids"), nb::arg("detach_swa_front_blocks") = true)
         .def("get_token_count", &BaseKVCacheManager::getTokenCount, nb::arg("request_id"))
         .def(
             "add_sequence_batch",
