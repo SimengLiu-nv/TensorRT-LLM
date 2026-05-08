@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 import time
 from abc import ABC, abstractmethod
@@ -842,11 +843,51 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
+        self._round_robin_warmup_servers: set[str] = set()
 
     def _create_server_state(self, server: str) -> KvCacheAwareServerState:
         return KvCacheAwareServerState(server, self._use_tokens,
                                        self._tokens_per_block,
                                        lambda: self.session)
+
+    @staticmethod
+    def _normalize_tail_quarter_match_ratios(
+            raw_match_ratios: list[float]) -> tuple[list[float], float]:
+        if not raw_match_ratios:
+            return [], 0.0
+
+        quarter = 0.25
+        bounded_match_ratios = [
+            min(max(match_ratio, 0.0), 1.0)
+            for match_ratio in raw_match_ratios
+        ]
+        min_match_ratio = min(bounded_match_ratios)
+        common_lower_quarter = math.floor(min_match_ratio / quarter) * quarter
+        match_ratios = [
+            min(max((match_ratio - common_lower_quarter) / quarter, 0.0), 1.0)
+            for match_ratio in bounded_match_ratios
+        ]
+        return match_ratios, common_lower_quarter
+
+    def _select_round_robin_warmup_server(
+            self, servers: list[str]) -> Optional[str]:
+        unused_servers = [
+            server for server in servers
+            if server not in self._round_robin_warmup_servers
+        ]
+        if not unused_servers:
+            return None
+
+        for _ in range(len(servers)):
+            server = servers[self._rr_counter % len(servers)]
+            self._rr_counter += 1
+            if server in unused_servers:
+                self._round_robin_warmup_servers.add(server)
+                return server
+
+        server = unused_servers[0]
+        self._round_robin_warmup_servers.add(server)
+        return server
 
     async def get_next_server(
             self,
@@ -857,6 +898,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 server for server in self._server_state.keys()
                 if server != exclude_server
             ]
+            if not servers:
+                raise ValueError(
+                    f"No available servers after excluding {exclude_server}")
         # Tokenize + block-hash is CPU-bound (~50 ms p50 for a 40 k-token
         # chat request with a Rust-backed tokenizer). Running it directly
         # inside the async handler blocks the orchestrator's event loop and
@@ -872,30 +916,52 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         # select the server by (KV match - load)
         # TODO: more options
         workloads = [
-            state.num_active_requests()
-            for state in self._server_state.values()
+            self._server_state[server].num_active_requests()
+            for server in servers
         ]
         scores = []
         matches = []
+        raw_match_ratios = []
+        load_penalties = []
         for i in range(len(servers)):
             server = servers[i]
             # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
             matches.append(
                 await self._server_state[server].matched_tokens(block_hashes))
-            score = matches[-1] / padded_tokens - workloads[
-                i] / self._max_batch_size
+            raw_match_ratios.append(matches[-1] / padded_tokens)
+        match_ratios, match_ratio_lower_bound = (
+            self._normalize_tail_quarter_match_ratios(raw_match_ratios))
+        for i in range(len(servers)):
+            load_penalties.append(workloads[i] / self._max_batch_size)
+            score = match_ratios[i] - load_penalties[i]
             scores.append(score)
-        max_score = max(scores)
-        tied = [i for i, s in enumerate(scores) if s == max_score]
-        winner = tied[self._rr_counter % len(tied)]
-        self._rr_counter += 1
-        server = servers[winner]
         async with self._lock:
+            warmup_server = self._select_round_robin_warmup_server(servers)
+            if warmup_server is not None:
+                winner = servers.index(warmup_server)
+                routing_mode = "round_robin_warmup"
+            else:
+                max_score = max(scores)
+                tied = [i for i, s in enumerate(scores) if s == max_score]
+                winner = tied[self._rr_counter % len(tied)]
+                self._rr_counter += 1
+                routing_mode = "score"
+            server = servers[winner]
             await self._register_request(server, request)
         return server, {
             "block_hashes": block_hashes,  # list[list[int]]
             "token_lists": token_lists,  # list[list[int]]
+            "candidate_servers": servers,  # list[str]
             "matches": matches,  # list[int]
+            "request_tokens": padded_tokens,  # int
+            "raw_match_ratios": raw_match_ratios,  # list[float]
+            "match_ratios": match_ratios,  # list[float]
+            "match_ratio_lower_bound": match_ratio_lower_bound,  # float
+            "workloads": workloads,  # list[int]
+            "load_penalties": load_penalties,  # list[float]
+            "scores": scores,  # list[float]
+            "selected_server": server,  # str
+            "routing_mode": routing_mode,  # str
             "server_info": self._server_info.get(server, {}),
         }
 
@@ -913,6 +979,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             new_state[server] = (self._server_state.get(server)
                                  or self._create_server_state(server))
         self._server_state = new_state
+        self._round_robin_warmup_servers.intersection_update(new_servers)
 
 
 class _BlockHashTrie:

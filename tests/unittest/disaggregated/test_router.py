@@ -357,6 +357,114 @@ async def test_kv_cache_aware_router(servers, mock_aiohttp_session):
     assert len(set(final_servers)) == 3
 
 
+@pytest.mark.parametrize(
+    ("raw_match_ratios", "expected_lower_bound", "expected_match_ratios"),
+    [
+        ([0.0, 0.10], 0.0, [0.0, 0.40]),
+        ([0.24, 0.25], 0.0, [0.96, 1.0]),
+        ([0.25, 0.50], 0.25, [0.0, 1.0]),
+        ([0.50, 0.95], 0.50, [0.0, 1.0]),
+        ([0.74, 0.95], 0.50, [0.96, 1.0]),
+        ([0.75, 0.76], 0.75, [0.0, 0.04]),
+        ([0.95, 1.0], 0.75, [0.80, 1.0]),
+    ],
+)
+def test_kv_cache_aware_router_normalizes_tail_quarter_match_ratios(
+        raw_match_ratios: list[float], expected_lower_bound: float,
+        expected_match_ratios: list[float]) -> None:
+    match_ratios, lower_bound = (
+        KvCacheAwareRouter._normalize_tail_quarter_match_ratios(
+            raw_match_ratios))
+
+    assert lower_bound == pytest.approx(expected_lower_bound)
+    assert match_ratios == pytest.approx(expected_match_ratios)
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_uses_round_robin_before_scoring() -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1", "server2"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=1)
+    router._server_state["server1"].matched_tokens = mock.AsyncMock(
+        return_value=100)
+    router._server_state["server2"].matched_tokens = mock.AsyncMock(
+        return_value=0)
+
+    requests = [
+        CompletionRequest(model="TinyLlama", prompt=list(range(101)))
+        for _ in range(3)
+    ]
+
+    first_server, first_info = await router.get_next_server(requests[0])
+    second_server, second_info = await router.get_next_server(requests[1])
+    await router.finish_request(requests[0])
+    await router.finish_request(requests[1])
+    third_server, third_info = await router.get_next_server(requests[2])
+
+    assert first_server == "server1"
+    assert second_server == "server2"
+    assert first_info["routing_mode"] == "round_robin_warmup"
+    assert second_info["routing_mode"] == "round_robin_warmup"
+    assert third_server == "server1"
+    assert third_info["routing_mode"] == "score"
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_scores_tail_quarter_match_ratio() -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server95", "server50"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=1)
+    router._round_robin_warmup_servers.update(["server95", "server50"])
+    router._server_state["server95"].matched_tokens = mock.AsyncMock(
+        return_value=95)
+    router._server_state["server50"].matched_tokens = mock.AsyncMock(
+        return_value=50)
+
+    request = CompletionRequest(model="TinyLlama", prompt=list(range(101)))
+    server, info = await router.get_next_server(request)
+
+    assert server == "server95"
+    assert info["candidate_servers"] == ["server95", "server50"]
+    assert info["request_tokens"] == 100
+    assert info["matches"] == [95, 50]
+    assert info["raw_match_ratios"] == pytest.approx([0.95, 0.50])
+    assert info["match_ratio_lower_bound"] == pytest.approx(0.50)
+    assert info["match_ratios"] == pytest.approx([1.0, 0.0])
+    assert info["scores"] == pytest.approx([1.0, 0.0])
+    assert info["routing_mode"] == "score"
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_scores_across_boundary() -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server75", "server76"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=1)
+    router._round_robin_warmup_servers.update(["server75", "server76"])
+    router._server_state["server75"].matched_tokens = mock.AsyncMock(
+        return_value=75)
+    router._server_state["server76"].matched_tokens = mock.AsyncMock(
+        return_value=76)
+
+    request = CompletionRequest(model="TinyLlama", prompt=list(range(101)))
+    server, info = await router.get_next_server(request)
+
+    assert server == "server76"
+    assert info["candidate_servers"] == ["server75", "server76"]
+    assert info["request_tokens"] == 100
+    assert info["matches"] == [75, 76]
+    assert info["raw_match_ratios"] == pytest.approx([0.75, 0.76])
+    assert info["match_ratio_lower_bound"] == pytest.approx(0.75)
+    assert info["match_ratios"] == pytest.approx([0.0, 0.04])
+    assert info["scores"] == pytest.approx([0.0, 0.04])
+    assert info["routing_mode"] == "score"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api_type", ["completion", "chat"])
 async def test_kv_cache_aware_router_multi_turn_conversation(
