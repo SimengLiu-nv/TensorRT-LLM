@@ -969,7 +969,8 @@
       "allowed_values": [
         "lmcache",
         "lmcache-mp",
-        "kvbm"
+        "kvbm",
+        "mooncake-store"
       ],
       "annotation": "Optional[str]",
       "converter": "allowlist",
