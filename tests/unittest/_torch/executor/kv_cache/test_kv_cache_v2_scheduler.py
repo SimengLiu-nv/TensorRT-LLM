@@ -56,6 +56,7 @@ def make_gen_request(
     req.lora_task_id = lora_task_id
     req.is_context_init_state = False
     req.is_generation_in_progress_state = True
+    req.is_generation_to_complete_state = False
     req.is_first_context_chunk = is_first_context_chunk
     req.py_encoder_output_ready_event = None
     req.py_multimodal_data = None
@@ -1483,9 +1484,7 @@ class TestDeadlockDetection:
         def resize_fn(req, n):
             return not fail[0]
 
-        mgr = make_kv_cache_manager(
-            resize_context_fn=resize_fn, has_cache_tier_below_gpu=False
-        )
+        mgr = make_kv_cache_manager(resize_context_fn=resize_fn, has_cache_tier_below_gpu=False)
         sched = make_scheduler(mgr, max_num_tokens=1000)
         sched._DEADLOCK_STALL_ITERS = 3
         reqs = [make_ctx_request(0, 100, is_first_context_chunk=False)]
