@@ -907,7 +907,10 @@ def _create_py_executor_impl(
                     forward_pass_callable)
 
             kv_connector_manager = KvCacheConnectorManager(
-                connector_worker, connector_scheduler)
+                connector_worker,
+                connector_scheduler,
+                aggressive_prefix_budgeting=kv_connector_config.
+                aggressive_prefix_budgeting)
 
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")
