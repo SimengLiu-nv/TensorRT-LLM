@@ -1540,7 +1540,10 @@ class TestDeadlockDetection:
             sched.schedule_request(reqs, set())
 
     def test_raises_after_repeated_stalls_with_generation_candidates(self):
-        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lambda req: False,
+            can_evict=True,
+        )
         sched = make_scheduler(mgr, max_num_tokens=100)
         sched._DEADLOCK_STALL_ITERS = 3
         # Self-eviction suspends it on the first pass, which counts as
