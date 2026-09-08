@@ -172,6 +172,11 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         this connector uses.
         """
 
+    def update_state_after_alloc_by_layer_group(
+        self, request: LlmRequest, block_ids_by_layer_group: List[List[int]]
+    ) -> None:
+        """No-op counterpart for target-plus-draft or multi-group layouts."""
+
     # ---- work lists ----
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> MooncakeStoreMetadata:
@@ -219,6 +224,12 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         state = self._requests.pop(request.request_id, None)
         return bool(state is not None and state.emitted_saves)
 
+    def request_finished_by_layer_group(
+        self, request: LlmRequest, cache_block_ids_by_layer_group: List[List[int]]
+    ) -> bool:
+        """Finish a request whose pages span more than one layer group."""
+        return self.request_finished(request, [])
+
     # ---- internals ----
 
     def _require_worker(self) -> MooncakeStoreConnectorWorker:
@@ -247,7 +258,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             # indices into the flat `new_block_ids`, but it does not say which
             # group they belong to, so there is nothing safe to record from it.
             return
-        for layer_group_id, indices in by_group.items():
+        for layer_group_id, indices in enumerate(by_group):
             state.pages.setdefault(layer_group_id, []).extend(int(index) for index in indices)
 
     def _addressable_blocks(self, state: _RequestState) -> int:
