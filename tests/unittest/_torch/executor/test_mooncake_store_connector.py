@@ -877,13 +877,15 @@ def make_scheduler(store_config, hit_blocks=0):
 
 
 def request_data(request_id, new_tokens, page_indices, layer_group_id=0):
+    by_layer_group = [[] for _ in range(layer_group_id + 1)]
+    by_layer_group[layer_group_id] = list(page_indices)
     return RequestData(
         request_id=request_id,
         new_tokens=list(new_tokens),
         new_block_ids=list(page_indices),
         computed_position=0,
         num_scheduled_tokens=len(new_tokens),
-        new_block_ids_by_layer_group={layer_group_id: list(page_indices)},
+        new_block_ids_by_layer_group=by_layer_group,
     )
 
 
@@ -992,7 +994,7 @@ def test_scheduler_skips_blocks_without_a_page_in_every_group(store_config):
     scheduler.get_num_new_matched_tokens(request, 0)
 
     data = request_data(1, tokens, [4, 5])
-    data.new_block_ids_by_layer_group[1] = [7, BAD_PAGE_INDEX]
+    data.new_block_ids_by_layer_group.append([7, BAD_PAGE_INDEX])
     metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
 
     # Block 1 has no page in group 1, so neither of its halves is stored; block 0

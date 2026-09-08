@@ -25,6 +25,8 @@ from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     AsyncRequests, KvCacheConnectorManager, KvCacheConnectorScheduler,
     KvCacheConnectorSchedulerOutputManager, KvCacheConnectorWorker)
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.logger import logger
@@ -331,6 +333,48 @@ def test_scheduler_output_keeps_deltas_while_the_allocation_lives():
     assert len(again.new_requests) == 0
     assert len(again.cached_requests) == 1
     assert again.cached_requests[0].new_block_ids == []
+
+
+def test_scheduler_output_combines_target_and_one_model_draft_v2_groups():
+    """Separate MTP pages occupy one dense connector layer-group space."""
+    target_manager = object.__new__(KVCacheManagerV2)
+    target_manager.get_page_indices_by_layer_group = MagicMock(
+        side_effect=[[[10, 11]], [[10, 11, 12]]])
+    draft_manager = object.__new__(KVCacheManagerV2)
+    draft_manager.get_page_indices_by_layer_group = MagicMock(
+        side_effect=[[[20, 21]], [[20, 21, 22]]])
+
+    req = MagicMock()
+    req.request_id = 9
+    req.state = LlmRequestState.CONTEXT_INIT
+    req.get_tokens.side_effect = [list(range(32)), list(range(48))]
+    req.context_current_position = 0
+    req.context_remaining_length = 32
+    req.context_chunk_size = 32
+    req.kv_cache_retention_config = None
+    req.cache_salt = None
+
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [req]
+    manager = KvCacheConnectorSchedulerOutputManager()
+
+    first = manager.build_scheduler_output(
+        batch,
+        AsyncRequests({}, {}),
+        target_manager,
+        (draft_manager, ),
+    ).new_requests[0]
+    assert first.new_block_ids_by_layer_group == [[10, 11], [20, 21]]
+    assert first.new_block_ids == []
+
+    second = manager.build_scheduler_output(
+        batch,
+        AsyncRequests({}, {}),
+        target_manager,
+        (draft_manager, ),
+    ).cached_requests[0]
+    assert second.new_block_ids_by_layer_group == [[12], [22]]
+    assert second.new_block_ids == []
 
 
 def test_scheduler_output_num_scheduled_tokens_with_mtp():
