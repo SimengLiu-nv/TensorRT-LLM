@@ -75,7 +75,8 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .connectors.kv_cache_layout import build_kv_cache_layout_v2
+from .connectors.kv_cache_layout import (build_kv_cache_layout_v2,
+                                         combine_kv_cache_layouts)
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
@@ -1118,7 +1119,19 @@ class PyExecutor:
                 self._reject_non_gpu_cache_tiers(self.kv_cache_manager)
                 self._reject_connector_prefix_without_block_reuse(
                     self.kv_cache_manager)
-                layout = build_kv_cache_layout_v2(self.kv_cache_manager)
+                layouts = [build_kv_cache_layout_v2(self.kv_cache_manager)]
+                if self.draft_kv_cache_manager is not None:
+                    if not isinstance(self.draft_kv_cache_manager,
+                                      KVCacheManagerV2):
+                        raise NotImplementedError(
+                            "KV Cache Connector requires a V2 draft cache manager "
+                            "when one-model speculative decoding uses a separate "
+                            "draft cache.")
+                    self._reject_non_gpu_cache_tiers(
+                        self.draft_kv_cache_manager)
+                    layouts.append(
+                        build_kv_cache_layout_v2(self.draft_kv_cache_manager))
+                layout = combine_kv_cache_layouts(layouts)
                 self.kv_connector_manager.worker.register_kv_cache_layout(
                     layout)
             else:
@@ -7791,7 +7804,7 @@ class PyExecutor:
                 # swallows that, leaving `request_finished` uncalled and the
                 # connector never told to save anything.
                 if isinstance(self.kv_cache_manager, KVCacheManagerV2):
-                    by_layer_group = self.kv_cache_manager.get_page_indices_by_layer_group(
+                    by_layer_group = self._connector_page_indices_by_layer_group(
                         req)
                     cache_block_ids = by_layer_group[0] if len(
                         by_layer_group) == 1 else []
@@ -7815,6 +7828,17 @@ class PyExecutor:
         for req in requests:
             if req.is_finished:
                 kv_connector_request_finished(req)
+
+    def _connector_page_indices_by_layer_group(
+            self, request: LlmRequest) -> List[List[int]]:
+        """Return the connector's dense target-plus-draft group index space."""
+        by_layer_group = self.kv_cache_manager.get_page_indices_by_layer_group(
+            request)
+        if isinstance(self.draft_kv_cache_manager, KVCacheManagerV2):
+            by_layer_group.extend(
+                self.draft_kv_cache_manager.get_page_indices_by_layer_group(
+                    request))
+        return by_layer_group
 
     @staticmethod
     def _request_vote_id(request: LlmRequest) -> int:

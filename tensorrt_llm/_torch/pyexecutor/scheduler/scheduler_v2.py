@@ -15,7 +15,7 @@
 
 import enum
 import os
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
@@ -30,6 +30,9 @@ from .scheduler import (
     _is_forced_context_chunk_boundary,
     drop_decoder_context_requests_waiting_for_encoder_output,
 )
+
+if TYPE_CHECKING:
+    from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 
 class ScheduleAction(enum.Enum):
@@ -1371,6 +1374,19 @@ class KVCacheV2Scheduler(RequestScheduler):
         if self.draft_kv_cache_manager is not None:
             self.draft_kv_cache_manager.free_resources(req)
 
+    def _connector_peer_kv_cache_managers(self) -> tuple["KVCacheManagerV2", ...]:
+        """Other V2 pools whose pages share the connector request lifetime."""
+        if self.draft_kv_cache_manager is None:
+            return ()
+        return (self.draft_kv_cache_manager,)
+
+    def _preempt_request(self, req: LlmRequest) -> bool:
+        """Preempt target KV and include a separate draft pool when present."""
+        peers = self._connector_peer_kv_cache_managers()
+        if peers:
+            return self.kv_cache_manager.preempt_request(req, peers)
+        return self.kv_cache_manager.preempt_request(req)
+
     def _try_preempt_for_pages(
         self,
         requests_list: RequestList,
@@ -1411,14 +1427,14 @@ class KVCacheV2Scheduler(RequestScheduler):
             if not self.kv_cache_manager.is_request_active(victim.py_request_id):
                 continue
 
-            released = self.kv_cache_manager.preempt_request(victim)
+            released = self._preempt_request(victim)
             logger.debug(
                 f"[V2Scheduler] Preempting request {victim.py_request_id} "
                 f"(state={victim.state.name}), pages "
                 f"{'released' if released else 'pending connector saves'}"
             )
             self._clear_request_runtime_state(victim)
-            if self.draft_kv_cache_manager is not None:
+            if released and self.draft_kv_cache_manager is not None:
                 self.draft_kv_cache_manager.free_resources(victim)
             if released:
                 # Rewrites the prompt to include what was generated and resets
@@ -1625,10 +1641,31 @@ class KVCacheV2Scheduler(RequestScheduler):
                 f"[V2Scheduler] Recompute-pausing request {victim.py_request_id} "
                 f"to free pages for request {req.py_request_id}"
             )
-            self._recompute_pause_request(victim)
-            recompute_paused.append(victim)
+            if self.kv_cache_manager.kv_connector_manager is None:
+                self._recompute_pause_request(victim)
+                recompute_paused.append(victim)
+                released = True
+            else:
+                # Connector saves may still read these pages. Use the same
+                # deferred release handshake as context admission preemption;
+                # the executor pauses the victim once every worker reports the
+                # save complete. The draft pool is part of the request's
+                # serialized layout, so its page indices were captured before
+                # it is released here.
+                released = self._preempt_request(victim)
+                self._clear_request_runtime_state(victim)
+                if released and self.draft_kv_cache_manager is not None:
+                    self.draft_kv_cache_manager.free_resources(victim)
+                evicted.append(victim)
+                if released:
+                    victim.pause(self.max_input_len)
             recompute_pause_state.victim_indices.add(victim_idx)
             recompute_pause_state.frontier = min(recompute_pause_state.frontier, victim_idx)
+
+            if not released:
+                # One deferred victim at a time. Its pages become available
+                # through _resume_preempted_request after connector progress.
+                return req_it_end, False
 
             # Retry immediately: full teardown can make the allocation fit even
             # for an already-suspended victim. If it still fails, use any

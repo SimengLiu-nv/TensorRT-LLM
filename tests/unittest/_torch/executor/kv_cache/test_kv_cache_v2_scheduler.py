@@ -184,6 +184,7 @@ def make_kv_cache_manager(
     mgr.enable_partial_reuse = True
     mgr.enable_joint_kv_cache_reuse = enable_joint_kv_cache_reuse
     mgr.enable_block_reuse = enable_block_reuse
+    mgr.kv_connector_manager = None
     mgr.num_extra_kv_tokens = 0
     mgr.can_evict = can_evict
     mgr._has_cp_helix = False
@@ -582,6 +583,37 @@ class TestKVCacheFailuresGen:
         assert ids(out.recompute_paused_requests) == [99]
         assert call_count[0] == 4
         mgr.free_resources.assert_called_once_with(victim)
+
+    def test_connector_recompute_pause_uses_preemption_handshake(self):
+        """An in-flight save keeps generation pages alive until it retires."""
+        call_count = [0]
+
+        def alloc_fn(req):
+            call_count[0] += 1
+            return call_count[0] == 1
+
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=alloc_fn,
+            can_evict=True,
+            preempt_request_fn=lambda req, *peers: False,
+        )
+        mgr.kv_connector_manager = object()
+        draft_mgr = Mock()
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=100,
+            draft_kv_cache_manager=draft_mgr,
+        )
+        victim = make_gen_request(99)
+
+        out = sched.schedule_request([make_gen_request(0), make_gen_request(1), victim], set())
+
+        mgr.preempt_request.assert_called_once_with(victim, (draft_mgr,))
+        mgr.free_resources.assert_not_called()
+        draft_mgr.free_resources.assert_not_called()
+        victim.pause.assert_not_called()
+        assert out.recompute_paused_requests == []
+        assert 99 in ids(out.paused_requests)
 
     def test_recompute_pause_gate_stops_destructive_fallback(self):
         """Disabling recompute pause keeps ordinary suspension as the last fallback."""
