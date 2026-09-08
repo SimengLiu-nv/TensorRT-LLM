@@ -3055,7 +3055,10 @@ class ResourceManager:
         kv_cache_manager = self.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
         if hasattr(kv_cache_manager, "report_batch_to_connector"):
-            kv_cache_manager.report_batch_to_connector(scheduled_batch)
+            draft_kv_cache_manager = self.resource_managers.get(
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+            kv_cache_manager.report_batch_to_connector(
+                scheduled_batch, draft_kv_cache_manager=draft_kv_cache_manager)
 
     @nvtx_range("update_resources")
     def update_resources(

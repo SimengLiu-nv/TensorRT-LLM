@@ -62,6 +62,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import build_kv_cache_layout_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import PageIndexMode, Role
 from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
@@ -1301,6 +1302,17 @@ def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
         assert cache_manager.get_cache_bytes_per_token() == expected_cache_bytes
         with pytest.raises(AssertionError, match="shared-indexer layer"):
             cache_manager.get_indexer_k_cache_buffers(1)
+
+        layout = build_kv_cache_layout_v2(cache_manager)
+        index_key_layers = {
+            buffer.layer_id
+            for group in layout.groups
+            for region in group.regions
+            for buffer in region.buffers
+            if buffer.role == str(Role.INDEX_KEY)
+        }
+        assert index_key_layers == {0, 2}
+        assert {layer_id for group in layout.groups for layer_id in group.layer_ids} == {0, 1, 2}
     finally:
         cache_manager.shutdown()
 

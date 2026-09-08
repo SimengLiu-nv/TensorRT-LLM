@@ -1772,7 +1772,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests: set[int] = set()
         # Requests whose pages a connector is still reading from, so the
         # release half of `preempt_request` has to wait.
-        self._pending_preemption: Dict[int, LlmRequest] = {}
+        self._pending_preemption: Dict[int, Tuple[LlmRequest, Tuple["KVCacheManagerV2", ...]]] = {}
         self._prepare_page_table_tensor(index_mapper_capacity)
 
         self._log_kv_cache_pool_lifecycle_mapping()
@@ -3739,7 +3739,11 @@ class KVCacheManagerV2(BaseResourceManager):
         """True while a deferred preemption is still waiting on a connector."""
         return bool(self._pending_preemption)
 
-    def preempt_request(self, req: LlmRequest) -> bool:
+    def preempt_request(
+        self,
+        req: LlmRequest,
+        additional_kv_cache_managers: Sequence["KVCacheManagerV2"] = (),
+    ) -> bool:
         """Give up *req*'s KV cache so its pages can be reclaimed.
 
         Unlike :meth:`suspend_request` this does not keep the pages. Closing
@@ -3769,8 +3773,15 @@ class KVCacheManagerV2(BaseResourceManager):
         # DISAGG_CONTEXT_TRANS_IN_PROGRESS, out of the schedulable range, and
         # its `_KVCache` keeps holding the pages until every rank reports the
         # save retired through `get_finished`.
-        if self.kv_connector_manager.request_finished(req, self.get_connector_page_indices(req)):
-            self._pending_preemption[req.py_request_id] = req
+        by_layer_group = self.get_page_indices_by_layer_group(req)
+        for manager in additional_kv_cache_managers:
+            by_layer_group.extend(manager.get_page_indices_by_layer_group(req))
+        flat = by_layer_group[0] if len(by_layer_group) == 1 else []
+        if self.kv_connector_manager.request_finished(req, flat, by_layer_group):
+            self._pending_preemption[req.py_request_id] = (
+                req,
+                tuple(additional_kv_cache_managers),
+            )
             return False
 
         self._release_preempted(req)
@@ -3783,9 +3794,12 @@ class KVCacheManagerV2(BaseResourceManager):
         caller tells a preempted request apart from an ordinary finished one in
         the connector's `get_finished` output.
         """
-        if self._pending_preemption.pop(req.py_request_id, None) is None:
+        pending = self._pending_preemption.pop(req.py_request_id, None)
+        if pending is None:
             return False
         self._release_preempted(req)
+        for manager in pending[1]:
+            manager.free_resources(req)
         return True
 
     def _release_preempted(self, req: LlmRequest) -> None:
@@ -3928,7 +3942,11 @@ class KVCacheManagerV2(BaseResourceManager):
             # those two lists, so the split has to be rebuilt before it runs.
             scheduled_batch.reset_context_requests()
 
-    def report_batch_to_connector(self, scheduled_batch: ScheduledRequests) -> None:
+    def report_batch_to_connector(
+        self,
+        scheduled_batch: ScheduledRequests,
+        draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None,
+    ) -> None:
         """Report the batch to the KV connector.
 
         ``RequestData.num_scheduled_tokens`` describes the upcoming forward
@@ -3938,7 +3956,12 @@ class KVCacheManagerV2(BaseResourceManager):
         mini-batch the same hook.
         """
         if self.kv_connector_manager is not None and not self.is_draft:
-            self.kv_connector_manager.build_scheduler_output(scheduled_batch, self)
+            additional_managers = (
+                (draft_kv_cache_manager,) if draft_kv_cache_manager is not None else ()
+            )
+            self.kv_connector_manager.build_scheduler_output(
+                scheduled_batch, self, additional_managers
+            )
 
     # ---- KV connector prefix ----
     #
