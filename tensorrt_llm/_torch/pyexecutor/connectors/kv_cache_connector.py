@@ -37,7 +37,7 @@ To implement a custom KV connector, you need to implement both the scheduler and
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -515,10 +515,27 @@ class KvCacheConnectorSchedulerOutputRequest:
         self.block_ids_by_layer_group: List[List[int]] = []
         self.tokens = []
 
-    def update_and_build_data(self, req: LlmRequest, kv_cache_manager: "KVCacheManager"):
+    def update_and_build_data(
+        self,
+        req: LlmRequest,
+        kv_cache_manager: "KVCacheManager",
+        additional_kv_cache_managers: Sequence["KVCacheManager"] = (),
+    ) -> RequestData:
         from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
         is_v2 = isinstance(kv_cache_manager, KVCacheManagerV2)
+        if additional_kv_cache_managers and not is_v2:
+            raise NotImplementedError(
+                "A connector can combine target and draft KV caches only when "
+                "both use KVCacheManagerV2."
+            )
+        if any(
+            not isinstance(manager, KVCacheManagerV2) for manager in additional_kv_cache_managers
+        ):
+            raise NotImplementedError(
+                "A connector can combine target and draft KV caches only when "
+                "both use KVCacheManagerV2."
+            )
         tokens = req.get_tokens(0)
 
         new_block_ids_by_layer_group: List[List[int]] = []
@@ -526,7 +543,11 @@ class KvCacheConnectorSchedulerOutputRequest:
             # Block hashes and retention priorities have no V2 accessor yet, so
             # they are reported empty rather than guessed at.
             block_hashes = []
-            indices_by_group = kv_cache_manager.get_page_indices_by_layer_group(req)
+            indices_by_group = [
+                indices
+                for manager in (kv_cache_manager, *additional_kv_cache_managers)
+                for indices in manager.get_page_indices_by_layer_group(req)
+            ]
             while len(self.block_ids_by_layer_group) < len(indices_by_group):
                 self.block_ids_by_layer_group.append([])
             for layer_group_id, indices in enumerate(indices_by_group):
@@ -614,7 +635,8 @@ class KvCacheConnectorSchedulerOutputManager:
         scheduled_batch: ScheduledRequests,
         new_async_requests: AsyncRequests,
         kv_cache_manager: "KVCacheManager",
-    ):
+        additional_kv_cache_managers: Sequence["KVCacheManager"] = (),
+    ) -> SchedulerOutput:
         scheduler_output = SchedulerOutput()
 
         for req in scheduled_batch.context_requests:
@@ -624,7 +646,7 @@ class KvCacheConnectorSchedulerOutputManager:
             is_new = req.request_id not in self.requests
 
             request_data = self.requests[req.request_id].update_and_build_data(
-                req, kv_cache_manager
+                req, kv_cache_manager, additional_kv_cache_managers
             )
 
             # Don't include the connector matched tokens in the initial scheduler output.
@@ -638,7 +660,7 @@ class KvCacheConnectorSchedulerOutputManager:
 
         for req in scheduled_batch.generation_requests:
             request_data = self.requests[req.request_id].update_and_build_data(
-                req, kv_cache_manager
+                req, kv_cache_manager, additional_kv_cache_managers
             )
 
             scheduler_output.cached_requests.append(request_data)
@@ -831,10 +853,16 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         return req_id not in self.finished_async_loading_requests
 
     def build_scheduler_output(
-        self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
-    ):
+        self,
+        scheduled_batch: ScheduledRequests,
+        kv_cache_manager: "KVCacheManager",
+        additional_kv_cache_managers: Sequence["KVCacheManager"] = (),
+    ) -> None:
         self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
-            scheduled_batch, self.new_async_requests, kv_cache_manager
+            scheduled_batch,
+            self.new_async_requests,
+            kv_cache_manager,
+            additional_kv_cache_managers,
         )
 
     def take_scheduled_requests_pending_load(self, scheduled_requests: ScheduledRequests):
