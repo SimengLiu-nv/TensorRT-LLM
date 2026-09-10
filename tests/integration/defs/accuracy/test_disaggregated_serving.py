@@ -36,7 +36,7 @@ from defs.common import wait_for_reported_addr
 
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
-from tensorrt_llm.llmapi.llm_args import LlmArgs, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import LlmArgs
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
@@ -2214,22 +2214,24 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/GLM-5.2-NVFP4"
 
     @pytest.mark.skip_less_device(8)
-    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
-                             ids=["cache_mgr_v1"])
-    def test_nvfp4_nixl(self, use_kv_cache_manager_v2):
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
+                             ids=["active_nvfp4_cache_mgr_v2"])
+    def test_nvfp4_nixl(self, use_kv_cache_manager_v2: bool,
+                        monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TRTLLM_NVFP4_MLA_KV_CACHE_AMAX", "100")
+        monkeypatch.setenv("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", "1")
         kv_cache_config = {
+            "dtype": "nvfp4",
             "free_gpu_memory_fraction": 0.7,
-            "enable_block_reuse": False,
             "use_kv_cache_manager_v2": use_kv_cache_manager_v2,
+            "tokens_per_block": 64,
         }
         cache_transceiver_config = {
             "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
         }
         moe_config = {"backend": "CUTEDSL"}
-        speculative_config = {
-            "decoding_type": "MTP",
-            "max_draft_len": 1,
-        }
         ctx_server_config = {
             "tensor_parallel_size": 4,
             "pipeline_parallel_size": 1,
@@ -2240,9 +2242,9 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             "cuda_graph_config": None,
             "trust_remote_code": True,
             "max_seq_len": 8192,
-            "kv_cache_config": kv_cache_config,
+            "kv_cache_config": dict(kv_cache_config,
+                                    enable_block_reuse=True),
             "moe_config": moe_config,
-            "speculative_config": speculative_config,
             "cache_transceiver_config": cache_transceiver_config,
         }
         gen_server_config = {
@@ -2254,9 +2256,9 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": True,
             "trust_remote_code": True,
             "max_seq_len": 8192,
-            "kv_cache_config": kv_cache_config,
+            "kv_cache_config": dict(kv_cache_config,
+                                    enable_block_reuse=False),
             "moe_config": moe_config,
-            "speculative_config": speculative_config,
             "cache_transceiver_config": cache_transceiver_config,
         }
         disaggregated_server_config = {
@@ -2276,11 +2278,8 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
                                       max_workers=128) as llm:
             # launch_disaggregated_llm builds a bare LlmArgs for the DuckLLM,
             # so the specs used for the accuracy reference lookup must be
-            # filled in to match the registered entry (NVFP4 + FP8 KV cache
-            # + MTP).
-            llm.args.quant_config.kv_cache_quant_algo = "FP8"
-            llm.args.speculative_config = MTPDecodingConfig(
-                max_draft_len=speculative_config["max_draft_len"])
+            # filled in to match the active-NVFP4 reference entry.
+            llm.args.quant_config.kv_cache_quant_algo = "NVFP4"
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
 
