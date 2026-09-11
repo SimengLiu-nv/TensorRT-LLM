@@ -14,8 +14,9 @@
 # limitations under the License.
 """Leader side of the Mooncake store KV cache connector.
 
-Runs only on rank 0. It decides what to load and what to save; the workers do
-the moving. Two pieces of bookkeeping make that possible, and both exist because
+Runs on every ADP owner, or only rank 0 for TP. It decides what to load and
+what to save; the local worker owns the store connection. Two pieces of
+bookkeeping make that possible, and both exist because
 `KVCacheManagerV2` reports `RequestData.block_hashes` empty:
 
 * a hash chain per request, so a block has a content identity at all;
@@ -72,7 +73,9 @@ class _RequestState:
 class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     """Chooses which pages the Mooncake pool serves and which it receives."""
 
-    def __init__(self, llm_args: TorchLlmArgs):
+    supports_attention_dp = True
+
+    def __init__(self, llm_args: TorchLlmArgs) -> None:
         super().__init__(llm_args)
 
         validate_llm_args(llm_args)
@@ -82,7 +85,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         self._worker: Optional[MooncakeStoreConnectorWorker] = None
 
         logger.info(
-            f"mooncake-store leader ready (role={self._config.role.value}, "
+            f"mooncake-store scheduler adapter ready (role={self._config.role.value}, "
             f"tokens_per_block={self._tokens_per_block})"
         )
 
