@@ -1027,6 +1027,53 @@ def test_scheduler_cancel_load_truncates_the_offer(store_config):
     assert [page.page_index for page in metadata.loads[0].pages] == [10]
 
 
+@pytest.mark.parametrize(
+    "cancel_ranges,expected_pages",
+    [
+        ([(4, 8)], [12, 13, 14]),
+        ([(4, 12)], [13, 14]),
+        ([(4, 8), (16, 20)], [12, 13]),
+        ([(16, 20), (4, 8)], [12, 13]),
+        ([(4, 20)], []),
+        ([(0, 24)], []),
+        ([(0, 4), (20, 24)], [11, 12, 13, 14]),
+        ([(8, 8)], [11, 12, 13, 14]),
+        ([(4, 5)], [12, 13, 14]),
+        ([(19, 24)], [11, 12, 13]),
+    ],
+)
+def test_scheduler_cancel_load_preserves_uncanceled_range(
+    store_config: Path,
+    cancel_ranges: list[tuple[int, int]],
+    expected_pages: list[int],
+) -> None:
+    """Cancel from either end of a nonzero-offset offer without losing its remainder."""
+    scheduler = make_scheduler(store_config, hit_blocks=4)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    assert scheduler.get_num_new_matched_tokens(request, TOKENS_PER_BLOCK) == (16, False)
+    for start, end in cancel_ranges:
+        scheduler.cancel_load(request, start, end)
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, list(range(10, 16)))])
+    )
+    assert [page.page_index for load in metadata.loads for page in load.pages] == expected_pages
+    # A consumed offer must not be issued again on the next iteration.
+    next_metadata = scheduler.build_connector_meta(
+        SchedulerOutput(cached_requests=[request_data(1, [], [])])
+    )
+    assert next_metadata.loads == []
+
+
+def test_scheduler_rejects_cancellation_that_splits_an_offer(store_config: Path) -> None:
+    scheduler = make_scheduler(store_config, hit_blocks=4)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+    with pytest.raises(ValueError, match="beginning or end"):
+        scheduler.cancel_load(request, TOKENS_PER_BLOCK, 2 * TOKENS_PER_BLOCK)
+
+
 def test_scheduler_request_finished_pins_pages_only_when_saving(store_config):
     scheduler = make_scheduler(store_config, hit_blocks=0)
     tokens = list(range(2 * TOKENS_PER_BLOCK))
