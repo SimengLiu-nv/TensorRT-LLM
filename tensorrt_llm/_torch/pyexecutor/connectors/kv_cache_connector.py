@@ -443,8 +443,9 @@ class KvCacheConnectorScheduler(ABC):
         tokens ``[start, end)``, which the runtime will not consume after all.
 
         Offsets are absolute prompt positions, on the same scale as
-        ``num_computed_tokens``. The range is always a suffix of what was
-        offered, or the whole offer.
+        ``num_computed_tokens``. The range can be a prefix, a suffix, or the
+        whole offer. A leading range is released when the local cache overtakes
+        the offer while the request waits; the remaining suffix must still load.
 
         Only called when ``KvCacheConnectorConfig.aggressive_prefix_budgeting``
         is set. That is the mode in which the runtime asks during its scheduling

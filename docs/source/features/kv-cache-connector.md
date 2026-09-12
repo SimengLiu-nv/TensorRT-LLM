@@ -57,6 +57,7 @@ These methods run on the leader process for TP, or on each request-owning rank f
 
 * **`cancel_load(self, request: LlmRequest, start: int, end: int)`**
   * **Description**: Release the ownership `get_num_new_matched_tokens` took for prompt tokens `[start, end)`, which the runtime will not consume. Offsets are absolute prompt positions, on the same scale as `num_computed_tokens`.
+  * **Range handling**: the runtime can cancel either end of the offer, or the whole offer. When local reuse overtakes a leading range while the request waits, preserve the remaining suffix: the runtime still counts those tokens as externally loaded. Mooncake trims its pending block range before building the transfer metadata.
   * **When it is called**: only under `aggressive_prefix_budgeting`, where the query runs early enough that it is no longer binding. Not implementing it makes that mode fail at start-up rather than at runtime; every other configuration never reaches it. See [Contributing the prefix to the scheduler's budget](#contributing-the-prefix-to-the-schedulers-budget).
 
 * **`update_state_after_alloc_by_layer_group(self, request: LlmRequest, block_ids_by_layer_group: list[list[int]])`**
@@ -531,6 +532,14 @@ The value for one key is the concatenation of that layer group's regions for one
 * **Loads are synchronous**, performed in `start_load_kv` before the forward pass. A failed load raises: the runtime has already counted those tokens as computed, so a partial load is a wrong answer rather than a slow one.
 * **Saves are asynchronous**, handed to a background thread behind a CUDA event recorded on the forward stream. The pages are only complete once the pass that wrote them retires, and blocking the executor loop on an RDMA write is the cost the store exists to avoid. The leader reports such requests as saving asynchronously, so their pages stay pinned until `get_finished` confirms the writes landed. A dropped save is logged rather than raised, since it only costs a future cache miss.
 * Pages the store already holds are skipped, so several ranks or instances converging on the same prefix write it once.
+
+#### Tuning TTFT and retained capacity
+
+Measure end-to-end time to first token (TTFT) and connector load time separately. TTFT also includes request queues, context computation, the prefill-to-decode handoff, and decode scheduling. A high prefix hit rate alone does not establish low TTFT.
+
+For disaggregated serving, tune the generation server's `max_batch_size` and `cuda_graph_config.batch_sizes` together for the intended concurrency. A generation limit chosen for low concurrency can leave requests waiting after a fast prefill or restore. Verify that `max_num_tokens` covers the resulting generation and draft-token budget, and that the resolved GPU KV capacity accommodates the active sequences.
+
+Size the shared pool from retained payload measured over the complete workload, including warmup and final drain. Concurrency is not proportional to storage demand when conversation trees have different prefix lengths and branching. Check segment capacity, eviction counters, and allocation failures throughout the run, and leave headroom for allocator overhead and newly replayed prefixes.
 
 #### Unsupported configurations
 
