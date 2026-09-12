@@ -117,6 +117,7 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter, count_retiring_requests
+from .scheduler.scheduler_v2 import KVCacheV2Scheduler
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -6529,15 +6530,26 @@ class PyExecutor:
         return context_requests
 
     @nvtx_range("_schedule")
+<<<<<<< HEAD
     def _schedule(self):
         self._maybe_record_hang_diagnostic_phase("scheduling",
                                                  forward_completion="clear")
+=======
+    def _schedule(self) -> Tuple[ScheduledRequests, List[LlmRequest], int]:
+>>>>>>> b71f0eebb8 ([None][fix] Allow pending KV transfers to release scheduler capacity)
         if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
-        scheduler_output = self.scheduler.schedule_request(
-            self.active_requests, self.inflight_req_ids)
+        if isinstance(self.scheduler, KVCacheV2Scheduler):
+            scheduler_output = self.scheduler.schedule_request(
+                self.active_requests,
+                self.inflight_req_ids,
+                has_pending_kv_transfers=self.async_transfer_manager.
+                has_any_inflight_requests())
+        else:
+            scheduler_output = self.scheduler.schedule_request(
+                self.active_requests, self.inflight_req_ids)
 
         scheduled_encoder_requests = scheduler_output.encoder_requests
         should_batch_encoder_requests = (self.is_encoder_decoder
