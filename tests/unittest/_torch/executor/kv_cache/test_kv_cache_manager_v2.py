@@ -73,6 +73,160 @@ TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "available, capacities, limits, candidate_limit, expected",
+    [
+        ([7], [8, 0], {1: 6}, 3, True),
+        ([6], [8, 0], {1: 6}, 3, False),
+        ([4], [20, 0], {1: 6}, 3, True),
+        ([3], [8, 8], {1: 6, 2: 3}, 3, False),
+        ([5], [8, 8], {1: 6, 2: 3}, 3, True),
+        ([100, 6], [8, 0], {1: 6}, 3, False),
+    ],
+)
+def test_disagg_generation_reserves_unallocated_pages_in_every_pool(
+    available: list[int],
+    capacities: list[int],
+    limits: dict[int, int],
+    candidate_limit: int,
+    expected: bool,
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.tokens_per_block = 4
+    manager._disagg_generation_limits = limits
+    manager._disagg_generation_pool_counts = {i: 1 for i in range(len(available))}
+    manager.kv_cache_map = {
+        i + 1: Mock(capacity=capacity, num_blocks=(capacity + 3) // 4)
+        for i, capacity in enumerate(capacities)
+    }
+    manager._get_storage_statistics = Mock(
+        return_value=[SimpleNamespace(available=count) for count in available]
+    )
+    assert manager._can_reserve_disagg_generation(2, candidate_limit) is expected
+    # Admission checking neither consumes the reservation nor mutates cache cursors.
+    assert manager._disagg_generation_limits == limits
+    for cache in manager.kv_cache_map.values():
+        cache.resize.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enable_block_reuse", [False, True])
+@pytest.mark.parametrize("ledger_tokens_per_block, expected_blocks", [(4, 10), (16, 3)])
+def test_disagg_generation_counts_pool_variants_and_speculative_padding(
+    enable_block_reuse: bool, ledger_tokens_per_block: int, expected_blocks: int
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.tokens_per_block = 4
+    manager._ledger_tokens_per_block = ledger_tokens_per_block
+    manager.max_seq_len = 32
+    manager.num_extra_kv_tokens = 1
+    manager._kv_reserve_draft_tokens = 5
+    manager.enable_block_reuse = enable_block_reuse
+    request = Mock(max_new_tokens=20)
+    # Clamp model sequence length, then retain extra KV, draft, and base-token padding.
+    limit = manager._disagg_generation_limit(request, 24)
+    assert limit == expected_blocks + int(enable_block_reuse)
+    manager._disagg_generation_limits = {}
+    manager._disagg_generation_pool_counts = {0: 2}
+    manager.kv_cache_map = {1: Mock(capacity=0, num_blocks=0)}
+    stats = SimpleNamespace(available=2 * limit - 1)
+    manager._get_storage_statistics = Mock(return_value=[stats])
+    assert not manager._can_reserve_disagg_generation(1, limit)
+    stats.available = 2 * limit
+    assert manager._can_reserve_disagg_generation(1, limit)
+
+
+@pytest.mark.parametrize("reserve_growth", [False, True])
+@pytest.mark.parametrize("enable_block_reuse", [False, True])
+def test_disagg_generation_progress_under_real_gpu_page_pressure(
+    reserve_growth: bool, enable_block_reuse: bool
+) -> None:
+    """Prompt-only admission can fill the pool before either request finishes.
+
+    Use the real allocator and wrapper admission path; the control disables only
+    the new reservation. The guarded path must defer the second long prompt,
+    allow a short request alongside the first, and release reservations on free.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    init_cuda_once()
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            enable_block_reuse=enable_block_reuse,
+            host_cache_size=0,
+            max_gpu_total_bytes=128 << 10,
+            max_util_for_resume=1.0,
+        ),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=8,
+        head_dim=64,
+        tokens_per_block=4,
+        max_seq_len=65536,
+        max_batch_size=4,
+        max_num_tokens=4,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        vocab_size=4096,
+        is_disagg=True,
+    )
+    assert manager._disagg_generation_pool_counts == {0: 1}
+    if not reserve_growth:
+        manager._disagg_generation_pool_counts.clear()
+    total_blocks = manager.get_kv_cache_stats().max_num_blocks
+    prompt_len = total_blocks // 3 * manager.tokens_per_block
+    assert prompt_len >= 8
+    # Allocation granularity can make the physical pool larger than the tiny
+    # requested byte quota. Keep this pressure probe within the actual table.
+    assert 2 * prompt_len < manager.max_seq_len
+
+    def make_request(request_id: int, prompt: int, output: int) -> LlmRequest:
+        request = LlmRequest(
+            request_id=request_id,
+            max_new_tokens=output,
+            input_tokens=[request_id] * prompt,
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+        )
+        request.state = LlmRequestState.DISAGG_GENERATION_INIT
+        return request
+
+    first = make_request(1, prompt_len, prompt_len)
+    second = make_request(2, prompt_len, prompt_len)
+    short = make_request(3, 4, 1)
+    try:
+        assert manager.prepare_disagg_gen_init(first)
+        assert manager.kv_cache_map[1].capacity == prompt_len
+        assert manager.prepare_disagg_gen_init(second) is not reserve_growth
+        first.state = LlmRequestState.GENERATION_IN_PROGRESS
+        if reserve_growth:
+            assert 2 not in manager.kv_cache_map
+            assert 2 not in manager._disagg_generation_limits
+            assert manager.prepare_disagg_gen_init(short)
+            for _ in range(prompt_len):
+                assert manager.try_allocate_generation(first)
+            manager.free_resources(first)
+            assert 1 not in manager._disagg_generation_limits
+            assert manager.prepare_disagg_gen_init(second)
+            # Cancellation must return both the physical pages and the logical bound.
+            manager.free_resources(second)
+            manager.free_resources(short)
+            assert not manager._disagg_generation_limits
+            assert manager.get_kv_cache_stats().free_num_blocks == total_blocks
+        else:
+            second.state = LlmRequestState.GENERATION_IN_PROGRESS
+            for _ in range(prompt_len):
+                first_fits = manager.try_allocate_generation(first)
+                second_fits = manager.try_allocate_generation(second)
+                if not first_fits and not second_fits:
+                    break
+            else:
+                pytest.fail("The unguarded control did not exhaust its GPU KV pool")
+    finally:
+        manager.shutdown()
+
+
 class _CacheTierInitError(Exception):
     pass
 
@@ -763,6 +917,7 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
         return_perf_metrics=False,
         prompt_len=8,
         context_current_position=6,
+        context_remaining_length=2,
         is_first_context_chunk=True,
         is_disagg_generation_init_state=False,
     )
@@ -772,6 +927,7 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
     manager.kv_connector_manager = None
     manager.enable_block_reuse = True
     manager.is_estimating_kv_cache = False
+    manager.is_draft = False
     manager._has_cp_helix = False
     manager.kv_cache_map = {} if fresh_cache else {request.py_request_id: kv_cache}
     manager._stream = SimpleNamespace(cuda_stream=Mock())
@@ -783,6 +939,7 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
     assert manager.prepare_context_cache(request, reuse_limit=2) == 2
 
     assert request.context_current_position == 6
+    assert request.context_chunk_size == 2
     manager._record_branch_snapshot_point.assert_called_once_with(
         request, kv_cache, expected_lookup_tokens
     )

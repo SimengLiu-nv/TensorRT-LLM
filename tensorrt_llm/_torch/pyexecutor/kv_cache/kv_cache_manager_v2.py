@@ -1641,6 +1641,25 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_cache_map: dict[int, _KVCache] = {}
         self._disagg_receive_ready: dict[int, torch.cuda.Event] = {}
         self._request_stats_enabled_ids: set[int] = set()
+        # Incoming transfers do not consume a forward batch slot. With no
+        # eviction tier, full-attention requests must leave enough pages for
+        # their output tokens before another prompt is admitted. Keep logical
+        # reservations: eagerly resizing would also advance the cache cursor.
+        self._disagg_generation_limits: dict[int, int] = {}
+        self._disagg_generation_pool_counts: dict[int, int] = {}
+        if (
+            is_disagg
+            and not self.can_evict
+            and all(
+                isinstance(layer, AttentionLayerConfig)
+                and (layer.window_size is None or layer.window_size >= self.max_seq_len)
+                for layer in config.layers
+            )
+        ):
+            self._disagg_generation_pool_counts = {
+                int(pool.pool_group_index): len(pool.slot_desc.variants)
+                for pool in self.impl.pool_group_descs
+            }
 
         # Lazily built map of layer-group id -> sliding window size, restricted
         # to groups that are actually windowed. Only used by the debug-level
@@ -3644,6 +3663,37 @@ class KVCacheManagerV2(BaseResourceManager):
         target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
         return kv_cache.resize(max(kv_cache.capacity, target))
 
+    def _disagg_generation_limit(self, req: LlmRequest, prompt_len: int) -> int:
+        """Upper bound in ledger blocks, including speculative decode scratch."""
+        output_end = min(self.max_seq_len, prompt_len + req.max_new_tokens)
+        capacity = output_end + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
+        # Matching can share a partial tail page. Reserve its private copy even
+        # when growing that tail does not change the logical block count.
+        blocks = (capacity + self._ledger_tokens_per_block - 1) // self._ledger_tokens_per_block
+        return blocks + int(self.enable_block_reuse)
+
+    def _can_reserve_disagg_generation(self, request_id: int, limit: int) -> bool:
+        """Check each full-attention pool without allocating future KV pages.
+
+        The available counts already exclude resident prompts, generation KV,
+        and outgoing transfers. Add only the unallocated part of each admitted
+        request's completion bound, including transfers awaiting their first
+        decode iteration. Windowed and recurrent caches need a separate bound;
+        they retain their existing admission policy.
+        """
+        cache = self.kv_cache_map[request_id]
+        needed = max(0, limit - cache.num_blocks)
+        for req_id, req_limit in self._disagg_generation_limits.items():
+            if req_id == request_id:
+                continue
+            cache = self.kv_cache_map[req_id]
+            needed += max(0, req_limit - cache.num_blocks)
+        stats = self._get_storage_statistics(GPU_LEVEL)
+        return all(
+            needed * count <= stats[pool_id].available
+            for pool_id, count in self._disagg_generation_pool_counts.items()
+        )
+
     def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
         """Prepare KV cache for a disagg generation init request.
 
@@ -3667,6 +3717,14 @@ class KVCacheManagerV2(BaseResourceManager):
         # Helix requests carry the rank-local strided slice in prompt_len;
         # the global ledger sizes off the full prompt instead.
         prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+        limit = None
+        if self._disagg_generation_pool_counts:
+            limit = self._disagg_generation_limit(req, prompt_len)
+            if not self._can_reserve_disagg_generation(req.py_request_id, limit):
+                # No transfer has started. Release a newly matched prefix too:
+                # suspend alone cannot reclaim uncommitted KV without a tier.
+                self.free_resources(req)
+                return False
         target = prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
@@ -3685,6 +3743,8 @@ class KVCacheManagerV2(BaseResourceManager):
         ready = torch.cuda.Event()
         ready.record(self._stream)
         self._disagg_receive_ready[req.py_request_id] = ready
+        if limit is not None:
+            self._disagg_generation_limits[req.py_request_id] = limit
         return True
 
     def get_history_length(self, req: LlmRequest) -> int | None:
@@ -5383,7 +5443,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.index_mapper.remove_sequence(request_id)
         self._early_freed_index_requests.add(request_id)
 
-    def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+    def free_resources(self, request: LlmRequest, pin_on_release: bool = False) -> None:
         # A request awaiting preemption can still be cancelled or fail while
         # its saves drain. Dropping the entry here keeps a dead request from
         # blocking every later preemption through has_pending_preemption.
@@ -5408,6 +5468,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
+        self._disagg_generation_limits.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
         # The next owner of these pages fills them again; keeping the set would
         # both leak and let a recycled page skip its fill.
@@ -5661,11 +5722,12 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         return bool(has_invalid_values)
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
         self._disagg_receive_ready.clear()
+        self._disagg_generation_limits.clear()
         self._request_stats_enabled_ids.clear()
         self._fresh_pages_filled.clear()
         # Drop the outstanding plans before the manager shuts down: discarding a handle applies
