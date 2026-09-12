@@ -460,6 +460,8 @@ Measure end-to-end time to first token (TTFT) and connector load time separately
 
 For disaggregated serving, tune the generation server's `max_batch_size` and `cuda_graph_config.batch_sizes` together for the intended concurrency. A generation limit chosen for low concurrency can leave requests waiting after a fast prefill or restore. Verify that `max_num_tokens` covers the resulting generation and draft-token budget, and that the resolved GPU KV capacity accommodates the active sequences.
 
+For full-attention models using V2 without an eviction tier, disaggregated decode admission reserves logical GPU-page headroom through each request's output limit, including speculative padding. Incoming transfers may overlap decoding, but cannot consume the pages reserved for admitted requests to finish. The reservation is released when the request finishes or is cancelled; it does not eagerly allocate output pages. Windowed and recurrent caches retain their existing admission policy. This GPU admission budget is separate from the shared Mooncake store capacity.
+
 Size the shared pool from retained payload measured over the complete workload, including warmup and final drain. Concurrency is not proportional to storage demand when conversation trees have different prefix lengths and branching. Check segment capacity, eviction counters, and allocation failures throughout the run, and leave headroom for allocator overhead and newly replayed prefixes.
 
 #### Unsupported configurations
