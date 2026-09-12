@@ -1523,6 +1523,65 @@ class TestDeadlockDetection:
         with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
             sched.schedule_request(reqs, set())
 
+    @pytest.mark.parametrize("transfer_count", [1, 2])
+    @pytest.mark.parametrize("pages_released", [True, False])
+    def test_executor_waits_for_kv_transfer_ownership(
+        self, transfer_count: int, pages_released: bool
+    ) -> None:
+        """Retained KV pages can block prefill after its owner left the active list."""
+        from tensorrt_llm._torch.disaggregation.executor.transfer_manager import (
+            AsyncTransferManager,
+        )
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        blocked = make_ctx_request(0, 100, is_first_context_chunk=False)
+        retained = make_filtered_request(99)
+        resources = Mock()
+        resources.resource_managers = {ResourceManagerType.KV_CACHE_MANAGER: mgr}
+        transfers = AsyncTransferManager(resources, should_store_blocks=False)
+        # One owner models native disaggregation; two model a concurrent
+        # connector save. The request is no longer in the model's active list.
+        for _ in range(transfer_count):
+            transfers.start_transfer(retained)
+
+        executor = object.__new__(PyExecutor)
+        executor.scheduler = sched
+        executor.kv_cache_manager = mgr
+        executor.async_transfer_manager = transfers
+        executor.active_requests = [blocked]
+        executor.inflight_req_ids = set()
+        executor.enable_attention_dp = True
+        executor.attention_dp_enable_balance = False
+        executor.is_encoder_decoder = False
+        executor._cap_context_by_total_kv_len = Mock(side_effect=lambda requests: requests)
+
+        for owners_left in range(transfer_count, 0, -1):
+            for _ in range(sched._DEADLOCK_STALL_ITERS + 1):
+                batch, _, _ = executor._schedule()
+                assert batch.batch_size == 0
+            assert transfers.end_transfer(retained) == (owners_left == 1)
+
+        assert not transfers.has_any_inflight_requests()
+        if pages_released:
+            mgr.resize_context.side_effect = None
+            mgr.resize_context.return_value = True
+            batch, _, _ = executor._schedule()
+            assert batch.context_requests == [blocked]
+        else:
+            # A persistent allocation failure after all transfer owners retire
+            # must still trip the original deadlock guard.
+            for _ in range(sched._DEADLOCK_STALL_ITERS - 1):
+                executor._schedule()
+            with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+                executor._schedule()
+
     def test_transient_stall_does_not_raise(self):
         """One bad iteration is normal; the counter has to reset."""
         fail = [True]

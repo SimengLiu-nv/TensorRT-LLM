@@ -265,8 +265,21 @@ class KVCacheV2Scheduler(RequestScheduler):
         return self.no_schedule_until_state, self.no_schedule_after_state
 
     def schedule_request(
-        self, active_requests: RequestList, inflight_request_ids: set[int]
+        self,
+        active_requests: RequestList,
+        inflight_request_ids: set[int],
+        *,
+        has_pending_kv_transfers: bool = False,
     ) -> SchedulerOutput:
+        """Schedule work while allowing pending KV transfers to release pages.
+
+        Args:
+            active_requests: Requests still participating in model execution.
+            inflight_request_ids: Requests held by queued model work.
+            has_pending_kv_transfers: Whether completed requests still retain
+                their KV pages for asynchronous transfer. They may already be
+                absent from active_requests.
+        """
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
         # Main scheduling loop
         (
@@ -277,7 +290,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             recompute_paused,
             disagg_candidates,
             has_chunking,
-        ) = self._schedule_loop(active_requests, inflight_request_ids)
+        ) = self._schedule_loop(
+            active_requests,
+            inflight_request_ids,
+            has_pending_kv_transfers=has_pending_kv_transfers,
+        )
 
         # Sort by LoRA task ID
         scheduled_encoder.sort(key=_get_lora_task_id)
@@ -295,7 +312,13 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     # ---- Main scheduling loop ----
 
-    def _schedule_loop(self, active_requests, inflight_request_ids):
+    def _schedule_loop(
+        self,
+        active_requests: RequestList,
+        inflight_request_ids: set[int],
+        *,
+        has_pending_kv_transfers: bool = False,
+    ) -> tuple[RequestList, RequestList, RequestList, RequestList, RequestList, RequestList, bool]:
         scheduled_ctx: RequestList = []
         scheduled_encoder: RequestList = []
         scheduled_gen: RequestList = []
@@ -546,6 +569,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 or evicted
                 or recompute_paused
             ),
+            has_pending_kv_transfers=has_pending_kv_transfers,
         )
 
         return (
@@ -1461,6 +1485,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         pending_ctx: RequestList,
         preempted_ids: set[int],
         made_progress: bool,
+        has_pending_kv_transfers: bool = False,
     ) -> None:
         """Fail loudly when no request can be scheduled or reclaimed.
 
@@ -1470,7 +1495,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         generation ones because a disaggregated prefill server has no
         generation requests at all.
         """
-        if made_progress:
+        # Finished requests can leave active_requests while native KV sends
+        # or connector saves retain their pages. The executor keeps polling
+        # those transfers and enforcing their timeout while no batch fits.
+        # Counting that wait as a scheduling deadlock can abort a healthy
+        # prefill worker before the decode worker admits its pending transfers.
+        if made_progress or has_pending_kv_transfers:
             self._stalled_schedules = 0
             return
 
