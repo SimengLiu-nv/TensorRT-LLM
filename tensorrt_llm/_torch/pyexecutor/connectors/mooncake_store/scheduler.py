@@ -144,24 +144,32 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         )
         return hit_blocks * self._tokens_per_block, False
 
-    def cancel_load(self, request: LlmRequest, start: int, end: int):
-        """Drop offered blocks whose tokens the runtime will not consume.
+    def cancel_load(self, request: LlmRequest, start: int, end: int) -> None:
+        """Trim a leading or trailing range from an unconsumed load offer.
 
-        Loads here are synchronous and nothing has been transferred yet, so this
-        is exact: the offer is truncated before `build_connector_meta` turns it
-        into work.
+        The local cache can overtake the beginning of an offer while scheduling
+        waits. Preserve the remaining suffix in that case: the runtime still
+        counts it as externally loaded. Tail cancellation instead releases
+        blocks for which the runtime could not reserve pages.
         """
         state = self._requests.get(request.request_id)
-        if state is None or state.load_blocks == 0:
+        if state is None or state.load_blocks == 0 or end <= start:
             return
-        kept = 0
-        for offset in range(state.load_blocks):
-            block = state.load_first_block + offset
-            block_start = block * self._tokens_per_block
-            if block_start + self._tokens_per_block > start and block_start < end:
-                break
-            kept += 1
-        state.load_blocks = kept
+        first = state.load_first_block
+        last = first + state.load_blocks
+        cancel_first = max(first, start // self._tokens_per_block)
+        cancel_last = min(last, (end + self._tokens_per_block - 1) // self._tokens_per_block)
+        if cancel_first >= cancel_last:
+            return
+        if cancel_first == first:
+            state.load_first_block = cancel_last
+            state.load_blocks = last - cancel_last
+        elif cancel_last == last:
+            state.load_blocks = cancel_first - first
+        else:
+            raise ValueError(
+                "Mooncake load cancellation must trim the beginning or end of an offer"
+            )
 
     def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
         """No-op: page indices are read from the scheduler output instead.
