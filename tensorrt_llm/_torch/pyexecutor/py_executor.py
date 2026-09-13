@@ -6530,13 +6530,9 @@ class PyExecutor:
         return context_requests
 
     @nvtx_range("_schedule")
-<<<<<<< HEAD
-    def _schedule(self):
+    def _schedule(self) -> Tuple[ScheduledRequests, List[LlmRequest], int]:
         self._maybe_record_hang_diagnostic_phase("scheduling",
                                                  forward_completion="clear")
-=======
-    def _schedule(self) -> Tuple[ScheduledRequests, List[LlmRequest], int]:
->>>>>>> b71f0eebb8 ([None][fix] Allow pending KV transfers to release scheduler capacity)
         if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)

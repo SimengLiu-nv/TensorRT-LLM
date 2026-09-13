@@ -225,6 +225,7 @@ else:
         commit_min_snapshot: bool = False
         enable_stats: bool = True
         text_only: bool = False
+        reuse_match_alignment: int = 1
 
     KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
     del _KVCacheManagerConfigFieldSpec, _dataclasses

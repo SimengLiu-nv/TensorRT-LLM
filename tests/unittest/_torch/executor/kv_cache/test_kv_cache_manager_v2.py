@@ -94,8 +94,8 @@ def test_disagg_generation_reserves_unallocated_pages_in_every_pool(
 ) -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager.tokens_per_block = 4
-    manager._disagg_generation_limits = limits
-    manager._disagg_generation_pool_counts = {i: 1 for i in range(len(available))}
+    manager._disagg_completion_limits = limits
+    manager._disagg_completion_pool_counts = {i: 1 for i in range(len(available))}
     manager.kv_cache_map = {
         i + 1: Mock(capacity=capacity, num_blocks=(capacity + 3) // 4)
         for i, capacity in enumerate(capacities)
@@ -103,9 +103,9 @@ def test_disagg_generation_reserves_unallocated_pages_in_every_pool(
     manager._get_storage_statistics = Mock(
         return_value=[SimpleNamespace(available=count) for count in available]
     )
-    assert manager._can_reserve_disagg_generation(2, candidate_limit) is expected
+    assert manager._can_reserve_disagg_completion(2, candidate_limit) is expected
     # Admission checking neither consumes the reservation nor mutates cache cursors.
-    assert manager._disagg_generation_limits == limits
+    assert manager._disagg_completion_limits == limits
     for cache in manager.kv_cache_map.values():
         cache.resize.assert_not_called()
 
@@ -127,14 +127,14 @@ def test_disagg_generation_counts_pool_variants_and_speculative_padding(
     # Clamp model sequence length, then retain extra KV, draft, and base-token padding.
     limit = manager._disagg_generation_limit(request, 24)
     assert limit == expected_blocks + int(enable_block_reuse)
-    manager._disagg_generation_limits = {}
-    manager._disagg_generation_pool_counts = {0: 2}
+    manager._disagg_completion_limits = {}
+    manager._disagg_completion_pool_counts = {0: 2}
     manager.kv_cache_map = {1: Mock(capacity=0, num_blocks=0)}
     stats = SimpleNamespace(available=2 * limit - 1)
     manager._get_storage_statistics = Mock(return_value=[stats])
-    assert not manager._can_reserve_disagg_generation(1, limit)
+    assert not manager._can_reserve_disagg_completion(1, limit)
     stats.available = 2 * limit
-    assert manager._can_reserve_disagg_generation(1, limit)
+    assert manager._can_reserve_disagg_completion(1, limit)
 
 
 @pytest.mark.parametrize("reserve_growth", [False, True])
@@ -171,9 +171,9 @@ def test_disagg_generation_progress_under_real_gpu_page_pressure(
         vocab_size=4096,
         is_disagg=True,
     )
-    assert manager._disagg_generation_pool_counts == {0: 1}
+    assert manager._disagg_completion_pool_counts == {0: 1}
     if not reserve_growth:
-        manager._disagg_generation_pool_counts.clear()
+        manager._disagg_completion_pool_counts.clear()
     total_blocks = manager.get_kv_cache_stats().max_num_blocks
     prompt_len = total_blocks // 3 * manager.tokens_per_block
     assert prompt_len >= 8
@@ -202,17 +202,17 @@ def test_disagg_generation_progress_under_real_gpu_page_pressure(
         first.state = LlmRequestState.GENERATION_IN_PROGRESS
         if reserve_growth:
             assert 2 not in manager.kv_cache_map
-            assert 2 not in manager._disagg_generation_limits
+            assert 2 not in manager._disagg_completion_limits
             assert manager.prepare_disagg_gen_init(short)
             for _ in range(prompt_len):
                 assert manager.try_allocate_generation(first)
             manager.free_resources(first)
-            assert 1 not in manager._disagg_generation_limits
+            assert 1 not in manager._disagg_completion_limits
             assert manager.prepare_disagg_gen_init(second)
             # Cancellation must return both the physical pages and the logical bound.
             manager.free_resources(second)
             manager.free_resources(short)
-            assert not manager._disagg_generation_limits
+            assert not manager._disagg_completion_limits
             assert manager.get_kv_cache_stats().free_num_blocks == total_blocks
         else:
             second.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -292,6 +292,7 @@ def _make_cache_config_for_test(
     cache_manager = object.__new__(KVCacheManagerV2)
     cache_manager.kv_cache_type = kv_cache_type
     cache_manager.dtype = dtype
+    cache_manager.kv_connector_manager = None
     cache_manager.head_dim_per_layer = [128] * len(pp_layers)
     cache_manager.enable_swa_scratch_reuse = False
     cache_manager.num_extra_kv_tokens = num_extra_kv_tokens
@@ -1340,6 +1341,7 @@ def _revert_context_request(request_id: int) -> SimpleNamespace:
         prompt_len=512,
         context_current_position=256,
         context_chunk_size=192,
+        is_first_context_chunk=False,
         estimated_reusable_tokens=128,
         set_prepopulated_prompt_len=Mock(),
     )
