@@ -1660,12 +1660,13 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_map: dict[int, _KVCache] = {}
         self._request_stats_enabled_ids: set[int] = set()
-        # Incoming transfers do not consume a forward batch slot. With no
-        # eviction tier, full-attention requests must leave enough pages for
-        # their output tokens before another prompt is admitted. Keep logical
-        # reservations: eagerly resizing would also advance the cache cursor.
-        self._disagg_generation_limits: dict[int, int] = {}
-        self._disagg_generation_pool_counts: dict[int, int] = {}
+        # With no eviction tier, full-attention requests must reserve enough
+        # pages to finish before another prompt is admitted. Decode reserves
+        # output growth; connector prefill reserves its remaining prompt so a
+        # later restore is not truncated by other requests' chunk allocations.
+        # Keep logical reservations instead of eagerly allocating future pages.
+        self._disagg_completion_limits: dict[int, int] = {}
+        self._disagg_completion_pool_counts: dict[int, int] = {}
         if (
             is_disagg
             and not self.can_evict
@@ -1675,7 +1676,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 for layer in config.layers
             )
         ):
-            self._disagg_generation_pool_counts = {
+            self._disagg_completion_pool_counts = {
                 int(pool.pool_group_index): len(pool.slot_desc.variants)
                 for pool in self.impl.pool_group_descs
             }
@@ -2856,6 +2857,15 @@ class KVCacheManagerV2(BaseResourceManager):
             # A paired scheduler caps the claim by retaining D evidence past the
             # common usable depth, so this still trims exactly once.
             reuse_match_backoff=self.reuse_match_backoff,
+            # Disabling partial radix matching alone is insufficient: MTP
+            # lookahead backoff can still turn a whole block into a partial
+            # local claim, which prevents a whole-block connector lookup.
+            reuse_match_alignment=(
+                self._ledger_tokens_per_block
+                if self.kv_connector_manager is not None
+                and not kv_cache_config.enable_partial_reuse
+                else 1
+            ),
             enable_stats=self.enable_stats,
             swa_scratch_reuse=scratch_reuse_config,
             commit_min_snapshot=(
@@ -3387,6 +3397,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """Undo this iteration's context resize. False means the cache was dropped,
         not shrunk (history outran pre-resize capacity); the caller drops any draft pool.
         """
+        self._release_unconsumed_context_reservation(req)
         pre_cap = getattr(req, "py_ctx_pre_resize_cap", None)
         if pre_cap is None:
             return True
@@ -3591,6 +3602,37 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return False
 
+    def reserve_context_completion(self, req: LlmRequest) -> bool:
+        """Reserve a connector prefill's future pages before chunk allocation.
+
+        False means defer admission, without preempting an admitted request.
+        Conservative lookup runs after the batch has allocated its chunks, so
+        those chunks must leave room for each admitted request's full restore.
+        """
+        if not (
+            req.is_first_context_chunk
+            and self.kv_connector_manager is not None
+            and self._disagg_completion_pool_counts
+            and self._connector_may_serve(req)
+            and not self._connector_budgets_prefix()
+        ):
+            return True
+        if req.py_request_id in self._disagg_completion_limits:
+            return True
+        limit = self._disagg_context_limit(req)
+        if not self._can_reserve_disagg_completion(req.py_request_id, limit):
+            # No connector query or load has run. Release the local claim so
+            # retries can match fresh reuse evidence without holding pages.
+            self.free_resources(req)
+            return False
+        self._disagg_completion_limits[req.py_request_id] = limit
+        return True
+
+    def _release_unconsumed_context_reservation(self, req: LlmRequest) -> None:
+        """Return a first chunk's quota if neither load nor forward consumed it."""
+        if req.is_first_context_chunk and not req.py_connector_allocation_reported:
+            self._disagg_completion_limits.pop(req.py_request_id, None)
+
     def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.
 
@@ -3625,6 +3667,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             if req.is_first_context_chunk:
                 kv_cache.suspend()
+                self._release_unconsumed_context_reservation(req)
             return False
         self._fill_fresh_kv_pages(req.py_request_id)
         self._log_window_crossing(req, kv_cache, pre_cap, capacity, "context")
@@ -3643,27 +3686,35 @@ class KVCacheManagerV2(BaseResourceManager):
         target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
         return kv_cache.resize(max(kv_cache.capacity, target))
 
+    def _disagg_context_limit(self, req: LlmRequest) -> int:
+        """Prompt completion bound for a connector prefill, in ledger blocks."""
+        return self._disagg_completion_limit(req.prompt_len)
+
     def _disagg_generation_limit(self, req: LlmRequest, prompt_len: int) -> int:
         """Upper bound in ledger blocks, including speculative decode scratch."""
         output_end = min(self.max_seq_len, prompt_len + req.max_new_tokens)
-        capacity = output_end + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
+        return self._disagg_completion_limit(output_end)
+
+    def _disagg_completion_limit(self, end: int) -> int:
+        """Include speculative scratch and a private copy of a reused tail."""
+        capacity = end + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
         # Matching can share a partial tail page. Reserve its private copy even
         # when growing that tail does not change the logical block count.
         blocks = (capacity + self._ledger_tokens_per_block - 1) // self._ledger_tokens_per_block
         return blocks + int(self.enable_block_reuse)
 
-    def _can_reserve_disagg_generation(self, request_id: int, limit: int) -> bool:
+    def _can_reserve_disagg_completion(self, request_id: int, limit: int) -> bool:
         """Check each full-attention pool without allocating future KV pages.
 
         The available counts already exclude resident prompts, generation KV,
         and outgoing transfers. Add only the unallocated part of each admitted
-        request's completion bound, including transfers awaiting their first
-        decode iteration. Windowed and recurrent caches need a separate bound;
-        they retain their existing admission policy.
+        request's completion bound, including incoming transfers and connector
+        context chunks awaiting their first forward pass. Windowed and
+        recurrent caches retain their existing admission policy.
         """
         cache = self.kv_cache_map[request_id]
         needed = max(0, limit - cache.num_blocks)
-        for req_id, req_limit in self._disagg_generation_limits.items():
+        for req_id, req_limit in self._disagg_completion_limits.items():
             if req_id == request_id:
                 continue
             cache = self.kv_cache_map[req_id]
@@ -3671,7 +3722,7 @@ class KVCacheManagerV2(BaseResourceManager):
         stats = self._get_storage_statistics(GPU_LEVEL)
         return all(
             needed * count <= stats[pool_id].available
-            for pool_id, count in self._disagg_generation_pool_counts.items()
+            for pool_id, count in self._disagg_completion_pool_counts.items()
         )
 
     def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
@@ -3698,9 +3749,9 @@ class KVCacheManagerV2(BaseResourceManager):
         # the global ledger sizes off the full prompt instead.
         prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
         limit = None
-        if self._disagg_generation_pool_counts:
+        if self._disagg_completion_pool_counts:
             limit = self._disagg_generation_limit(req, prompt_len)
-            if not self._can_reserve_disagg_generation(req.py_request_id, limit):
+            if not self._can_reserve_disagg_completion(req.py_request_id, limit):
                 # No transfer has started. Release a newly matched prefix too:
                 # suspend alone cannot reclaim uncommitted KV without a tier.
                 self.free_resources(req)
@@ -3718,7 +3769,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._log_window_crossing(req, kv_cache, pre_cap, capacity, "disagg_gen_init")
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         if limit is not None:
-            self._disagg_generation_limits[req.py_request_id] = limit
+            self._disagg_completion_limits[req.py_request_id] = limit
         return True
 
     def get_history_length(self, req: LlmRequest) -> int | None:
@@ -4123,6 +4174,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 num_tokens,
             )
         self.kv_connector_manager.commit_new_matched_tokens(req, position - local_end, load_async)
+        if os.getenv("TLLM_KV_CONNECTOR_REUSE_DIAGNOSTICS") == "1":
+            logger.info(
+                f"KV_CONNECTOR_REUSE request_id={req.py_request_id} "
+                f"prompt_tokens={req.prompt_len} local_tokens={local_end} "
+                f"offered_tokens={num_tokens} honored_tokens={position - local_end} "
+                f"capacity={kv_cache.capacity} chunk_tokens={req.context_chunk_size}"
+            )
         return position > local_end
 
     def _reserve_connector_prefix(
@@ -5407,7 +5465,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
-        self._disagg_generation_limits.pop(request.py_request_id, None)
+        self._disagg_completion_limits.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
         # The next owner of these pages fills them again; keeping the set would
         # both leak and let a recycled page skip its fill.
@@ -5664,7 +5722,7 @@ class KVCacheManagerV2(BaseResourceManager):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
-        self._disagg_generation_limits.clear()
+        self._disagg_completion_limits.clear()
         self._request_stats_enabled_ids.clear()
         self._fresh_pages_filled.clear()
         # Drop the outstanding plans before the manager shuts down: discarding a handle applies
