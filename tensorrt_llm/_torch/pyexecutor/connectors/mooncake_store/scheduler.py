@@ -209,6 +209,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             loads = self._loads_for(state, request_data)
             if loads.pages:
                 metadata.loads.append(loads)
+            num_loaded_tokens = state.load_blocks * self._tokens_per_block
 
             # Whatever the store just supplied, and whatever the local cache
             # matched, is not ours to write back: the store already has the
@@ -219,7 +220,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             state.load_blocks = 0
 
             if self._config.role.saves:
-                saves = self._saves_for(state, request_data)
+                saves = self._saves_for(state, request_data, num_loaded_tokens)
                 if saves.pages:
                     state.emitted_saves = True
                     metadata.saves.append(saves)
@@ -296,12 +297,18 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             self._append_pages(state, transfers, block)
         return transfers
 
-    def _saves_for(self, state: _RequestState, request_data: RequestData) -> RequestTransfers:
+    def _saves_for(
+        self, state: _RequestState, request_data: RequestData, num_loaded_tokens: int
+    ) -> RequestTransfers:
         transfers = RequestTransfers(request_data.request_id)
         # Prompt hashes are known before prefill. Capacity and scratch pages
         # can also run ahead of computation. The worker waits for this forward
         # pass before saving, so only its completed full blocks are publishable.
-        computed_end = request_data.computed_position + request_data.num_scheduled_tokens
+        # The initial scheduler position excludes this iteration's connector
+        # restore. Add it back before locating the newly computed tail.
+        computed_end = (
+            request_data.computed_position + num_loaded_tokens + request_data.num_scheduled_tokens
+        )
         limit = min(self._addressable_blocks(state), computed_end // self._tokens_per_block)
         for block in range(state.saved_upto, limit):
             self._append_pages(state, transfers, block)

@@ -1042,6 +1042,46 @@ def test_scheduler_publishes_only_computed_full_blocks(store_config: Path) -> No
         assert [page.page_index for page in metadata.saves[0].pages] == [4 + ordinal]
 
 
+@pytest.mark.parametrize("local_blocks", [0, 1])
+@pytest.mark.parametrize("use_mtp", [False, True])
+def test_scheduler_saves_computed_tail_after_restore(
+    store_config: Path, local_blocks: int, use_mtp: bool
+) -> None:
+    config = MTPDecodingConfig(max_draft_len=1) if use_mtp else None
+    scheduler = make_scheduler(store_config, hit_blocks=2, speculative_config=config)
+    tokens = list(range(6 * TOKENS_PER_BLOCK + 1))
+    scheduler.get_num_new_matched_tokens(make_request(1, tokens), local_blocks * TOKENS_PER_BLOCK)
+    # The scheduler subtracts connector restores from computed_position.
+    # Full prompt hashes and capacity pages are available ahead of computation.
+    data = request_data(
+        1,
+        tokens,
+        list(range(10, 17)),
+        computed_position=local_blocks * TOKENS_PER_BLOCK,
+        num_scheduled_tokens=TOKENS_PER_BLOCK + 1,
+    )
+    metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    tail_block = local_blocks + 2
+    assert [page.page_index for page in metadata.loads[0].pages] == [
+        10 + local_blocks,
+        11 + local_blocks,
+    ]
+    assert [page.page_index for page in metadata.saves[0].pages] == [10 + tail_block]
+
+    # A later chunk includes the restored prefix in its position. Count the
+    # restore only once, and wait for this partial page to become complete.
+    data = request_data(
+        1,
+        [],
+        [],
+        computed_position=(tail_block + 1) * TOKENS_PER_BLOCK + 1,
+        num_scheduled_tokens=TOKENS_PER_BLOCK - 1,
+    )
+    metadata = scheduler.build_connector_meta(SchedulerOutput(cached_requests=[data]))
+    assert metadata.loads == []
+    assert [page.page_index for page in metadata.saves[0].pages] == [11 + tail_block]
+
+
 def test_scheduler_mtp_keys_require_matching_lookahead(store_config: Path) -> None:
     tokens = list(range(3 * TOKENS_PER_BLOCK))
     other_tokens = list(tokens)
