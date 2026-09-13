@@ -3044,6 +3044,8 @@ def test_non_last_pp_rank_drains_every_relay_send():
 
     waited = sorted(call.args[1] for call in executor.wait_on_pp_send_handles.call_args_list)
     assert waited == [0, 1, 2, 3]
+
+
 # ---------------------------------------------------------------------------
 # aggressive_prefix_budgeting bring-up.
 #
