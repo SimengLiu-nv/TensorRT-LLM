@@ -22,6 +22,8 @@ plain integers, which is all the addressing arithmetic needs.
 import contextlib
 import json
 import time
+from collections.abc import Sequence
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -67,7 +69,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import (
     MooncakeStoreConnectorWorker,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.registry import uses_connector
-from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, MTPDecodingConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 TOKENS_PER_BLOCK = 4
@@ -168,7 +170,7 @@ def store_config(tmp_path, monkeypatch):
     return path
 
 
-def make_llm_args():
+def make_llm_args(*, speculative_config: MTPDecodingConfig | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         model="/models/test-model",
         kv_cache_config=SimpleNamespace(tokens_per_block=TOKENS_PER_BLOCK),
@@ -176,6 +178,7 @@ def make_llm_args():
         pipeline_parallel_size=1,
         context_parallel_size=1,
         sparse_attention_config=None,
+        speculative_config=speculative_config,
     )
 
 
@@ -263,6 +266,32 @@ def test_hash_chain_rejects_shrinking_token_list():
     chain.extend(list(range(2 * TOKENS_PER_BLOCK)))
     with pytest.raises(ValueError, match="shrank"):
         chain.extend(list(range(TOKENS_PER_BLOCK)))
+
+
+@pytest.mark.parametrize("lookahead", [1, TOKENS_PER_BLOCK + 1])
+def test_hash_chain_requires_lookahead_and_matches_incremental_extension(lookahead: int) -> None:
+    tokens = list(range(4 * TOKENS_PER_BLOCK + lookahead))
+    chain = BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead)
+    assert chain.extend(tokens[: TOKENS_PER_BLOCK + lookahead - 1]) == []
+    assert len(chain.extend(tokens[: TOKENS_PER_BLOCK + lookahead])) == 1
+    for end in range(TOKENS_PER_BLOCK + lookahead + 1, len(tokens) + 1):
+        chain.extend(tokens[:end])
+    assert len(chain.hashes) == 4
+    assert chain.hashes == BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead).extend(
+        tokens
+    )
+
+    divergent = list(tokens)
+    divergent[TOKENS_PER_BLOCK + lookahead - 1] += 1000
+    assert (
+        chain.hashes[0]
+        != BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead).extend(divergent)[0]
+    )
+
+
+def test_hash_chain_rejects_negative_lookahead() -> None:
+    with pytest.raises(ValueError, match="prompt_lookahead"):
+        BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=-1)
 
 
 def test_key_namespace_separates_every_dimension():
@@ -870,21 +899,37 @@ class FakeWorker:
         return min(self.hit_blocks, len(block_hashes))
 
 
-def make_scheduler(store_config, hit_blocks=0):
-    scheduler = MooncakeStoreConnectorScheduler(make_llm_args())
+def make_scheduler(
+    store_config: Path,
+    hit_blocks: int = 0,
+    speculative_config: MTPDecodingConfig | None = None,
+) -> MooncakeStoreConnectorScheduler:
+    scheduler = MooncakeStoreConnectorScheduler(
+        make_llm_args(speculative_config=speculative_config)
+    )
     scheduler._worker = FakeWorker(hit_blocks)
     return scheduler
 
 
-def request_data(request_id, new_tokens, page_indices, layer_group_id=0):
+def request_data(
+    request_id: int,
+    new_tokens: Sequence[int],
+    page_indices: Sequence[int],
+    layer_group_id: int = 0,
+    *,
+    computed_position: int = 0,
+    num_scheduled_tokens: int | None = None,
+) -> RequestData:
     by_layer_group = [[] for _ in range(layer_group_id + 1)]
     by_layer_group[layer_group_id] = list(page_indices)
     return RequestData(
         request_id=request_id,
         new_tokens=list(new_tokens),
         new_block_ids=list(page_indices),
-        computed_position=0,
-        num_scheduled_tokens=len(new_tokens),
+        computed_position=computed_position,
+        num_scheduled_tokens=(
+            len(new_tokens) if num_scheduled_tokens is None else num_scheduled_tokens
+        ),
         new_block_ids_by_layer_group=by_layer_group,
     )
 
@@ -943,7 +988,7 @@ def test_scheduler_builds_loads_for_the_offered_blocks(store_config):
     assert [page.page_index for page in metadata.saves[0].pages] == [12, 13, 14]
 
 
-def test_scheduler_does_not_resave_blocks_across_iterations(store_config):
+def test_scheduler_does_not_resave_blocks_across_iterations(store_config: Path) -> None:
     scheduler = make_scheduler(store_config, hit_blocks=0)
     tokens = list(range(2 * TOKENS_PER_BLOCK))
     request = make_request(1, tokens)
@@ -957,7 +1002,11 @@ def test_scheduler_does_not_resave_blocks_across_iterations(store_config):
     # A generation step completes one more block; only that block is saved.
     more_tokens = list(range(2 * TOKENS_PER_BLOCK, 3 * TOKENS_PER_BLOCK))
     second = scheduler.build_connector_meta(
-        SchedulerOutput(cached_requests=[request_data(1, more_tokens, [6])])
+        SchedulerOutput(
+            cached_requests=[
+                request_data(1, more_tokens, [6], computed_position=2 * TOKENS_PER_BLOCK)
+            ]
+        )
     )
     assert [page.page_index for page in second.saves[0].pages] == [6]
 
@@ -973,6 +1022,44 @@ def test_scheduler_waits_for_a_block_to_fill_before_saving(store_config):
     )
     # Page 5 holds a single token, so only the full block is offered up.
     assert [page.page_index for page in metadata.saves[0].pages] == [4]
+
+
+def test_scheduler_publishes_only_computed_full_blocks(store_config: Path) -> None:
+    scheduler = make_scheduler(store_config)
+    tokens = list(range(3 * TOKENS_PER_BLOCK + 1))
+    scheduler.get_num_new_matched_tokens(make_request(1, tokens), 0)
+    data = request_data(1, tokens, [4, 5, 6, 7], num_scheduled_tokens=TOKENS_PER_BLOCK - 1)
+    first = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    assert first.saves == []
+
+    # Full prompt hashes and every capacity page were reported up front, but
+    # no page may be published until its final token has actually been computed.
+    for ordinal in range(3):
+        computed = TOKENS_PER_BLOCK - 1 if ordinal == 0 else ordinal * TOKENS_PER_BLOCK
+        scheduled = 1 if ordinal == 0 else TOKENS_PER_BLOCK
+        data = request_data(1, [], [], computed_position=computed, num_scheduled_tokens=scheduled)
+        metadata = scheduler.build_connector_meta(SchedulerOutput(cached_requests=[data]))
+        assert [page.page_index for page in metadata.saves[0].pages] == [4 + ordinal]
+
+
+def test_scheduler_mtp_keys_require_matching_lookahead(store_config: Path) -> None:
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    other_tokens = list(tokens)
+    other_tokens[TOKENS_PER_BLOCK] += 1000
+    config = MTPDecodingConfig(max_draft_len=1)
+    scheduler = make_scheduler(store_config, hit_blocks=99, speculative_config=config)
+    scheduler.get_num_new_matched_tokens(make_request(1, tokens), 0)
+    scheduler.get_num_new_matched_tokens(make_request(2, other_tokens), 0)
+    first, other = scheduler._worker.queries
+    assert first == list(BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=1).extend(tokens))
+    assert first[0] != other[0]
+    assert first[0] != BlockHashChain(TOKENS_PER_BLOCK).extend(tokens)[0]
+
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(2, other_tokens, [4, 5, 6])])
+    )
+    assert len(metadata.loads[0].pages) == 2
+    assert metadata.saves == []  # The final block lacks the draft's following token.
 
 
 def test_scheduler_saves_nothing_as_a_consumer(store_config, monkeypatch):

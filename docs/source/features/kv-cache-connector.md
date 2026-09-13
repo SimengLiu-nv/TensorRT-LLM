@@ -442,11 +442,17 @@ In a disaggregated deployment, run context servers as `both` and leave generatio
 
 The store is addressed by whole blocks. The connector is handed the device match as `num_computed_tokens` and offers only blocks beyond it, but it can resume only from a block boundary, so when the device match ends mid-block it declines the lookup and the store is not consulted at all. Partial reuse is precisely what puts the match off a boundary, so it trades part of one block of device reuse for every stored block of the remaining prefix. Measured on MiniMax-M3, leaving it enabled declined 97.2% of lookups and left actual prompt cache read at 35% against a 96% ceiling; forcing it off raised that to 94% and roughly doubled throughput.
 
+For one-model speculative decoding such as MTP, V2 also aligns the final local reuse claim after applying the required prompt lookahead backoff. Disabling partial radix matching alone does not keep this claim aligned: a one-token backoff can turn a complete block into a partial local prefix and suppress the whole store lookup. Alignment discards at most the remaining partial block while retaining the lookahead safety requirement, so Mooncake can load the stored suffix.
+
 #### How it keys pages
 
 `KVCacheManagerV2` reports `RequestData.block_hashes` empty, so the connector derives block identity itself: a blake2b chain where each block's hash covers its own tokens *and* every token before it, seeded by the request's `cache_salt`. A key is `<prefix>/<model>/w<world size>r<rank>/lg<layer group>/t<tokens per block>b<bytes per page>/<block hash>`. The namespace pins down everything that would make the stored bytes mean something different, so a mismatched shard count, layer group or page geometry reads as a cache miss rather than as garbage.
 
 The value for one key is the concatenation of that layer group's regions for one page slot, handed to Mooncake's multi-buffer batch APIs as a list of `(address, size)` pairs.
+
+For a one-model draft with a known prompt lookahead, each block hash also covers the following lookahead tokens. The hash seed identifies the lookahead length, so these entries cannot alias older token-only entries. A stored target-plus-draft page must match the tokens that produced both caches, including draft inputs beyond the block boundary.
+
+The scheduler publishes only complete blocks covered by the upcoming forward pass; the worker waits for that pass before reading them. Prompt hashes, allocated capacity, and speculative scratch can exist before their KV values are valid, so their presence alone does not make a page ready to save. The versioned hash seed makes entries written before this completed-block validation appear as misses after an upgrade.
 
 #### Transfer behavior
 
@@ -461,6 +467,8 @@ Measure end-to-end time to first token (TTFT) and connector load time separately
 For disaggregated serving, tune the generation server's `max_batch_size` and `cuda_graph_config.batch_sizes` together for the intended concurrency. A generation limit chosen for low concurrency can leave requests waiting after a fast prefill or restore. Verify that `max_num_tokens` covers the resulting generation and draft-token budget, and that the resolved GPU KV capacity accommodates the active sequences.
 
 For full-attention models using V2 without an eviction tier, disaggregated decode admission reserves logical GPU-page headroom through each request's output limit, including speculative padding. Incoming transfers may overlap decoding, but cannot consume the pages reserved for admitted requests to finish. The reservation is released when the request finishes or is cancelled; it does not eagerly allocate output pages. Windowed and recurrent caches retain their existing admission policy. This GPU admission budget is separate from the shared Mooncake store capacity.
+
+Under the same full-attention, disaggregated, no-eviction-tier conditions, the default connector prefill path reserves headroom through the end of each admitted prompt. Chunk allocation remains incremental. A new request waits for GPU headroom before querying the connector, which prevents other requests' small chunks from consuming the space needed to restore its matching prefix. Returning an unconsumed first chunk to the queue releases its reservation; request completion and cancellation release it too. This policy applies when `aggressive_prefix_budgeting=False`. Store residency alone does not establish a cache hit: the prefix must match and the receiving GPU must have room to restore it.
 
 Size the shared pool from retained payload measured over the complete workload, including warmup and final drain. Concurrency is not proportional to storage demand when conversation trees have different prefix lengths and branching. Check segment capacity, eviction counters, and allocation failures throughout the run, and leave headroom for allocator overhead and newly replayed prefixes.
 
