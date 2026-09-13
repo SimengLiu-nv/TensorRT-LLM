@@ -28,6 +28,7 @@ bookkeeping make that possible, and both exist because
 
 from typing import Dict, List, Optional, Tuple
 
+from tensorrt_llm._torch.speculative.interface import draft_prompt_lookahead
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
@@ -81,6 +82,9 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         validate_llm_args(llm_args)
         self._config = MooncakeStoreConnectorConfig.from_env()
         self._tokens_per_block = int(llm_args.kv_cache_config.tokens_per_block)
+        self._prompt_lookahead = (
+            draft_prompt_lookahead(getattr(llm_args, "speculative_config", None)) or 0
+        )
         self._requests: Dict[int, _RequestState] = {}
         self._worker: Optional[MooncakeStoreConnectorWorker] = None
 
@@ -252,7 +256,11 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         state = self._requests.get(request.request_id)
         if state is None:
             state = _RequestState(
-                BlockHashChain(self._tokens_per_block, cache_salt=request.cache_salt)
+                BlockHashChain(
+                    self._tokens_per_block,
+                    cache_salt=request.cache_salt,
+                    prompt_lookahead=self._prompt_lookahead,
+                )
             )
             self._requests[request.request_id] = state
         # Hashing the prompt here rather than waiting for the first scheduler
@@ -293,7 +301,11 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
 
     def _saves_for(self, state: _RequestState, request_data: RequestData) -> RequestTransfers:
         transfers = RequestTransfers(request_data.request_id)
-        limit = self._addressable_blocks(state)
+        # Prompt hashes are known before prefill. Capacity and scratch pages
+        # can also run ahead of computation. The worker waits for this forward
+        # pass before saving, so only its completed full blocks are publishable.
+        computed_end = request_data.computed_position + request_data.num_scheduled_tokens
+        limit = min(self._addressable_blocks(state), computed_end // self._tokens_per_block)
         for block in range(state.saved_upto, limit):
             self._append_pages(state, transfers, block)
         state.saved_upto = max(state.saved_upto, limit)

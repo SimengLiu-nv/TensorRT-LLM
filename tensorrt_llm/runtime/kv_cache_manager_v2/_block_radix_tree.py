@@ -752,7 +752,10 @@ class BlockRadixTree:
                 yield block, match_len
 
     def _prune_match(
-        self, matched: list[tuple[Block, int]], ssm_lc_id: LifeCycleId | None
+        self,
+        matched: list[tuple[Block, int]],
+        ssm_lc_id: LifeCycleId | None,
+        alignment: int = 1,
     ) -> list[tuple[Block, int]]:
         """Shorten `matched` to the prefix that is actually reusable.
 
@@ -769,6 +772,14 @@ class BlockRadixTree:
         # shorten the match to the coverage of a required page. Every retry strictly
         # shortens the match, so the loop terminates.
         while matched:
+            # Backoff, snapshots and partial page coverage may all produce an
+            # unaligned endpoint. Shorten before checking coverage again: moving
+            # an SWA endpoint backwards can make previously stale pages active.
+            remainder = self._num_matched_tokens(matched) % alignment
+            if remainder:
+                matched = self._back_off_match(matched, remainder)
+                if not matched:
+                    break
             # Check SSM snapshot availability first: truncating to the last reusable SSM
             # snapshot changes the matched length that all the attention checks use.
             if ssm_lc_id is not None:
@@ -786,6 +797,8 @@ class BlockRadixTree:
                 if not matched:
                     break
                 matched[-1] = (matched[-1][0], ssm_match_len)
+                if self._num_matched_tokens(matched) % alignment:
+                    continue
 
             # Only pages that are active at this candidate endpoint constrain attention
             # reuse. Full attention requires every block. SWA requires sink blocks and the
@@ -837,6 +850,7 @@ class BlockRadixTree:
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
         backoff: int = 0,
+        alignment: int = 1,
     ) -> ReuseMatch:
         """
         Return the currently reusable prefix match without holding pages.
@@ -847,6 +861,7 @@ class BlockRadixTree:
         `backoff` trims that many tokens off the tail (see
         KVCacheManagerConfig.reuse_match_backoff).
         """
+        assert alignment > 0 and self._tokens_per_block % alignment == 0
         raw_matched = list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
         num_reusable_tokens_before_pruning = self._num_matched_tokens(raw_matched)
         ssm_lc_id = self._life_cycles.ssm_life_cycle_id
@@ -858,11 +873,11 @@ class BlockRadixTree:
         # the prefix the attention pages alone support. Only hybrid models pay for
         # the second pass; without an SSM life cycle the two results are identical.
         num_reusable_tokens_before_hybrid_pruning = (
-            self._num_matched_tokens(self._prune_match(list(raw_matched), None))
+            self._num_matched_tokens(self._prune_match(list(raw_matched), None, alignment))
             if ssm_lc_id is not None
             else None
         )
-        matched = self._prune_match(raw_matched, ssm_lc_id)
+        matched = self._prune_match(raw_matched, ssm_lc_id, alignment)
         num_tokens = self._num_matched_tokens(matched)
         return ReuseMatch(
             [block for block, _ in matched],

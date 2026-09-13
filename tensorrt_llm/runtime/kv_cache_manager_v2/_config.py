@@ -270,11 +270,23 @@ class KVCacheManagerConfig:
     flag is carried for API/behavior parity with the C++ backend but changes no hashing.)
     """
 
+    reuse_match_alignment: int = 1
+    """
+    Required token alignment of the final reusable prefix, after lookahead
+    backoff and page-coverage pruning. Whole-block connectors use the block
+    size so an unaligned local claim cannot prevent loading their suffix.
+    The default preserves token-granular reuse, including exact partial blocks.
+    """
+
     @property
     def enable_swa_scratch_reuse(self) -> bool:
         return self.swa_scratch_reuse is not None
 
     def __post_init__(self) -> None:
+        assert (
+            self.reuse_match_alignment > 0
+            and self.tokens_per_block % self.reuse_match_alignment == 0
+        )
         assert self.cache_tiers and self.cache_tiers[0].tier == CacheTier.GPU_MEM
         assert len(set(layer.layer_id for layer in self.layers)) == len(self.layers), (
             "duplicate layer id"
