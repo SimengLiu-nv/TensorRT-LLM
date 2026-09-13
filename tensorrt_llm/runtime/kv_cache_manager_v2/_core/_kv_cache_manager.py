@@ -485,6 +485,7 @@ class KVCacheManager:
             input_tokens,
             self.enable_partial_match,
             self.init_config.reuse_match_backoff,
+            self.init_config.reuse_match_alignment,
         )
 
     def probe_reuse(

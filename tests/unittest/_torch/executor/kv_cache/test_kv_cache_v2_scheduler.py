@@ -1485,6 +1485,35 @@ class TestContextPreemption:
 # ===========================================================================
 
 
+@pytest.mark.parametrize("chunked", [False, True])
+def test_completion_reservation_deferral_preserves_started_context(chunked: bool) -> None:
+    """A new prompt waiting for headroom must let admitted prefill finish."""
+    manager = make_kv_cache_manager(has_cache_tier_below_gpu=False)
+    manager.reserve_context_completion.side_effect = [False, True]
+    scheduler = make_scheduler(
+        manager,
+        max_num_tokens=1000,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64) if chunked else None,
+    )
+    waiting = make_ctx_request(0, 500)
+    started = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+    batch = scheduler.schedule_request([waiting, started], set())
+
+    assert ids(batch.context_requests) == [99]
+    assert batch.paused_requests == []
+    manager.preempt_request.assert_not_called()
+    manager.resize_context.assert_called_once_with(started, 100)
+    started.pause.assert_not_called()
+
+    # Once the first request finishes, admission can accept the queued prompt.
+    manager.reserve_context_completion.side_effect = None
+    manager.reserve_context_completion.return_value = True
+    resumed = scheduler.schedule_request([waiting], set())
+    assert ids(resumed.context_requests) == [0]
+    manager.preempt_request.assert_not_called()
+
+
 class TestDeadlockDetection:
     """The scheduler must fail loudly rather than spin scheduling nothing.
 

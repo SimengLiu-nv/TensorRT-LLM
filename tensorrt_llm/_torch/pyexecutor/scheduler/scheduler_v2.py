@@ -815,12 +815,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # V2 resizes KV cache directly in the scheduler (no separate
         # prepareResources for main cache), so include draft tokens.
-        if not self._try_allocate_context(req, context_tokens + draft_len):
-            # Out of pages. Give one started request up so this one can
-            # proceed, and retry next iteration rather than now: a failed
-            # resize leaves a first chunk suspended, so the retry has to go
-            # back through prepare_context to resume it.
-            preempt_for_pages(req)
+        if not self._try_allocate_context(req, context_tokens + draft_len, preempt_for_pages):
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)
@@ -924,9 +919,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # V2 resizes KV cache directly in the scheduler, so include
         # draft tokens for last chunk.
-        if not self._try_allocate_context(req, resize_tokens):
-            # Out of pages — see the same call in _try_schedule_context_full.
-            preempt_for_pages(req)
+        if not self._try_allocate_context(req, resize_tokens, preempt_for_pages):
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)
@@ -1011,11 +1004,20 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.kv_cache_manager.prepare_connector_prefix(req)
         return True
 
-    def _try_allocate_context(self, req: LlmRequest, num_tokens: int) -> bool:
+    def _try_allocate_context(
+        self, req: LlmRequest, num_tokens: int, preempt_for_pages: Callable[[LlmRequest], bool]
+    ) -> bool:
         """Admit one context chunk in both target and draft KV pools."""
+        if not self.kv_cache_manager.reserve_context_completion(req):
+            # An admitted request owns this headroom. Let it finish instead of
+            # preempting it to make room for another prompt.
+            return False
         if not self.kv_cache_manager.resize_context(req, num_tokens):
             if self.enable_joint_kv_cache_reuse:
                 self._suspend_request(req)
+            # A physical allocation failure can still require preemption.
+            # Retry on the next pass, after prepare_context resumes the cache.
+            preempt_for_pages(req)
             return False
 
         draft_manager = self._joint_draft_manager
@@ -1027,6 +1029,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             # drop the draft pool too or it still describes abandoned progress.
             draft_manager.free_resources(req)
         self._suspend_request(req)
+        preempt_for_pages(req)
         return False
 
     def _align_chunk_to_mm_block(
