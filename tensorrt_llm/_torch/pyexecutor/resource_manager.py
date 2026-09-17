@@ -838,6 +838,19 @@ class KVCacheManager(BaseResourceManager):
         # reuse, so we rebuild the context request lists here.
         scheduled_batch.reset_context_requests()
 
+    def report_batch_to_connector(self,
+                                  scheduled_batch: ScheduledRequests) -> None:
+        """Report the batch to the KV connector.
+
+        Driven by ``ResourceManager.prepare_resources`` *after* the token-budget
+        trim rather than from the end of ``prepare_resources`` above, because
+        ``RequestData.num_scheduled_tokens`` is documented as "the number of
+        scheduled tokens for the upcoming forward pass" and is built from
+        ``context_chunk_size`` (``connectors/kv_cache_connector.py``). Reporting
+        before the trim over-states it for every chunk the trim shrinks, and a
+        connector that decides what to save or offload from that count would
+        publish KV for tokens the forward pass never computed.
+        """
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.build_scheduler_output(
                 scheduled_batch, self)
@@ -2603,6 +2616,13 @@ class ResourceManager:
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
                 resource_manager.prepare_resources(scheduled_batch)
+        # Strictly after every manager: the connector is told how many tokens
+        # the forward pass will compute, which is only settled once each
+        # manager has prepared. See `report_batch_to_connector`.
+        kv_cache_manager = self.resource_managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        if hasattr(kv_cache_manager, "report_batch_to_connector"):
+            kv_cache_manager.report_batch_to_connector(scheduled_batch)
 
     @nvtx_range("update_resources")
     def update_resources(
