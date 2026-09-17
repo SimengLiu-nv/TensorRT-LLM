@@ -521,6 +521,8 @@ In a disaggregated deployment, run context servers as `both` and leave generatio
 
 The store is addressed by whole blocks. The connector is handed the device match as `num_computed_tokens` and offers only blocks beyond it, but it can resume only from a block boundary, so when the device match ends mid-block it declines the lookup and the store is not consulted at all. Partial reuse is precisely what puts the match off a boundary, so it trades part of one block of device reuse for every stored block of the remaining prefix. Measured on MiniMax-M3, leaving it enabled declined 97.2% of lookups and left actual prompt cache read at 35% against a 96% ceiling; forcing it off raised that to 94% and roughly doubled throughput.
 
+With MTP configured, the Mooncake connector supports context-only requests on a disaggregated prefill engine. Target and draft cache regions are registered together. Speculative generation must run on a separate connector-free decode engine: rejected draft tokens can replace page slots, which the connector's append-only page deltas cannot describe. Non-context requests are rejected before store lookup or transfer scheduling.
+
 For one-model speculative decoding such as MTP, V2 also aligns the final local reuse claim after applying the required prompt lookahead backoff. Disabling partial radix matching alone does not keep this claim aligned: a one-token backoff can turn a complete block into a partial local prefix and suppress the whole store lookup. Alignment discards at most the remaining partial block while retaining the lookahead safety requirement, so Mooncake can load the stored suffix.
 
 #### How it keys pages
