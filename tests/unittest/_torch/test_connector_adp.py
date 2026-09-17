@@ -284,3 +284,43 @@ def test_dummy_v2_callbacks_do_not_publish_transfer_state(
     manager.scheduler.request_finished_by_layer_group.assert_not_called()
     assert not manager.scheduler_output_manager.external_loads
     assert not manager.has_pending_transfers(dummy.request_id)
+
+
+@pytest.mark.parametrize("context_only,dummy", [(True, False), (False, True)])
+def test_mtp_prefill_allows_context_work_and_adp_dummies(context_only: bool, dummy: bool) -> None:
+    manager = _manager()
+    manager.speculative_prefill_only = True
+    request = _request(7, dummy=dummy)
+    request.is_context_only_request = context_only
+
+    manager.query_num_new_matched_tokens(request, 0)
+
+    assert manager.scheduler.get_num_new_matched_tokens.call_count == (0 if dummy else 1)
+
+
+@pytest.mark.parametrize("generation_only", [False, True])
+def test_mtp_prefill_rejects_generation_before_lookup(generation_only: bool) -> None:
+    manager = _manager()
+    manager.speculative_prefill_only = True
+    request = _request(7)
+    request.is_context_only_request = False
+    request.is_generation_only_request = generation_only
+
+    with pytest.raises(NotImplementedError, match="context-only prefill"):
+        manager.query_num_new_matched_tokens(request, 0)
+
+    manager.scheduler.get_num_new_matched_tokens.assert_not_called()
+
+
+def test_mtp_prefill_rejects_generation_before_transfer_scheduling() -> None:
+    manager = _manager()
+    manager.speculative_prefill_only = True
+    request = _request(7)
+    request.is_context_only_request = False
+    batch = ScheduledRequests()
+    batch.generation_requests.append(request)
+
+    with pytest.raises(NotImplementedError, match="context-only prefill"):
+        manager.build_scheduler_output(batch, MagicMock())
+
+    assert manager.scheduler_output_manager.requests == {}
