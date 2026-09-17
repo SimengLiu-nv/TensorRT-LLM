@@ -23,7 +23,8 @@ from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
                                           GuidedDecodingConfig, KvCacheConfig,
-                                          SpeculativeConfig, TorchLlmArgs)
+                                          MTPDecodingConfig, SpeculativeConfig,
+                                          TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
                                            _xgrammar_tokenizer_info)
@@ -813,12 +814,20 @@ def _create_py_executor_impl(
                 "kv_cache_config.use_kv_cache_manager_v2=True to use another policy."
             )
 
+        # Context-only requests do not reject draft tokens. Keep Mooncake's
+        # target-plus-MTP prefill layout available, and reject generation work
+        # at the connector boundary before it can use append-only page deltas.
+        speculative_prefill_only = (
+            isinstance(spec_config, MTPDecodingConfig)
+            and uses_connector(kv_connector_config, "mooncake-store")
+            and is_disagg_enabled(cache_transceiver_config))
+
         # Rejected draft tokens shrink a request's page list, and the freed slot
         # goes to whichever request allocates next. The connector is only told
         # about pages appended since the last report, so it would keep
         # addressing a slot another request now owns.
         if (spec_config is not None and spec_config.max_draft_len > 0
-                and v2_selection is True):
+                and v2_selection is True and not speculative_prefill_only):
             raise NotImplementedError(
                 "KV connector is not supported with speculative decoding. "
                 "Disable speculative decoding to run a connector.")
@@ -876,7 +885,8 @@ def _create_py_executor_impl(
                 connector_scheduler,
                 aggressive_prefix_budgeting=kv_connector_config.
                 aggressive_prefix_budgeting,
-                enable_attention_dp=mapping.enable_attention_dp)
+                enable_attention_dp=mapping.enable_attention_dp,
+                speculative_prefill_only=speculative_prefill_only)
 
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")

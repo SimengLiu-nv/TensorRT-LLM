@@ -1079,7 +1079,8 @@ class PyExecutor:
             is_kv_cache_manager_v2 = isinstance(self.kv_cache_manager,
                                                 KVCacheManagerV2)
 
-            if is_kv_cache_manager_v2 and self.max_draft_len > 0:
+            if (is_kv_cache_manager_v2 and self.max_draft_len > 0
+                    and not self.kv_connector_manager.speculative_prefill_only):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with speculative "
                     "decoding. Rejected draft tokens "

@@ -114,7 +114,6 @@ class FakeRequest:
         self.py_connector_allocation_reported = False
         self.py_connector_served_position = 0
 
-
         self.py_connector_prefix_start = None
         self.py_connector_prefix_end = None
         self.py_connector_load_async = False

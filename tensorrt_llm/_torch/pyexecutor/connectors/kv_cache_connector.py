@@ -729,6 +729,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         aggressive_prefix_budgeting: bool = False,
         *,
         enable_attention_dp: bool = False,
+        speculative_prefill_only: bool = False,
     ) -> None:
         assert (scheduler is not None) == (enable_attention_dp or mpi_rank() == 0), (
             "A scheduler is required on every attention-DP owner, or only rank 0 for TP."
@@ -745,6 +746,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # than read from llm_args so the cache manager needs only this object.
         self.aggressive_prefix_budgeting = aggressive_prefix_budgeting
         self.enable_attention_dp = enable_attention_dp
+        self.speculative_prefill_only = speculative_prefill_only
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -800,14 +802,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         pages -- records only the part it honours via
         ``commit_new_matched_tokens``.
 
-        Generation-only requests are rejected by the caller, not here: the two
-        callers hold different objects. ``get_num_new_matched_tokens`` is handed
-        a C++-side ``LlmRequest`` where the flag is a property, while
-        ``KVCacheManagerV2`` holds the Python subclass where it is a method, so
-        no single spelling of the check reads correctly in both.
+        Generation-only requests are rejected before any store query.
         """
         if request.is_dummy_request:
             return 0, False
+        self._validate_speculative_prefill_request(request)
+        if request.is_generation_only_request:
+            raise RuntimeError("Connector API is not supported for generation-only requests!")
         num_tokens, load_kv_async = self._run_on_leader(
             lambda: self.scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
         )
@@ -838,8 +839,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         the batch and let prefill write those pages concurrently. So a connector
         must tolerate a load whose result is discarded: the runtime parks the
         request, waits for the load, then computes the range locally and
-        overwrites it. There is no way to say otherwise -- the ABC has no
-        ``cancel_load``, and a parked request carries no honoured count into
+        overwrites it. The default placement does not cancel an asynchronous
+        offer, and a parked request carries no honoured count into
         ``build_connector_meta``.
         """
         if request.is_dummy_request:
@@ -1007,12 +1008,30 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             )
         )
 
+    def _validate_speculative_prefill_request(self, request: LlmRequest) -> None:
+        """Keep MTP's append-only connector page lists on context-only work."""
+        if (
+            self.speculative_prefill_only
+            and not request.is_dummy_request
+            and not request.is_context_only_request
+        ):
+            raise NotImplementedError(
+                "Mooncake with MTP supports context-only prefill requests. "
+                "Run speculative generation on a separate connector-free decode engine."
+            )
+
     def build_scheduler_output(
         self,
         scheduled_batch: ScheduledRequests,
         kv_cache_manager: "KVCacheManager",
         additional_kv_cache_managers: Sequence["KVCacheManager"] = (),
     ) -> None:
+        if self.speculative_prefill_only:
+            for request in (
+                *scheduled_batch.context_requests,
+                *scheduled_batch.generation_requests,
+            ):
+                self._validate_speculative_prefill_request(request)
         self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
             scheduled_batch,
             self.new_async_requests,
