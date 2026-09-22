@@ -778,9 +778,7 @@
       "path": "kv_cache_config.use_uvm"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
-      "converter": "",
+      "capture_policy": "bool",
       "kind": "value",
       "path": "kv_connector_config.aggressive_prefix_budgeting"
     },
