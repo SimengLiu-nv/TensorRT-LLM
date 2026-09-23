@@ -246,6 +246,15 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         """Finish a request whose pages span more than one layer group."""
         return self.request_finished(request, [])
 
+    def forget_request(self, request_id: int) -> None:
+        """Drop the bookkeeping of a request that restarts from scratch.
+
+        Its saved-up-to mark and page table describe an allocation that is
+        gone; the next lookup rebuilds them, so the blocks it now recomputes
+        are saved again rather than treated as already stored.
+        """
+        self._requests.pop(request_id, None)
+
     # ---- internals ----
 
     def _require_worker(self) -> MooncakeStoreConnectorWorker:
