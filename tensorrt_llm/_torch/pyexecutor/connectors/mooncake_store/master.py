@@ -337,6 +337,8 @@ def _client_config(
         "role": "both",
         "transfer_batch_size": pool.transfer_batch_size,
         "stage_through_host": pool.stage_through_host,
+        "async_load": pool.async_load,
+        "async_load_workers": pool.async_load_workers,
     }
     if pool.cache_prefix is not None:
         config["cache_prefix"] = pool.cache_prefix
