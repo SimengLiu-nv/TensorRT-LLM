@@ -174,6 +174,12 @@ void KvCacheManager::shutdown()
     mStorage->destroy();
 }
 
+void KvCacheManager::setGpuEvictionCallbacks(GpuEvictionCallback evict, GpuSlotReleaseCallback release)
+{
+    auto const apiLock = lockExclusive();
+    mStorage->setGpuEvictionCallbacks(std::move(evict), std::move(release));
+}
+
 void KvCacheManager::clearReusableBlocks()
 {
     KVCM2_API_GUARD();

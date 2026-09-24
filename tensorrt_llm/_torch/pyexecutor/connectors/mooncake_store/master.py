@@ -336,6 +336,7 @@ def _client_config(
         "local_buffer_size": pool.local_buffer_size,
         "role": "both",
         "transfer_batch_size": pool.transfer_batch_size,
+        "write_policy": pool.write_policy,
         "stage_through_host": pool.stage_through_host,
     }
     if pool.cache_prefix is not None:

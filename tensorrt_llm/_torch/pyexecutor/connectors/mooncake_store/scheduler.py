@@ -238,7 +238,11 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             them now would let a later request overwrite bytes mid-transfer.
         """
         state = self._requests.pop(request.request_id, None)
-        return bool(state is not None and state.emitted_saves)
+        return bool(
+            self._config.write_policy == "write_through"
+            and state is not None
+            and state.emitted_saves
+        )
 
     def request_finished_by_layer_group(
         self, request: LlmRequest, cache_block_ids_by_layer_group: List[List[int]]

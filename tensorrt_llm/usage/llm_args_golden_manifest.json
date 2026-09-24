@@ -794,6 +794,25 @@
       "path": "kv_connector_config.connector"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_connector_config.mooncake_store.global_segment_size"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_connector_config.mooncake_store.local_buffer_size"
+    },
+    {
+      "allowed_values": [
+        "write_through",
+        "offload"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_connector_config.mooncake_store.write_policy"
+    },
+    {
       "capture_policy": "list[int]|none",
       "kind": "value",
       "path": "layer_wise_benchmarks_config.calibration_layer_indices"

@@ -118,6 +118,8 @@ public:
 
     void shutdown();
 
+    void setGpuEvictionCallbacks(GpuEvictionCallback evict, GpuSlotReleaseCallback release);
+
     // Number of not-yet-destroyed managers in this process. A manager counts from the start of its
     // construction, so one whose constructor throws is counted for the duration of that attempt.
     [[nodiscard]] static uint32_t numLiveManagers() noexcept;

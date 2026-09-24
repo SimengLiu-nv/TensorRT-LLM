@@ -54,6 +54,8 @@ from ..llm_request import get_draft_token_length
 from ..scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as RuntimeKVCacheManager
+
     from ..resource_manager import KVCacheManager
     from .kv_cache_layout import KvCacheLayout
 
@@ -197,6 +199,11 @@ class KvCacheConnectorWorker(ABC):
         cuda event into the forward pass cuda stream to obtain a
         signal of when it's appropriate to start offloading cache blocks.
         """
+
+    def register_kv_cache_manager(
+        self, manager: "RuntimeKVCacheManager", layer_group_offset: int = 0
+    ) -> None:
+        """Register allocator lifecycle hooks after the physical layout is registered."""
 
     @abstractmethod
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):

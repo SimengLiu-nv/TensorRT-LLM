@@ -49,6 +49,12 @@ using MigrationRecorder
     = std::function<void(std::vector<SharedPtr<Page>> const&, std::vector<Slot> const&, CacheLevel, CacheLevel)>;
 using DropRecorder = std::function<void(std::vector<SharedPtr<Page>> const&, CacheLevel)>;
 
+// Callbacks run synchronously while the manager owns the GPU slots. The eviction
+// callback may throw: selected pages are then restored to their eviction queues.
+// The release callback only invalidates metadata and must not throw or reenter KVCM.
+using GpuEvictionCallback = std::function<void(std::vector<std::pair<LifeCycleId, SlotId>> const&)>;
+using GpuSlotReleaseCallback = std::function<void(LifeCycleId, SlotId)>;
+
 // Immutable bidirectional mapping between lifecycles and pool groups.
 class LifeCyclePoolGroupMapping
 {
@@ -139,6 +145,8 @@ public:
     StorageManager& operator=(StorageManager const&) = delete;
 
     void destroy();
+
+    void setGpuEvictionCallbacks(GpuEvictionCallback evict, GpuSlotReleaseCallback release);
 
     // ---- Allocation -------------------------------------------------------
 
@@ -369,6 +377,10 @@ private:
     CacheLevel appendLevelSlotDescList(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescs);
 
     [[nodiscard]] auto makeEvictionRollbackGuard(TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const& evicted);
+
+    void notifyGpuEviction(CacheLevel level, TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const& pages);
+    GpuEvictionCallback mGpuEvictionCallback;
+    GpuSlotReleaseCallback mGpuSlotReleaseCallback;
 
     void _prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals, CacheLevel lvlId,
         PagesByLifeCycle& fallenPages, MigrationRecorder const& migrationRecorder = {},

@@ -386,6 +386,37 @@ The available presets are `lmcache`, `lmcache-mp`, `kvbm` and `mooncake-store`. 
 
 ### Mooncake distributed store (`mooncake-store`)
 
+The Mooncake write policy is selectable:
+
+```yaml
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    master_server_address: "host:50051"
+    write_policy: offload  # or write_through (the default)
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: true
+  host_cache_size: 0
+```
+
+`write_through` publishes complete computed blocks after each forward pass.
+`offload` keeps those blocks on the GPU and publishes a page only when the local
+allocator selects it for eviction. Request completion alone does not publish it.
+The allocator retains ownership until the write completes; a failed publication
+fails the allocation and restores the eviction queue. This synchronous write can
+increase allocation latency under pressure. Offload currently requires the C++
+V2 backend and a GPU-only local cache hierarchy.
+
+Each target/draft layer group is published when its page is evicted. A remote
+block is reusable only after every required group is present. Locally cached
+blocks are unavailable to other engines until eviction. Restoring a block does
+not delete its shared copy, since other engines may still need it; total unique
+capacity therefore depends on overlap between GPU and Mooncake residency.
+For an externally supplied `MOONCAKE_CONFIG_PATH`, set `"write_policy": "offload"`
+in that JSON file instead.
+
+
 Publishes KV pages into a [Mooncake](https://github.com/kvcache-ai/Mooncake) store, a shared CPU memory pool addressed by content, so a prefix computed by one engine can be replayed by another. Regular block reuse cannot do this, because it never leaves the instance that computed the prefix.
 
 This is a **different component** from the Mooncake transfer engine that the C++ cache transceiver uses for disaggregated prefill/decode handoff. That moves KV point to point between two known peers; this publishes pages into a pool that any peer can read. The two compose: a context server can write pages into the store and still hand off to a generation server over NIXL.

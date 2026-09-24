@@ -2377,6 +2377,13 @@ class MooncakeStoreConfig(StrictBaseModel):
         None,
         description="Key namespace for the pool. Bump it after any change to "
         "page layout or contents. Defaults to 'trtllm'.")
+    write_policy: Literal["write_through", "offload"] = Field(
+        default="write_through",
+        description="When to publish complete GPU KV blocks to Mooncake. "
+        "write_through publishes after computation; offload publishes only "
+        "when KVCM evicts the GPU page and waits for publication before reuse. "
+        "Offload requires the C++ V2 manager and a GPU-only local cache.",
+    )
     stage_through_host: bool = Field(
         False,
         telemetry=False,

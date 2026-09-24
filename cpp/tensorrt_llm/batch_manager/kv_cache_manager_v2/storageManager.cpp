@@ -729,8 +729,45 @@ CacheTier StorageManager::cacheTier(CacheLevel level) const
     return mLevels.at(level).cacheTier;
 }
 
+void StorageManager::setGpuEvictionCallbacks(GpuEvictionCallback evict, GpuSlotReleaseCallback release)
+{
+    if (evict && numCacheLevels() != CacheLevel{1})
+    {
+        throw std::invalid_argument("External GPU eviction requires a GPU-only cache hierarchy");
+    }
+    mGpuEvictionCallback = std::move(evict);
+    mGpuSlotReleaseCallback = std::move(release);
+}
+
+void StorageManager::notifyGpuEviction(
+    CacheLevel level, TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const& pages)
+{
+    if (level != kHotLevel || !mGpuEvictionCallback)
+    {
+        return;
+    }
+    std::vector<std::pair<LifeCycleId, SlotId>> slots;
+    for (auto const& group : pages)
+    {
+        for (auto const& page : group)
+        {
+            // A host-side publisher cannot inherit CUDA stream dependencies.
+            page->readyEvent.synchronize();
+            slots.emplace_back(page->lifeCycle, page->slotId());
+        }
+    }
+    if (!slots.empty())
+    {
+        mGpuEvictionCallback(slots);
+    }
+}
+
 void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
 {
+    if (level == kHotLevel && mGpuSlotReleaseCallback)
+    {
+        mGpuSlotReleaseCallback(lc, slot.slotId());
+    }
     PoolGroupIndex pg = getPoolGroupIndex(level, lc);
     mLevels.at(level).storage->release(pg, std::move(slot));
 }
@@ -812,6 +849,7 @@ void StorageManager::forceEvict(
 {
     auto evicted = mLevels.at(level).controller.evict(minNumPages);
     auto rescheduleEvictedPagesOnFailure = makeEvictionRollbackGuard(evicted);
+    notifyGpuEviction(level, evicted);
 
     if (isLastLevel(level))
     {
@@ -951,6 +989,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
 
     auto evicted = ctrl.evict(numToEvict);
     auto rescheduleEvictedPagesOnFailure = makeEvictionRollbackGuard(evicted);
+    notifyGpuEviction(lvlId, evicted);
     TypedVec<LifeCycleId, std::vector<SharedPtr<Page>>> acceptedPages(numLifeCycles());
 
     auto acceptFallenPages = [&](PoolGroupIndex pgIdx, SlotCount count)

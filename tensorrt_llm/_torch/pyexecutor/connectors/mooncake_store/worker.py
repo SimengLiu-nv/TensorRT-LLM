@@ -24,16 +24,16 @@ Loads are synchronous: the runtime has already told the scheduler those tokens
 are computed, so the bytes must be in place before the forward pass reads them,
 and a failed load is a wrong answer rather than a slow one.
 
-Saves are asynchronous and gated on a CUDA event. The pages are only complete
-once the forward pass that wrote them has retired, and blocking the executor
-loop on an RDMA write is exactly the cost the store is supposed to avoid. The
-scheduler reports such a request as saving asynchronously, which keeps its pages
-pinned until `get_finished` says the writes landed.
+Write-through saves run asynchronously after a CUDA event and pin pages until
+`get_finished` reports completion. Offload saves run synchronously at GPU
+eviction: the cache manager retains ownership until the forward event and
+Mooncake write both complete, then releases the slots for reuse.
 """
 
 import threading
 import traceback
 from collections import defaultdict
+from functools import partial
 from queue import Queue
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -42,13 +42,14 @@ import torch
 from tensorrt_llm._utils import mpi_rank, mpi_world_size
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as RuntimeKVCacheManager
 
 from ..kv_cache_connector import KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
 from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig
 from .keys import KeyNamespace
-from .metadata import MooncakeStoreMetadata, RequestTransfers
+from .metadata import MooncakeStoreMetadata, PageTransfer, RequestTransfers
 from .staging import (
     HostStagingPool,
     describe_batch_for_get,
@@ -196,6 +197,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # stay pinned until we report them back through `get_finished`.
         self._closed_requests: Set[int] = set()
         self._save_error: Optional[BaseException] = None
+        # Metadata only: ownership remains with KVCM until its eviction callback.
+        self._offload_pages: dict[tuple[int, int], tuple[PageTransfer, torch.cuda.Event]] = {}
+        self._offload_managers: list[RuntimeKVCacheManager] = []
 
         global _LOCAL_WORKER
         _LOCAL_WORKER = self
@@ -263,7 +267,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 for rank in range(self._attention_world_size)
             )
 
-        if self._config.role.saves:
+        if self._config.role.saves and self._config.write_policy == "offload":
+            self._save_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        if self._config.role.saves and self._config.write_policy == "write_through":
             self._save_thread = threading.Thread(
                 target=self._drain_saves,
                 name=f"mooncake-store-save-{self._rank}",
@@ -274,6 +280,42 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         logger.info(
             f"mooncake-store worker rank {self._rank} registered layout: {addressing.describe()}"
         )
+
+    def register_kv_cache_manager(
+        self, manager: RuntimeKVCacheManager, layer_group_offset: int = 0
+    ) -> None:
+        """Attach publication to real GPU eviction, including target/draft pools."""
+        if self._config.write_policy != "offload" or not self._config.role.saves:
+            return
+        if not hasattr(manager, "set_gpu_eviction_callbacks"):
+            raise NotImplementedError("Mooncake offload requires the C++ KVCacheManagerV2 backend")
+        manager.set_gpu_eviction_callbacks(
+            partial(self._offload_evicted_pages, layer_group_offset=layer_group_offset),
+            partial(self._forget_offload_page, layer_group_offset=layer_group_offset),
+        )
+        self._offload_managers.append(manager)
+
+    def _forget_offload_page(
+        self, layer_group_id: int, page_index: int, *, layer_group_offset: int
+    ) -> None:
+        """Invalidate a slot identity on every release, including cancellation."""
+        self._offload_pages.pop((layer_group_id + layer_group_offset, page_index), None)
+
+    def _offload_evicted_pages(
+        self, slots: list[tuple[int, int]], *, layer_group_offset: int
+    ) -> None:
+        """Publish while KVCM still owns the selected slots; failure rolls back eviction."""
+        pages: list[PageTransfer] = []
+        for group, index in slots:
+            entry = self._offload_pages.get((group + layer_group_offset, index))
+            if entry is not None:
+                page, ready = entry
+                ready.synchronize()
+                pages.append(page)
+        if pages:
+            # This thread owns the staging buffer in offload mode. No background
+            # writer can race it, and KVCM cannot recycle sources until it returns.
+            self._put([RequestTransfers(request_id=0, pages=pages)])
 
     def _open_staging(self, addressing: PageAddressing) -> None:
         """Allocate and register the pinned slots pages will pass through.
@@ -458,10 +500,21 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
     # ---- save path ----
 
-    def wait_for_save(self, stream: torch.cuda.Stream):
-        """Hand this pass's saves to the background thread, gated on an event."""
+    def wait_for_save(self, stream: torch.cuda.Stream) -> None:
+        """Record offload candidates or enqueue write-through saves after this pass."""
         metadata: Optional[MooncakeStoreMetadata] = self.get_connector_meta()
-        if metadata is None or not metadata.saves or not self._config.role.saves:
+        if metadata is None or not self._config.role.saves:
+            return
+        if self._config.write_policy == "offload":
+            candidates = [*metadata.loads, *metadata.saves]
+            if candidates:
+                event = torch.cuda.Event()
+                event.record(stream)
+                for transfer in candidates:
+                    for page in transfer.pages:
+                        self._offload_pages[(page.layer_group_id, page.page_index)] = (page, event)
+            return
+        if not metadata.saves:
             return
         self._reraise_save_error()
 
@@ -562,6 +615,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             # scheduler cannot know this: it holds no store handle, and the
             # answer changes between the time it builds metadata and now.
             present = self._store.batch_is_exist(list(batch_keys))
+            if len(present) != len(batch_keys):
+                raise RuntimeError("Mooncake returned incomplete existence results during save")
             pending = [
                 index
                 for index, status in enumerate(present)
@@ -585,6 +640,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 source_sizes,
             )
             failures = sum(1 for result in results if not isinstance(result, int) or result < 0)
+            failures += abs(len(pending) - len(results))
+            if failures and self._config.write_policy == "offload":
+                raise RuntimeError(
+                    f"Mooncake offload failed for {failures} pages; retaining GPU slots"
+                )
             if failures:
                 # A dropped write only costs a future cache miss, so it is worth
                 # a warning rather than failing a request that already answered.
@@ -631,6 +691,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
     def shutdown(self) -> None:
         """Stop the save thread and release the store handle. Idempotent."""
+        for manager in self._offload_managers:
+            manager.set_gpu_eviction_callbacks(None, None)
+        self._offload_managers.clear()
+        self._offload_pages.clear()
         thread, self._save_thread = self._save_thread, None
         if thread is not None:
             self._save_queue.put(None)

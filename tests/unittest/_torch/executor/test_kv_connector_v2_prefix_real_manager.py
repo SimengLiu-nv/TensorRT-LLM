@@ -937,3 +937,61 @@ def test_refuted_connector_chunk_releases_unused_completion_reservation() -> Non
         assert not manager._disagg_completion_limits
     finally:
         manager.shutdown()
+
+
+@pytest.mark.parametrize("fail_first", [False, True])
+def test_native_offload_callback_precedes_recycle_and_failure_preserves_queue(
+    fail_first: bool,
+) -> None:
+    """Force real GPU pool exhaustion; publication owns slots until it returns."""
+    manager = make_manager(FakeConnectorManager(num_matched=0))
+    if not hasattr(manager.impl, "set_gpu_eviction_callbacks"):
+        manager.shutdown()
+        pytest.skip("external eviction callbacks require the C++ backend")
+    events: list[tuple[str, list[tuple[int, int]]]] = []
+    fail = fail_first
+
+    def evict(slots: list[tuple[int, int]]) -> None:
+        nonlocal fail
+        events.append(("evict", list(slots)))
+        if fail:
+            fail = False
+            raise RuntimeError("injected offload publication failure")
+
+    def release(group: int, index: int) -> None:
+        events.append(("release", [(group, index)]))
+
+    seed = manager.impl.create_kv_cache()
+    pressure = None
+    try:
+        manager.impl.set_gpu_eviction_callbacks(evict, release)
+        available = min(stat.free for stat in manager.impl.get_storage_statistics(0))
+        assert available > 1
+        tokens = list(range(available * TOKENS_PER_BLOCK))
+        assert seed.resume(manager._stream.cuda_stream)
+        assert seed.resize(len(tokens), len(tokens))
+        seed.commit(tokens, is_end=True)
+        seed.close()
+        assert not any(kind == "evict" for kind, _ in events)
+        events.clear()
+        pressure = manager.impl.create_kv_cache()
+        assert pressure.resume(manager._stream.cuda_stream)
+        if fail_first:
+            with pytest.raises(RuntimeError, match="injected offload"):
+                pressure.resize(TOKENS_PER_BLOCK, TOKENS_PER_BLOCK)
+            assert [kind for kind, _ in events] == ["evict"]
+            failed_slots = events[0][1]
+            events.clear()
+        assert pressure.resize(TOKENS_PER_BLOCK, TOKENS_PER_BLOCK)
+        assert events[0][0] == "evict"
+        if fail_first:
+            assert events[0][1] == failed_slots
+        evicted_slots = set(events[0][1])
+        released_slots = {slot for kind, slots in events if kind == "release" for slot in slots}
+        assert evicted_slots <= released_slots
+    finally:
+        manager.impl.set_gpu_eviction_callbacks(None, None)
+        seed.close()
+        if pressure is not None:
+            pressure.close()
+        manager.shutdown()

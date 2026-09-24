@@ -25,6 +25,7 @@ import time
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -54,6 +55,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import (
     KeyNamespace,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
+    MooncakeStoreMetadata,
     PageTransfer,
     RequestTransfers,
 )
@@ -1294,3 +1296,87 @@ def test_tp_lookup_still_requires_all_attention_shards(
 def test_mooncake_declares_adp_support() -> None:
     assert MooncakeStoreConnectorScheduler.supports_attention_dp
     assert MooncakeStoreConnectorWorker.supports_attention_dp
+
+
+@pytest.mark.parametrize("policy", ["write_through", "offload"])
+def test_write_policy_is_parsed_and_validated(store_config: Path, policy: str) -> None:
+    raw = json.loads(store_config.read_text())
+    raw["write_policy"] = policy
+    store_config.write_text(json.dumps(raw))
+    assert MooncakeStoreConnectorConfig.from_file(str(store_config)).write_policy == policy
+    raw["write_policy"] = "unknown"
+    store_config.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="write_policy"):
+        MooncakeStoreConnectorConfig.from_file(str(store_config))
+
+
+def test_offload_publishes_only_evicted_pages_and_invalidates_recycled_slots(
+    store_config: Path, fake_store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = json.loads(store_config.read_text())
+    raw["write_policy"] = "offload"
+    store_config.write_text(json.dumps(raw))
+    event = Mock()
+    monkeypatch.setattr(torch.cuda, "Event", lambda: event)
+    with make_worker(fake_store, layout=make_layout(num_groups=2)) as worker:
+        manager = Mock()
+        worker.register_kv_cache_manager(manager, layer_group_offset=1)
+        evict, release = manager.set_gpu_eviction_callbacks.call_args.args
+        new_page = PageTransfer(b"new", 1, 2)
+        restored_page = PageTransfer(b"restored", 1, 3)
+        worker.bind_connector_meta(
+            MooncakeStoreMetadata(
+                loads=[RequestTransfers(1, [restored_page])],
+                saves=[RequestTransfers(1, [new_page])],
+            )
+        )
+        worker.wait_for_save(Mock())
+        assert fake_store.put_calls == []
+        assert worker._save_thread is None
+        evict([(0, 2)])
+        assert len(fake_store.put_calls) == 1
+        event.synchronize.assert_called_once()
+        release(0, 2)
+        evict([(0, 2)])
+        assert len(fake_store.put_calls) == 1
+        # A restored page must remain eligible for offloading if the shared pool
+        # has discarded its copy while this GPU still holds it.
+        evict([(0, 3)])
+        assert len(fake_store.put_calls) == 2
+        release(0, 3)
+        assert worker._offload_pages == {}
+
+
+@pytest.mark.parametrize("results", [[-1], []])
+def test_offload_write_failure_keeps_candidate_for_retry(
+    store_config: Path,
+    fake_store: FakeStore,
+    monkeypatch: pytest.MonkeyPatch,
+    results: list[int],
+) -> None:
+    raw = json.loads(store_config.read_text())
+    raw["write_policy"] = "offload"
+    store_config.write_text(json.dumps(raw))
+    event = Mock()
+    monkeypatch.setattr(torch.cuda, "Event", lambda: event)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        page = PageTransfer(b"failure", 0, 1)
+        worker.bind_connector_meta(MooncakeStoreMetadata(saves=[RequestTransfers(1, [page])]))
+        worker.wait_for_save(Mock())
+        monkeypatch.setattr(fake_store, "batch_put_from_multi_buffers", lambda *_args: results)
+        with pytest.raises(RuntimeError, match="retaining GPU slots"):
+            worker._offload_evicted_pages([(0, 1)], layer_group_offset=0)
+        assert (0, 1) in worker._offload_pages
+
+
+def test_offload_request_completion_does_not_pin_pages(
+    store_config: Path, fake_store: FakeStore
+) -> None:
+    raw = json.loads(store_config.read_text())
+    raw["write_policy"] = "offload"
+    store_config.write_text(json.dumps(raw))
+    scheduler = MooncakeStoreConnectorScheduler(make_llm_args())
+    request = make_request(99, list(range(12)))
+    state = scheduler._state_for(request, list(range(12)))
+    state.emitted_saves = True
+    assert not scheduler.request_finished(request, [])

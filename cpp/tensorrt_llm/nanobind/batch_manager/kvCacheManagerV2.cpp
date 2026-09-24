@@ -2240,6 +2240,35 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     // ---- KvCacheManager ----------------------------------------------------
     nb::class_<kv::KvCacheManager>(m, "KVCacheManager")
         .def(
+            "set_gpu_eviction_callbacks",
+            [](kv::KvCacheManager& self, std::function<void(std::vector<std::pair<int, int>> const&)> evict,
+                std::function<void(int, int)> release)
+            {
+                kv::GpuEvictionCallback evictionCallback;
+                kv::GpuSlotReleaseCallback releaseCallback;
+                if (evict)
+                {
+                    evictionCallback = [evict](auto const& slots)
+                    {
+                        std::vector<std::pair<int, int>> indices;
+                        indices.reserve(slots.size());
+                        for (auto const& [lifeCycle, slot] : slots)
+                        {
+                            indices.emplace_back(
+                                static_cast<int>(kv::toSizeT(lifeCycle)), kv::slotIdToPageIndexValue(slot));
+                        }
+                        evict(indices);
+                    };
+                }
+                if (release)
+                {
+                    releaseCallback = [release](kv::LifeCycleId lifeCycle, kv::SlotId slot)
+                    { release(static_cast<int>(kv::toSizeT(lifeCycle)), kv::slotIdToPageIndexValue(slot)); };
+                }
+                self.setGpuEvictionCallbacks(std::move(evictionCallback), std::move(releaseCallback));
+            },
+            nb::arg("evict").none(), nb::arg("release").none(), nb::call_guard<nb::gil_scoped_release>())
+        .def(
             "__init__",
             [](kv::KvCacheManager* self, kv::KVCacheManagerConfig const& config, nb::object eventManager,
                 nb::object codecObject)

@@ -28,7 +28,7 @@ import os
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 __all__ = [
     "CLIENT_CONFIG_NAME",
@@ -165,6 +165,8 @@ class MooncakeStoreConnectorConfig:
     #: How many page keys go into one store call. Bounds the size of a single
     #: RPC without bounding how much a request may transfer.
     transfer_batch_size: int = 64
+    #: Publish completed pages immediately or only when GPU slots are evicted.
+    write_policy: Literal["write_through", "offload"] = "write_through"
     #: Pass pages through a pinned host buffer instead of registering the KV
     #: pools with Mooncake. Costs a copy each way, but works without GPUDirect
     #: RDMA, which registering device memory requires.
@@ -176,6 +178,8 @@ class MooncakeStoreConnectorConfig:
 
     def __post_init__(self) -> None:
         """Reject settings that would fail later, inside a transfer."""
+        if self.write_policy not in ("write_through", "offload"):
+            raise ValueError("write_policy must be write_through or offload")
         if not self.master_server_address:
             raise ValueError("master_server_address is required")
         if self.local_buffer_size <= 0:
@@ -207,6 +211,7 @@ class MooncakeStoreConnectorConfig:
             cache_prefix=str(raw.get("cache_prefix", DEFAULT_CACHE_PREFIX)),
             model_key=raw.get("model_key") or None,
             transfer_batch_size=int(raw.get("transfer_batch_size", 64)),
+            write_policy=raw.get("write_policy", "write_through"),
             stage_through_host=bool(raw.get("stage_through_host", False)),
             staging_buffer_bytes=parse_size(
                 raw.get("staging_buffer_bytes", DEFAULT_STAGING_BUFFER_SIZE)
