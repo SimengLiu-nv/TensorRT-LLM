@@ -333,7 +333,12 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             request_data.computed_position + num_loaded_tokens + request_data.num_scheduled_tokens
         )
         limit = min(self._addressable_blocks(state), computed_end // self._tokens_per_block)
-        for block in range(state.saved_upto, limit):
+        # A store miss does not reset the local reuse boundary. Reused pages
+        # already have an identity, and native sequence rebasing can share
+        # them with a request whose lookahead hash differs. Only register pages
+        # completed by this forward; a partial boundary block still belongs here.
+        first = max(state.saved_upto, request_data.computed_position // self._tokens_per_block)
+        for block in range(first, limit):
             self._append_pages(state, transfers, block)
         state.saved_upto = max(state.saved_upto, limit)
         return transfers

@@ -12,6 +12,10 @@ import pytest
 import torch
 
 import tensorrt_llm
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
+    RequestData,
+    SchedulerOutput,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import build_kv_cache_layout_v2
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     MooncakeStoreConnectorConfig,
@@ -27,13 +31,17 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.ownership import O
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.ownership_server import (
     OwnershipServer,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
+    MooncakeStoreConnectorScheduler,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import (
     MooncakeStoreConnectorWorker,
     _open_store,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MooncakeStoreConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MooncakeStoreConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import ReuseScope
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA KV pools")
 
@@ -168,3 +176,110 @@ def test_native_allocator_offloads_and_restores_without_cpu_duplicate(
                 server.shutdown()
                 thread.join()
                 control.close()
+
+
+def test_native_rebased_prefix_is_not_registered_as_new_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "mooncake.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "master_server_address": "127.0.0.1:50051",
+                "role": "producer",
+            }
+        )
+    )
+    monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(config_path))
+    monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_ROLE", raising=False)
+    spec_config = MTPDecodingConfig(max_draft_len=1)
+    manager = KVCacheManagerV2(
+        kv_cache_config=KvCacheConfig(max_tokens=2048, enable_block_reuse=True, host_cache_size=0),
+        kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=4,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=4096,
+        max_batch_size=4,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=tensorrt_llm.bindings.DataType.HALF,
+        vocab_size=32000,
+        spec_config=spec_config,
+    )
+    scheduler = MooncakeStoreConnectorScheduler(
+        SimpleNamespace(
+            model="ownership-native",
+            kv_cache_config=SimpleNamespace(tokens_per_block=32),
+            tensor_parallel_size=1,
+            enable_attention_dp=False,
+            pipeline_parallel_size=1,
+            context_parallel_size=1,
+            sparse_attention_config=None,
+            speculative_config=spec_config,
+        )
+    )
+    released: list[tuple[int, int]] = []
+
+    def record_release(group: int, slot: int) -> None:
+        released.append((group, slot))
+
+    manager.impl.set_gpu_eviction_callbacks(None, record_release)
+    original_tokens = list(range(97))
+    other_tokens = list(original_tokens)
+    other_tokens[32] += 1000
+    first_slot = None
+    try:
+        for tokens in (original_tokens, other_tokens):
+            cache = manager.impl.create_kv_cache()
+            try:
+                assert cache.resume(manager._stream.cuda_stream)
+                assert cache.resize(len(tokens), len(tokens))
+                cache.commit(tokens)
+                slot = list(cache.get_aggregated_page_indices(0))[0]
+                if first_slot is None:
+                    first_slot = slot
+                else:
+                    assert slot == first_slot
+            finally:
+                cache.close()
+        assert (0, first_slot) not in released
+        assert (
+            BlockHashChain(32, prompt_lookahead=1).extend(original_tokens)[0]
+            != BlockHashChain(32, prompt_lookahead=1).extend(other_tokens)[0]
+        )
+
+        cache = manager.impl.create_kv_cache(ReuseScope(), other_tokens)
+        try:
+            local_tokens = cache.history_length
+            assert local_tokens >= 64
+            assert cache.resume(manager._stream.cuda_stream)
+            assert cache.resize(len(other_tokens), len(other_tokens))
+            indices = list(cache.get_aggregated_page_indices(0))
+            assert indices[0] == first_slot
+            request = SimpleNamespace(
+                request_id=3, cache_salt=None, get_tokens=lambda beam: other_tokens
+            )
+            assert scheduler.get_num_new_matched_tokens(request, local_tokens) == (0, False)
+            metadata = scheduler.build_connector_meta(
+                SchedulerOutput(
+                    new_requests=[
+                        RequestData(
+                            request_id=3,
+                            new_tokens=other_tokens,
+                            new_block_ids=indices,
+                            new_block_ids_by_layer_group=[indices],
+                            computed_position=local_tokens,
+                            num_scheduled_tokens=len(other_tokens) - local_tokens,
+                        )
+                    ]
+                )
+            )
+            assert first_slot not in [
+                page.page_index for transfer in metadata.saves for page in transfer.pages
+            ]
+        finally:
+            cache.close()
+    finally:
+        manager.impl.set_gpu_eviction_callbacks(None, None)
+        manager.shutdown()

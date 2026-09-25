@@ -216,6 +216,7 @@ def make_worker(
     *,
     layout: KvCacheLayout | None = None,
     enable_attention_dp: bool = False,
+    speculative_config: MTPDecodingConfig | None = None,
 ) -> Iterator[MooncakeStoreConnectorWorker]:
     """Build a worker and shut it down before the test call phase ends.
 
@@ -224,7 +225,11 @@ def make_worker(
     fixture teardown would run too late to keep it quiet.
     """
     initial_threads = set(threading.enumerate())
-    worker = MooncakeStoreConnectorWorker(make_llm_args(enable_attention_dp=enable_attention_dp))
+    worker = MooncakeStoreConnectorWorker(
+        make_llm_args(
+            enable_attention_dp=enable_attention_dp, speculative_config=speculative_config
+        )
+    )
     fake_store.workers.append(worker)
     if layout is not None:
         worker.register_kv_cache_layout(layout)
@@ -1000,6 +1005,29 @@ def test_scheduler_skips_local_prefix_when_looking_up(store_config):
     assert scheduler._worker.queries[0] == full_chain[2:5]
 
 
+@pytest.mark.parametrize("local_tokens", [4, 5, 12])
+@pytest.mark.parametrize("use_mtp", [False, True])
+def test_scheduler_does_not_resave_local_prefix_on_store_miss(
+    store_config: Path, local_tokens: int, use_mtp: bool
+) -> None:
+    config = MTPDecodingConfig(max_draft_len=1) if use_mtp else None
+    scheduler = make_scheduler(store_config, hit_blocks=0, speculative_config=config)
+    tokens = list(range(13))
+    assert scheduler.get_num_new_matched_tokens(make_request(1, tokens), local_tokens) == (0, False)
+    data = request_data(
+        1,
+        tokens,
+        [10, 11, 12, 13],
+        computed_position=local_tokens,
+        num_scheduled_tokens=len(tokens) - local_tokens,
+    )
+    metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    assert metadata.loads == []
+    assert [page.page_index for transfer in metadata.saves for page in transfer.pages] == list(
+        range(10 + local_tokens // TOKENS_PER_BLOCK, 13)
+    )
+
+
 def test_scheduler_builds_loads_for_the_offered_blocks(store_config):
     scheduler = make_scheduler(store_config, hit_blocks=2)
     tokens = list(range(5 * TOKENS_PER_BLOCK))
@@ -1350,6 +1378,57 @@ def ownership_service(
                 worker.shutdown()
             server.shutdown()
             thread.join()
+
+
+def test_offload_local_reuse_preserves_rebased_slot_identity(
+    store_config: Path,
+    fake_store: FakeStore,
+    monkeypatch: pytest.MonkeyPatch,
+    ownership_service: OffloadDirectory,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "Event", Mock)
+    config = MTPDecodingConfig(max_draft_len=1)
+    with make_worker(fake_store, layout=make_layout(), speculative_config=config) as worker:
+        scheduler = MooncakeStoreConnectorScheduler(make_llm_args(speculative_config=config))
+        scheduler._worker = worker
+        tokens = list(range(2 * TOKENS_PER_BLOCK + 1))
+        assert scheduler.get_num_new_matched_tokens(make_request(1, tokens), 0) == (0, False)
+        worker.bind_connector_meta(
+            scheduler.build_connector_meta(
+                SchedulerOutput(new_requests=[request_data(1, tokens, [0, 1, 2])])
+            )
+        )
+        worker.wait_for_save(Mock())
+        original = worker._offload_pages[(0, 0)][0]
+
+        # Native sequence rebasing shares the first full page, whose tokens
+        # agree, even when the next token changes the connector's MTP hash.
+        other_tokens = list(tokens)
+        other_tokens[TOKENS_PER_BLOCK] += 1000
+        assert scheduler.get_num_new_matched_tokens(
+            make_request(2, other_tokens), TOKENS_PER_BLOCK
+        ) == (0, False)
+        assert scheduler._requests[2].chain.hashes[0] != original.block_hash
+        metadata = scheduler.build_connector_meta(
+            SchedulerOutput(
+                new_requests=[
+                    request_data(
+                        2,
+                        other_tokens,
+                        [0, 3, 4],
+                        computed_position=TOKENS_PER_BLOCK,
+                        num_scheduled_tokens=len(other_tokens) - TOKENS_PER_BLOCK,
+                    )
+                ]
+            )
+        )
+        worker.bind_connector_meta(metadata)
+        worker.wait_for_save(Mock())
+        assert [page.page_index for transfer in metadata.saves for page in transfer.pages] == [3]
+        assert worker._offload_pages[(0, 0)][0] == original
+        assert len(worker._offload_pages) == 3
+        assert fake_store.put_calls == []
+        assert ownership_service.statistics()["settled_overlap_keys"] == 0
 
 
 def test_offload_publishes_only_evicted_pages_and_invalidates_recycled_slots(
