@@ -92,9 +92,9 @@ class OwnershipServer(socketserver.ThreadingTCPServer):
         elif operation == "finish":
             directory.finish_eviction(owner, request.token, request.success)
         elif operation == "forget":
-            directory.forget(owner, request.keys)
+            return _Reply(accepted=directory.forget(owner, request.keys))
         elif operation == "close":
-            directory.unregister(owner)
+            return _Reply(accepted=directory.unregister(owner))
         elif operation == "stats":
             return _Reply(statistics=directory.statistics())
         else:
@@ -126,7 +126,7 @@ class _Handler(socketserver.StreamRequestHandler):
                             reply = _Reply(epoch=epoch)
                         else:
                             reply = self.server.dispatch(owner, request)
-                    if request.operation == "close":
+                    if request.operation == "close" and reply.accepted:
                         owner = ""
                         closing = True
                 except (ValidationError, ValueError, RuntimeError, KeyError) as exc:
@@ -213,7 +213,7 @@ class OwnershipClient:
 
     def forget(self, keys: list[str]) -> None:
         if keys:
-            self._call(_Request(operation="forget", keys=keys))
+            self._until_accepted(_Request(operation="forget", keys=keys))
 
     def statistics(self) -> dict[str, int]:
         return self._call(_Request(operation="stats")).statistics
@@ -221,7 +221,7 @@ class OwnershipClient:
     def close(self) -> None:
         if not self._closed:
             try:
-                self._call(_Request(operation="close"))
+                self._until_accepted(_Request(operation="close"))
                 if self._stream.read(1):
                     raise RuntimeError("offload coordinator did not close its worker session")
             finally:

@@ -231,3 +231,58 @@ def test_cancellation_cannot_retire_an_active_dma_read() -> None:
     directory.claim("b", ["active"], lease)
     assert not store.keys
     assert directory.statistics()["read_leases"] == 0
+
+
+@pytest.mark.parametrize("operation", ["forget", "close"])
+def test_cancellation_waits_for_another_gpu_owners_eviction(
+    operation: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = MemoryStore()
+    directory = OffloadDirectory(store, 4)
+    attempted = threading.Event()
+    if operation == "forget":
+        original_forget = directory.forget
+
+        def observe_forget(owner: str, keys: list[str]) -> bool:
+            attempted.set()
+            return original_forget(owner, keys)
+
+        monkeypatch.setattr(directory, "forget", observe_forget)
+    else:
+        original_unregister = directory.unregister
+
+        def observe_unregister(owner: str) -> bool:
+            attempted.set()
+            return original_unregister(owner)
+
+        monkeypatch.setattr(directory, "unregister", observe_unregister)
+    with OwnershipServer(("127.0.0.1", 0), directory) as server:
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        address = f"127.0.0.1:{server.server_address[1]}"
+        clients = [OwnershipClient(address) for _ in range(2)]
+        try:
+            for client in clients:
+                client.claim(["shared"])
+            token, writes = clients[0].prepare_eviction(["shared"], [1])
+            assert not writes
+            with ThreadPoolExecutor(1) as pool:
+                if operation == "forget":
+                    pending = pool.submit(clients[1].forget, ["shared"])
+                else:
+                    pending = pool.submit(clients[1].close)
+                try:
+                    assert attempted.wait(timeout=5)
+                    with pytest.raises(TimeoutError):
+                        pending.result(timeout=0.05)
+                finally:
+                    clients[0].finish_eviction(token, True)
+                pending.result(timeout=5)
+            assert not store.keys
+            assert clients[0].statistics()["gpu_keys"] == 0
+            assert clients[0].statistics()["fenced"] == 0
+        finally:
+            for client in clients:
+                client.close()
+            server.shutdown()
+            thread.join()

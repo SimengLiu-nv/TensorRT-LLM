@@ -271,22 +271,26 @@ class OffloadDirectory:
         self._refresh_many(transition.keys)
         del self._evictions[token]
 
-    def forget(self, owner: str, keys: list[str]) -> None:
+    def forget(self, owner: str, keys: list[str]) -> bool:
         """Discard uncommitted/cancelled GPU pages without publishing them."""
         self._client(owner)
+        if any(self._pages.get(key, _Page()).transition for key in keys):
+            return False
         for key in keys:
             page = self._pages.get(key)
             if page is None:
                 continue
-            if page.transition:
-                raise RuntimeError("cannot forget a page during an eviction transaction")
             page.owners.discard(owner)
         self._refresh_many(keys)
+        return True
 
-    def unregister(self, owner: str) -> None:
+    def unregister(self, owner: str) -> bool:
         self._client(owner)
         if any(t.owner == owner for t in self._evictions.values()):
             raise RuntimeError("cannot close a worker with unfinished publications")
+        owned_keys = [key for key, page in self._pages.items() if owner in page.owners]
+        if any(self._pages[key].transition for key in owned_keys):
+            return False
         # Graceful worker close follows completion/failure of its synchronous
         # GETs, so its own active DMA reservations can now be retired.
         for lease in list(self._leases):
@@ -300,8 +304,9 @@ class OffloadDirectory:
         for lease, (lease_owner, _) in list(self._leases.items()):
             if lease_owner == owner:
                 self.release_read(owner, lease)
-        self.forget(owner, [key for key, page in self._pages.items() if owner in page.owners])
+        self.forget(owner, owned_keys)
         self._clients.remove(owner)
+        return True
 
     def statistics(self) -> dict[str, int]:
         """Expose settled overlap separately from protected in-flight duplication."""
