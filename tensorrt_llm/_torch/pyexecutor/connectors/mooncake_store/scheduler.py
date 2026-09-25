@@ -55,9 +55,10 @@ class _RequestState:
         "load_first_block",
         "load_blocks",
         "emitted_saves",
+        "read_lease",
     )
 
-    def __init__(self, chain: BlockHashChain):
+    def __init__(self, chain: BlockHashChain) -> None:
         self.chain = chain
         #: The request's tokens, accumulated from the per-step deltas.
         self.tokens: List[int] = []
@@ -69,6 +70,7 @@ class _RequestState:
         self.load_first_block = 0
         self.load_blocks = 0
         self.emitted_saves = False
+        self.read_lease = ""
 
 
 class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
@@ -117,6 +119,9 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         """
         tokens = request.get_tokens(0)
         state = self._state_for(request, tokens)
+        if self._config.write_policy == "offload":
+            self._require_worker().release_read(request.request_id)
+            state.read_lease = ""
         state.load_first_block = 0
         state.load_blocks = 0
 
@@ -138,7 +143,12 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         if not candidates:
             return 0, False
 
-        hit_blocks = self._require_worker().count_prefix_hit(candidates)
+        if self._config.write_policy == "offload":
+            state.read_lease, hit_blocks = self._require_worker().reserve_prefix(
+                request.request_id, candidates
+            )
+        else:
+            hit_blocks = self._require_worker().count_prefix_hit(candidates)
         if hit_blocks == 0:
             return 0, False
 
@@ -168,6 +178,10 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         cancel_last = min(last, (end + self._tokens_per_block - 1) // self._tokens_per_block)
         if cancel_first >= cancel_last:
             return
+        if self._config.write_policy == "offload":
+            self._require_worker().release_read(
+                request.request_id, state.chain.hashes[cancel_first:cancel_last]
+            )
         if cancel_first == first:
             state.load_first_block = cancel_last
             state.load_blocks = last - cancel_last
@@ -237,6 +251,8 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             thread. Its pages are the source of those RDMA reads, so freeing
             them now would let a later request overwrite bytes mid-transfer.
         """
+        if self._config.write_policy == "offload":
+            self._require_worker().release_read(request.request_id)
         state = self._requests.pop(request.request_id, None)
         return bool(
             self._config.write_policy == "write_through"
@@ -292,7 +308,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         return min(len(state.chain.hashes), min(len(indices) for indices in state.pages.values()))
 
     def _loads_for(self, state: _RequestState, request_data: RequestData) -> RequestTransfers:
-        transfers = RequestTransfers(request_data.request_id)
+        transfers = RequestTransfers(request_data.request_id, read_lease=state.read_lease)
         limit = self._addressable_blocks(state)
         for offset in range(state.load_blocks):
             block = state.load_first_block + offset

@@ -394,6 +394,7 @@ kv_connector_config:
   mooncake_store:
     master_server_address: "host:50051"
     write_policy: offload  # or write_through (the default)
+    offload_coordinator_address: "host:50072"  # required for offload
 kv_cache_config:
   use_kv_cache_manager_v2: true
   enable_block_reuse: true
@@ -401,21 +402,57 @@ kv_cache_config:
 ```
 
 `write_through` publishes complete computed blocks after each forward pass.
-`offload` keeps those blocks on the GPU and publishes a page only when the local
-allocator selects it for eviction. Request completion alone does not publish it.
-The allocator retains ownership until the write completes; a failed publication
-fails the allocation and restores the eviction queue. This synchronous write can
-increase allocation latency under pressure. Offload currently requires the C++
-V2 backend and a GPU-only local cache hierarchy.
+`offload` maintains exclusive steady-state residency between participating GPU
+caches and the Mooncake CPU pool. It requires the C++ V2 backend, GPU block reuse,
+a GPU-only local cache hierarchy, and one shared ownership coordinator:
 
-Each target/draft layer group is published when its page is evicted. A remote
-block is reusable only after every required group is present. Locally cached
-blocks are unavailable to other engines until eviction. Restoring a block does
-not delete its shared copy, since other engines may still need it; total unique
-capacity therefore depends on overlap between GPU and Mooncake residency.
-For an externally supplied `MOONCAKE_CONFIG_PATH`, set `"write_policy": "offload"`
-in that JSON file instead.
+```yaml
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    master_server_address: "host:50051"
+    write_policy: offload
+    offload_coordinator_address: "host:50072"
+```
 
+Start the coordinator against a fresh Mooncake pool. Its connection JSON uses
+the same master, protocol, and RDMA devices as the workers. The coordinator
+contributes no pool memory. Its byte budget must fit the donated CPU pool,
+leaving allocator headroom:
+
+```bash
+python -m tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.ownership_server \
+  --config mooncake-connection.json --host 0.0.0.0 --port 50072 --capacity 5TiB
+```
+
+Every participating worker must use this coordinator. It tracks all GPU owners
+of a content key. Evicting one GPU copy publishes only if no other GPU owner
+remains; slot release commits the ownership transfer. Failed publication retains
+the GPU pages and revokes any partial writes. Request completion alone does not
+publish reusable GPU pages.
+
+Remote prefix matches hold read reservations before scheduler admission. Loads
+mark their reservations active before DMA; cancellation cannot remove an active
+reader's source. Once device data is ready, promotion registers the GPU owner.
+The last reader removes the CPU copy. Temporary duplication is limited to
+protected transfers. The CPU objects are hard pinned in Mooncake; the coordinator
+runs a byte-bounded LRU and evicts only unreserved CPU-only objects.
+
+Offload keys include an ownership-service epoch and are separate from
+write-through keys. Service restart or an ungraceful worker disconnect fences
+ownership; restart the pool and its workers together. This implementation does
+not provide ownership-service failover. Do not share its namespace with writers
+that bypass the coordinator.
+
+GPU-resident content is reusable locally but is not fetched from peer GPUs.
+Repeated content on multiple GPUs still consumes multiple GPU slots, so unique
+capacity is the union of participating GPU content and CPU content, not the sum
+of all physical allocation counters. A connector-free decode engine donating
+DRAM does not contribute reusable GPU capacity to this hierarchy.
+
+For an externally supplied `MOONCAKE_CONFIG_PATH`, include both
+`"write_policy": "offload"` and `"offload_coordinator_address": "host:50072"`
+in that JSON file.
 
 Publishes KV pages into a [Mooncake](https://github.com/kvcache-ai/Mooncake) store, a shared CPU memory pool addressed by content, so a prefix computed by one engine can be replayed by another. Regular block reuse cannot do this, because it never leaves the instance that computed the prefix.
 

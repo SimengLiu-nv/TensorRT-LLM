@@ -48,6 +48,7 @@ class RequestTransfers:
 
     request_id: int
     pages: List[PageTransfer] = field(default_factory=list)
+    read_lease: str = ""
 
 
 @dataclass

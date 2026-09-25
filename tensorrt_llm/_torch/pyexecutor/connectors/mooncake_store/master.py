@@ -339,6 +339,8 @@ def _client_config(
         "write_policy": pool.write_policy,
         "stage_through_host": pool.stage_through_host,
     }
+    if pool.offload_coordinator_address is not None:
+        config["offload_coordinator_address"] = pool.offload_coordinator_address
     if pool.cache_prefix is not None:
         config["cache_prefix"] = pool.cache_prefix
     # Left out when unset so the connector's own default applies instead of a

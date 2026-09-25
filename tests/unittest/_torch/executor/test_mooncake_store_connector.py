@@ -21,6 +21,7 @@ plain integers, which is all the addressing arithmetic needs.
 
 import contextlib
 import json
+import threading
 import time
 from collections.abc import Iterator, Sequence
 from pathlib import Path
@@ -58,6 +59,10 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
     MooncakeStoreMetadata,
     PageTransfer,
     RequestTransfers,
+)
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.ownership import OffloadDirectory
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.ownership_server import (
+    OwnershipServer,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
     MooncakeStoreConnectorScheduler,
@@ -114,6 +119,12 @@ class FakeStore:
             -1 if (key in self.fail_gets_for or key not in self.objects) else sum(size)
             for key, size in zip(keys, sizes)
         ]
+
+    def batch_remove(self, keys: list[str], force: bool = False) -> list[int]:
+        assert force
+        results = [0 if key in self.objects else -1 for key in keys]
+        self.objects.difference_update(keys)
+        return results
 
     def close(self):
         self.closed = True
@@ -212,14 +223,19 @@ def make_worker(
     pytest-threadleak snapshots threads around the call phase only, so
     fixture teardown would run too late to keep it quiet.
     """
+    initial_threads = set(threading.enumerate())
     worker = MooncakeStoreConnectorWorker(make_llm_args(enable_attention_dp=enable_attention_dp))
     fake_store.workers.append(worker)
     if layout is not None:
         worker.register_kv_cache_layout(layout)
+    owned_threads = set(threading.enumerate()) - initial_threads
     try:
         yield worker
     finally:
         worker.shutdown()
+        for thread in owned_threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive(), f"worker thread did not stop: {thread.name}"
 
 
 def make_request(request_id, tokens, cache_salt=None):
@@ -1310,40 +1326,71 @@ def test_write_policy_is_parsed_and_validated(store_config: Path, policy: str) -
         MooncakeStoreConnectorConfig.from_file(str(store_config))
 
 
-def test_offload_publishes_only_evicted_pages_and_invalidates_recycled_slots(
+@pytest.fixture
+def ownership_service(
     store_config: Path, fake_store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[OffloadDirectory]:
+    directory = OffloadDirectory(fake_store, 1024 * 1024)
+    with OwnershipServer(("127.0.0.1", 0), directory) as server:
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        raw = json.loads(store_config.read_text())
+        raw["write_policy"] = "offload"
+        raw["offload_coordinator_address"] = f"127.0.0.1:{server.server_address[1]}"
+        store_config.write_text(json.dumps(raw))
+        monkeypatch.setattr(
+            worker_module,
+            "_offload_replication_config",
+            lambda: SimpleNamespace(with_hard_pin=True),
+        )
+        try:
+            yield directory
+        finally:
+            for worker in fake_store.workers:
+                worker.shutdown()
+            server.shutdown()
+            thread.join()
+
+
+def test_offload_publishes_only_evicted_pages_and_invalidates_recycled_slots(
+    store_config: Path,
+    fake_store: FakeStore,
+    monkeypatch: pytest.MonkeyPatch,
+    ownership_service: OffloadDirectory,
 ) -> None:
-    raw = json.loads(store_config.read_text())
-    raw["write_policy"] = "offload"
-    store_config.write_text(json.dumps(raw))
     event = Mock()
     monkeypatch.setattr(torch.cuda, "Event", lambda: event)
     with make_worker(fake_store, layout=make_layout(num_groups=2)) as worker:
         manager = Mock()
         worker.register_kv_cache_manager(manager, layer_group_offset=1)
         evict, release = manager.set_gpu_eviction_callbacks.call_args.args
-        new_page = PageTransfer(b"new", 1, 2)
-        restored_page = PageTransfer(b"restored", 1, 3)
-        worker.bind_connector_meta(
-            MooncakeStoreMetadata(
-                loads=[RequestTransfers(1, [restored_page])],
-                saves=[RequestTransfers(1, [new_page])],
-            )
-        )
+        page = PageTransfer(b"new", 1, 2)
+        worker.bind_connector_meta(MooncakeStoreMetadata(saves=[RequestTransfers(1, [page])]))
         worker.wait_for_save(Mock())
         assert fake_store.put_calls == []
         assert worker._save_thread is None
         evict([(0, 2)])
         assert len(fake_store.put_calls) == 1
-        event.synchronize.assert_called_once()
+        assert ownership_service.statistics()["transitions"] == 1
         release(0, 2)
+        assert ownership_service.statistics()["transitions"] == 0
         evict([(0, 2)])
         assert len(fake_store.put_calls) == 1
-        # A restored page must remain eligible for offloading if the shared pool
-        # has discarded its copy while this GPU still holds it.
+        key = worker._page_key(page)
+        lease, count = worker._ownership.reserve_prefix([[key]])
+        assert count == 1
+        restored = PageTransfer(b"new", 1, 3)
+        worker.bind_connector_meta(
+            MooncakeStoreMetadata(loads=[RequestTransfers(2, [restored], read_lease=lease)])
+        )
+        worker.start_load_kv(Mock())
+        worker.wait_for_save(Mock())
+        assert key not in fake_store.objects
+        assert ownership_service.statistics()["overlap_keys"] == 0
         evict([(0, 3)])
         assert len(fake_store.put_calls) == 2
         release(0, 3)
+        assert key in fake_store.objects
         assert worker._offload_pages == {}
 
 
@@ -1353,6 +1400,7 @@ def test_offload_write_failure_keeps_candidate_for_retry(
     fake_store: FakeStore,
     monkeypatch: pytest.MonkeyPatch,
     results: list[int],
+    ownership_service: OffloadDirectory,
 ) -> None:
     raw = json.loads(store_config.read_text())
     raw["write_policy"] = "offload"
@@ -1376,6 +1424,7 @@ def test_offload_request_completion_does_not_pin_pages(
     raw["write_policy"] = "offload"
     store_config.write_text(json.dumps(raw))
     scheduler = MooncakeStoreConnectorScheduler(make_llm_args())
+    scheduler._worker = Mock()
     request = make_request(99, list(range(12)))
     state = scheduler._state_for(request, list(range(12)))
     state.emitted_saves = True

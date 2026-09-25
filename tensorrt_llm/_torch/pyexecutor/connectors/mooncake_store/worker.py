@@ -35,7 +35,7 @@ import traceback
 from collections import defaultdict
 from functools import partial
 from queue import Queue
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -50,6 +50,7 @@ from .addressing import PageAddressing
 from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig
 from .keys import KeyNamespace
 from .metadata import MooncakeStoreMetadata, PageTransfer, RequestTransfers
+from .ownership_server import OwnershipClient
 from .staging import (
     HostStagingPool,
     describe_batch_for_get,
@@ -60,7 +61,19 @@ from .staging import (
 from .staging import sync_stream as _sync_stream
 from .validation import validate_layout, validate_llm_args
 
+if TYPE_CHECKING:
+    from mooncake.store import ReplicateConfig
+
 __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
+
+
+def _offload_replication_config() -> "ReplicateConfig":
+    from mooncake.store import ReplicateConfig
+
+    config = ReplicateConfig()
+    config.with_hard_pin = True
+    return config
+
 
 #: Set by the worker's constructor so the scheduler adapter, built in the same
 #: process on every ADP owner (rank 0 for TP), can reach the store handle without
@@ -200,6 +213,18 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # Metadata only: ownership remains with KVCM until its eviction callback.
         self._offload_pages: dict[tuple[int, int], tuple[PageTransfer, torch.cuda.Event]] = {}
         self._offload_managers: list[RuntimeKVCacheManager] = []
+        self._ownership: OwnershipClient | None = None
+        self._offload_key_slots: dict[str, set[tuple[int, int]]] = {}
+        self._read_leases: dict[int, str] = {}
+        self._eviction_slots: dict[str, set[tuple[int, int]]] = {}
+        self._slot_evictions: dict[tuple[int, int], str] = {}
+        self._eviction_writes: dict[str, list[str]] = {}
+        if self._config.write_policy == "offload":
+            if not self._config.offload_coordinator_address:
+                raise ValueError("Mooncake offload requires offload_coordinator_address")
+            if not self._config.role.saves or not self._config.role.loads:
+                raise ValueError("Exclusive Mooncake offload requires role=both")
+            self._ownership = OwnershipClient(self._config.offload_coordinator_address)
 
         global _LOCAL_WORKER
         _LOCAL_WORKER = self
@@ -295,27 +320,127 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         )
         self._offload_managers.append(manager)
 
+    def _page_key(self, page: PageTransfer) -> str:
+        return self._namespaces[page.layer_group_id].key(page.block_hash)
+
+    def _track_offload_page(self, page: PageTransfer, event: torch.cuda.Event) -> None:
+        slot = (page.layer_group_id, page.page_index)
+        previous = self._offload_pages.get(slot)
+        if previous is not None and self._page_key(previous[0]) != self._page_key(page):
+            raise RuntimeError("GPU slot changed identity without a release callback")
+        self._offload_pages[slot] = (page, event)
+        self._offload_key_slots.setdefault(self._page_key(page), set()).add(slot)
+
     def _forget_offload_page(
         self, layer_group_id: int, page_index: int, *, layer_group_offset: int
     ) -> None:
-        """Invalidate a slot identity on every release, including cancellation."""
-        self._offload_pages.pop((layer_group_id + layer_group_offset, page_index), None)
+        """Commit ownership only as the allocator releases its source slots."""
+        slot = (layer_group_id + layer_group_offset, page_index)
+        entry = self._offload_pages.pop(slot, None)
+        if entry is None:
+            return
+        key = self._page_key(entry[0])
+        remaining = self._offload_key_slots[key]
+        remaining.remove(slot)
+        if not remaining:
+            del self._offload_key_slots[key]
+        token = self._slot_evictions.pop(slot, None)
+        assert self._ownership is not None
+        if token is not None:
+            slots = self._eviction_slots[token]
+            slots.remove(slot)
+            if not slots:
+                self._ownership.finish_eviction(token, True)
+                del self._eviction_slots[token]
+                del self._eviction_writes[token]
+        elif not remaining:
+            self._ownership.forget([key])
+
+    def _revoke_publications(self, keys: list[str]) -> None:
+        """Remove partial writes while the directory still fences their keys."""
+        if not keys:
+            return
+        present = self._store.batch_is_exist(keys)
+        if len(present) != len(keys) or any(status < 0 for status in present):
+            raise RuntimeError("Cannot establish partial offload publication state")
+        published = [key for key, status in zip(keys, present) if status == 1]
+        if published:
+            results = self._store.batch_remove(published, force=True)
+            if len(results) != len(published) or any(status != 0 for status in results):
+                raise RuntimeError("Cannot revoke partial offload publication")
 
     def _offload_evicted_pages(
         self, slots: list[tuple[int, int]], *, layer_group_offset: int
     ) -> None:
-        """Publish while KVCM still owns the selected slots; failure rolls back eviction."""
-        pages: list[PageTransfer] = []
-        for group, index in slots:
-            entry = self._offload_pages.get((group + layer_group_offset, index))
+        """Prepare a transfer; retain GPU ownership until the release callback."""
+        selected = {(group + layer_group_offset, index) for group, index in slots}
+        by_key: dict[str, PageTransfer] = {}
+        for slot in selected:
+            entry = self._offload_pages.get(slot)
             if entry is not None:
                 page, ready = entry
                 ready.synchronize()
-                pages.append(page)
-        if pages:
-            # This thread owns the staging buffer in offload mode. No background
-            # writer can race it, and KVCM cannot recycle sources until it returns.
-            self._put([RequestTransfers(request_id=0, pages=pages)])
+                key = self._page_key(page)
+                if self._offload_key_slots[key] <= selected:
+                    by_key[key] = page
+        if not by_key:
+            return
+        if any(slot in self._slot_evictions for slot in selected):
+            raise RuntimeError("A previous GPU eviction has not released its slots")
+        keys = list(by_key)
+        assert self._ownership is not None
+        assert self._addressing is not None
+        sizes = [self._addressing.bytes_per_page(by_key[key].layer_group_id) for key in keys]
+        token, writes = self._ownership.prepare_eviction(keys, sizes)
+        completed = False
+        try:
+            self._put([RequestTransfers(request_id=0, pages=[by_key[key] for key in writes])])
+            completed = True
+        finally:
+            if not completed:
+                self._revoke_publications(writes)
+                self._ownership.finish_eviction(token, False)
+        tracked = {slot for key in keys for slot in self._offload_key_slots[key]}
+        self._eviction_slots[token] = tracked
+        self._eviction_writes[token] = writes
+        for slot in tracked:
+            self._slot_evictions[slot] = token
+
+    def reserve_prefix(self, request_id: int, block_hashes: Sequence[bytes]) -> tuple[str, int]:
+        """Reserve all shards and layer groups before reporting reusable tokens."""
+        self.release_read(request_id)
+        assert self._ownership is not None
+        blocks = [
+            [
+                namespace.key(block_hash)
+                for group in self._peer_namespaces.values()
+                for namespace in group
+            ]
+            for block_hash in block_hashes
+        ]
+        lease, count = self._ownership.reserve_prefix(blocks)
+        if lease:
+            self._read_leases[request_id] = lease
+        return lease, count
+
+    def release_read(self, request_id: int, block_hashes: Sequence[bytes] | None = None) -> None:
+        lease = self._read_leases.get(request_id)
+        if lease and self._ownership is not None:
+            keys = (
+                None
+                if block_hashes is None
+                else [
+                    namespace.key(block_hash)
+                    for block_hash in block_hashes
+                    for group in self._peer_namespaces.values()
+                    for namespace in group
+                ]
+            )
+            if keys == []:
+                return
+            self._ownership.release_read(lease, keys)
+            if block_hashes is None:
+                del self._read_leases[request_id]
 
     def _open_staging(self, addressing: PageAddressing) -> None:
         """Allocate and register the pinned slots pages will pass through.
@@ -359,7 +484,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
     def _namespace(self, rank: int, layer_group_id: int, bytes_per_page: int) -> KeyNamespace:
         return KeyNamespace(
-            cache_prefix=self._config.cache_prefix,
+            cache_prefix=(
+                self._config.cache_prefix + "/exclusive-v1/" + self._ownership.epoch
+                if self._ownership is not None
+                else self._config.cache_prefix
+            ),
             model_key=self._model_key,
             rank=rank,
             world_size=self._attention_world_size,
@@ -432,13 +561,20 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
     # ---- load path ----
 
-    def start_load_kv(self, stream: torch.cuda.Stream):
+    def start_load_kv(self, stream: torch.cuda.Stream) -> None:
         """Pull every scheduled page into its GPU slot before the forward pass."""
         metadata: Optional[MooncakeStoreMetadata] = self.get_connector_meta()
         if metadata is None or not metadata.loads:
             return
         self._reraise_save_error()
 
+        if self._ownership is not None:
+            for transfer in metadata.loads:
+                if not transfer.read_lease:
+                    raise RuntimeError("Offload load was admitted without a read reservation")
+                self._ownership.start_read(
+                    transfer.read_lease, list({self._page_key(page) for page in transfer.pages})
+                )
         keys, addresses, sizes, total_pages = self._resolve(metadata.loads)
         if not keys:
             return
@@ -481,6 +617,18 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 # these pages, so the scatter has to complete before either.
                 _sync_stream(handle)
 
+        if self._ownership is not None:
+            event = torch.cuda.Event()
+            event.record(stream)
+            event.synchronize()
+            for transfer in metadata.loads:
+                if not transfer.read_lease:
+                    raise RuntimeError("Offload load was admitted without a read reservation")
+                self._ownership.claim(
+                    [self._page_key(page) for page in transfer.pages], transfer.read_lease
+                )
+                for page in transfer.pages:
+                    self._track_offload_page(page, event)
         logger.debug(f"mooncake-store rank {self._rank} loaded {total_pages} pages")
 
     def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream):
@@ -510,9 +658,18 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             if candidates:
                 event = torch.cuda.Event()
                 event.record(stream)
+                event.synchronize()
+                assert self._ownership is not None
+                assert self._addressing is not None
+                claims = {
+                    self._page_key(page): self._addressing.bytes_per_page(page.layer_group_id)
+                    for transfer in metadata.saves
+                    for page in transfer.pages
+                }
+                self._ownership.claim(list(claims), sizes=list(claims.values()))
                 for transfer in candidates:
                     for page in transfer.pages:
-                        self._offload_pages[(page.layer_group_id, page.page_index)] = (page, event)
+                        self._track_offload_page(page, event)
             return
         if not metadata.saves:
             return
@@ -634,11 +791,16 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 )
                 # The store reads the slots on this thread, so fill them first.
                 _sync_stream(handle)
-            results = self._store.batch_put_from_multi_buffers(
-                [batch_keys[i] for i in pending],
-                source_addresses,
-                source_sizes,
-            )
+            put_keys = [batch_keys[i] for i in pending]
+            if self._ownership is not None:
+                config = _offload_replication_config()
+                results = self._store.batch_put_from_multi_buffers(
+                    put_keys, source_addresses, source_sizes, config
+                )
+            else:
+                results = self._store.batch_put_from_multi_buffers(
+                    put_keys, source_addresses, source_sizes
+                )
             failures = sum(1 for result in results if not isinstance(result, int) or result < 0)
             failures += abs(len(pending) - len(results))
             if failures and self._config.write_policy == "offload":
@@ -694,7 +856,17 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         for manager in self._offload_managers:
             manager.set_gpu_eviction_callbacks(None, None)
         self._offload_managers.clear()
+        if self._ownership is not None:
+            for token, keys in self._eviction_writes.items():
+                self._revoke_publications(keys)
+                self._ownership.finish_eviction(token, False)
+            self._ownership.close()
+            self._ownership = None
         self._offload_pages.clear()
+        self._offload_key_slots.clear()
+        self._eviction_slots.clear()
+        self._eviction_writes.clear()
+        self._slot_evictions.clear()
         thread, self._save_thread = self._save_thread, None
         if thread is not None:
             self._save_queue.put(None)

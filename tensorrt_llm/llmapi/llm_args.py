@@ -2377,12 +2377,20 @@ class MooncakeStoreConfig(StrictBaseModel):
         None,
         description="Key namespace for the pool. Bump it after any change to "
         "page layout or contents. Defaults to 'trtllm'.")
+    offload_coordinator_address: Optional[str] = Field(
+        default=None,
+        telemetry=False,
+        description=
+        "Host:port of the shared exclusive-offload ownership service. Required "
+        "when write_policy is offload; every worker sharing the pool must use the same service.",
+    )
     write_policy: Literal["write_through", "offload"] = Field(
         default="write_through",
         description="When to publish complete GPU KV blocks to Mooncake. "
         "write_through publishes after computation; offload publishes only "
         "when KVCM evicts the GPU page and waits for publication before reuse. "
-        "Offload requires the C++ V2 manager and a GPU-only local cache.",
+        "Offload requires the C++ V2 manager, a GPU-only local cache, and a shared "
+        "ownership coordinator; restored CPU copies are retired after active reads finish.",
     )
     stage_through_host: bool = Field(
         False,

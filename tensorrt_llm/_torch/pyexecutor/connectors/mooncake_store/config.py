@@ -167,6 +167,7 @@ class MooncakeStoreConnectorConfig:
     transfer_batch_size: int = 64
     #: Publish completed pages immediately or only when GPU slots are evicted.
     write_policy: Literal["write_through", "offload"] = "write_through"
+    offload_coordinator_address: str | None = None
     #: Pass pages through a pinned host buffer instead of registering the KV
     #: pools with Mooncake. Costs a copy each way, but works without GPUDirect
     #: RDMA, which registering device memory requires.
@@ -212,6 +213,7 @@ class MooncakeStoreConnectorConfig:
             model_key=raw.get("model_key") or None,
             transfer_batch_size=int(raw.get("transfer_batch_size", 64)),
             write_policy=raw.get("write_policy", "write_through"),
+            offload_coordinator_address=raw.get("offload_coordinator_address"),
             stage_through_host=bool(raw.get("stage_through_host", False)),
             staging_buffer_bytes=parse_size(
                 raw.get("staging_buffer_bytes", DEFAULT_STAGING_BUFFER_SIZE)
