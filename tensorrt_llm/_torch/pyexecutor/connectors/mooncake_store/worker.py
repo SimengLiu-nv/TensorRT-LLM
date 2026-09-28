@@ -41,7 +41,7 @@ import time
 import traceback
 from collections import defaultdict
 from queue import Queue
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -147,7 +147,15 @@ def _batched(items: Sequence, size: int):
 class _AsyncLoadStats:
     """Counters for the asynchronous loader, summarised once per interval."""
 
-    __slots__ = ("completed", "wait_sum", "wait_max", "xfer_sum", "xfer_max", "failed_pages", "loaded_bytes")
+    __slots__ = (
+        "completed",
+        "wait_sum",
+        "wait_max",
+        "xfer_sum",
+        "xfer_max",
+        "failed_pages",
+        "loaded_bytes",
+    )
 
     def __init__(self) -> None:
         self.reset()
@@ -264,7 +272,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # One shared FIFO: an idle worker thread takes the next request, so a
         # request is handled by exactly one worker and starts in arrival order.
         self._load_queue: "Queue[Optional[Tuple[int, RequestTransfers, float]]]" = Queue()
-        self._async_workers = max(1, int(self._config.async_load_workers)) if self._async_load else 0
+        self._async_workers = (
+            max(1, int(self._config.async_load_workers)) if self._async_load else 0
+        )
         self._load_threads: List[threading.Thread] = []
         self._load_lock = threading.Lock()
         self._load_streams: List[Optional[torch.cuda.Stream]] = []
@@ -537,7 +547,12 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         if failed_requests:
             # The executor takes these requests out of the batch and restarts
-            # them from local reuse; see `take_failed_load_requests`.
+            # them from local reuse; see `take_failed_load_requests`. Nothing of
+            # theirs is computed this pass, so their saves leave the bound
+            # metadata now: `wait_for_save` would otherwise read pages the
+            # executor has freed (or another request has since filled) and
+            # publish them under the failed request's valid keys.
+            self.drop_bound_saves(failed_requests)
             self._failed_load_requests.update(failed_requests)
             logger.warning(
                 f"mooncake-store rank {self._rank} failed to load {num_failed_pages} page(s) "
@@ -738,7 +753,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                     self._async_pending.discard(request_id)
                     self._async_done[request_id] = failed
                     self._async_stats.record(
-                        started_at - enqueued_at, finished_at - started_at, num_failed_pages, loaded_bytes
+                        started_at - enqueued_at,
+                        finished_at - started_at,
+                        num_failed_pages,
+                        loaded_bytes,
                     )
 
     def take_failed_load_requests(self) -> Set[int]:
@@ -750,6 +768,31 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         """
         failed, self._failed_load_requests = self._failed_load_requests, set()
         return failed
+
+    def drop_bound_saves(self, request_ids: Iterable[int]) -> int:
+        """Remove these requests' saves from the metadata bound for this pass.
+
+        For a request taken out of the batch after `build_connector_meta` ran
+        (a failed prefix load, a restart): its scheduled tail is never
+        computed, so none of it may be published. Edits the bound metadata in
+        place, which is the object `wait_for_save` reads. Returns the number of
+        save entries removed.
+        """
+        metadata: Optional[MooncakeStoreMetadata] = self.get_connector_meta()
+        if metadata is None or not metadata.saves:
+            return 0
+        drop = set(request_ids)
+        saves = metadata.saves
+        kept = [transfers for transfers in saves if transfers.request_id not in drop]
+        removed = len(saves) - len(kept)
+        if removed:
+            dropped_ids = sorted({transfers.request_id for transfers in saves} & drop)
+            saves[:] = kept
+            logger.debug(
+                f"mooncake-store rank {self._rank} dropped the saves of requests "
+                f"{dropped_ids} ({removed} entr{'y' if removed == 1 else 'ies'}) from this pass"
+            )
+        return removed
 
     def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream):
         """No-op: loads complete in `start_load_kv`.

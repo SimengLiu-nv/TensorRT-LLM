@@ -1003,6 +1003,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def forget_request(self, request: LlmRequest) -> None:
         """Drop everything keyed to a request that is about to restart from scratch."""
+        # Saves bound for this pass would publish pages the request never
+        # computed. The worker already drops them when a synchronous load
+        # fails, and a parked request has none bound; this covers any other
+        # caller that restarts a request after the metadata was built.
+        drop_saves = getattr(self.worker, "drop_bound_saves", None)
+        if drop_saves is not None:
+            drop_saves([request.request_id])
         self.reset_request_state(request)
         if self.scheduler is not None:
             forget = getattr(self.scheduler, "forget_request", None)

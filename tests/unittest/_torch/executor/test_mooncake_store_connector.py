@@ -654,6 +654,60 @@ def test_worker_load_skips_the_rest_of_a_failed_request_and_keeps_the_others(
         assert worker._namespaces[0].key(present) in fetched
 
 
+def test_worker_failed_load_drops_that_requests_saves_from_the_pass(store_config, fake_store):
+    """A mixed batch: the request that lost a page must not publish its scheduled tail.
+
+    `build_connector_meta` bound the saves of every scheduled request before the
+    load ran. The failed request leaves the batch without computing anything, so
+    only the surviving request's saves may reach `wait_for_save`.
+    """
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as worker:
+        present, missing = bytes([1]) * 16, bytes([2]) * 16
+        tail_ok, tail_failed = bytes([3]) * 16, bytes([4]) * 16
+        fake_store.objects.add(worker._namespaces[0].key(present))
+        loads = [
+            RequestTransfers(7, [PageTransfer(present, 0, 1)]),
+            RequestTransfers(8, [PageTransfer(missing, 0, 2)]),
+        ]
+        saves = [
+            RequestTransfers(7, [PageTransfer(tail_ok, 0, 3)]),
+            RequestTransfers(8, [PageTransfer(tail_failed, 0, 4)]),
+        ]
+        metadata = SimpleNamespace(loads=loads, saves=saves)
+        worker.bind_connector_meta(metadata)
+        worker.start_load_kv(None)
+        assert worker.take_failed_load_requests() == {8}
+        # What `wait_for_save` will hand to the save thread after the pass:
+        assert [transfers.request_id for transfers in worker.get_connector_meta().saves] == [7]
+        assert metadata.saves is worker.get_connector_meta().saves  # edited in place
+        assert 8 not in worker._outstanding_saves
+        # Dropping a request that has nothing bound leaves the survivor alone.
+        assert worker.drop_bound_saves([9]) == 0
+        assert [transfers.request_id for transfers in metadata.saves] == [7]
+
+
+def test_worker_drops_bound_saves_of_a_restarted_request_even_when_it_was_the_whole_batch(
+    store_config, fake_store
+):
+    """An attention-DP owner whose only request failed runs a dummy forward: no saves at all."""
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as worker:
+        missing, tail = bytes([2]) * 16, bytes([4]) * 16
+        metadata = SimpleNamespace(
+            loads=[RequestTransfers(8, [PageTransfer(missing, 0, 2)])],
+            saves=[RequestTransfers(8, [PageTransfer(tail, 0, 4)])],
+        )
+        worker.bind_connector_meta(metadata)
+        worker.start_load_kv(None)
+        assert worker.take_failed_load_requests() == {8}
+        assert metadata.saves == []
+        # With nothing bound to save, the post-pass handoff is a no-op.
+        worker.wait_for_save(None)
+        assert worker._save_queue.empty()
+        assert not worker._outstanding_saves
+        # A second drop is harmless, as is dropping an unknown request.
+        assert worker.drop_bound_saves([8, 9]) == 0
+
+
 def test_worker_load_addresses_the_requested_page(store_config, fake_store):
     layout = make_layout(regions_per_group=2)
     with make_worker(fake_store, layout=layout) as worker:
@@ -1545,7 +1599,10 @@ def test_scheduler_starts_the_async_load_when_the_pages_are_reported(store_confi
     ((request_id, transfers),) = scheduler._worker.async_loads
     state = scheduler._requests[1]
     assert request_id == 1
-    assert [(page.layer_group_id, page.page_index) for page in transfers.pages] == [(0, 10), (0, 11)]
+    assert [(page.layer_group_id, page.page_index) for page in transfers.pages] == [
+        (0, 10),
+        (0, 11),
+    ]
     assert [page.block_hash for page in transfers.pages] == list(state.chain.hashes[:2])
 
     # The offer is consumed: the request comes back as a new scheduler-output
