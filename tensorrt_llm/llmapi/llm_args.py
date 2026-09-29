@@ -2391,6 +2391,22 @@ class MooncakeStoreConfig(StrictBaseModel):
         "that cannot hold that many reduces the batch instead of failing, so "
         "undersizing it costs throughput quietly. Defaults to the connector's "
         "own 512MiB.")
+    async_load: bool = Field(
+        False,
+        telemetry=False,
+        description="Load a served prefix on a background thread while the "
+        "runtime parks the request, so the transfer does not sit inside the "
+        "executor iteration (which every attention-DP rank waits on). The "
+        "request rejoins the batch once its pages have landed. Requires "
+        "attention DP or a single rank: each owner loads its own whole pages.")
+    async_load_workers: int = Field(
+        1,
+        ge=1,
+        telemetry=False,
+        description="Threads serving asynchronous loads, each with its own "
+        "CUDA stream and staging slots; staging_buffer_bytes is split across "
+        "them (never below 64 pages each). Requests are taken from one FIFO by "
+        "the first free worker, so several parked requests transfer at once.")
 
     @model_validator(mode="after")
     def _require_exactly_one_master(self) -> "MooncakeStoreConfig":

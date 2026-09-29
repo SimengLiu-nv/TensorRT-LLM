@@ -173,6 +173,11 @@ class MooncakeStoreConnectorConfig:
     #: sized from the layout's largest page, so this caps how many pages may be
     #: in flight rather than how large one may be.
     staging_buffer_bytes: int = DEFAULT_STAGING_BUFFER_SIZE
+    #: Load a served prefix on a background thread while the runtime parks the
+    #: request, instead of inside the executor iteration. See the worker.
+    async_load: bool = False
+    #: Load worker threads (each with its own stream and staging slots).
+    async_load_workers: int = 1
 
     def __post_init__(self) -> None:
         """Reject settings that would fail later, inside a transfer."""
@@ -186,6 +191,8 @@ class MooncakeStoreConnectorConfig:
             raise ValueError("transfer_batch_size must be > 0")
         if self.stage_through_host and self.staging_buffer_bytes <= 0:
             raise ValueError("staging_buffer_bytes must be > 0 when staging is on")
+        if self.async_load_workers < 1:
+            raise ValueError("async_load_workers must be >= 1")
 
     @staticmethod
     def from_file(path: str) -> "MooncakeStoreConnectorConfig":
@@ -211,6 +218,8 @@ class MooncakeStoreConnectorConfig:
             staging_buffer_bytes=parse_size(
                 raw.get("staging_buffer_bytes", DEFAULT_STAGING_BUFFER_SIZE)
             ),
+            async_load=bool(raw.get("async_load", False)),
+            async_load_workers=int(raw.get("async_load_workers", 1)),
         )
 
     @staticmethod

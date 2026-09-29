@@ -982,6 +982,40 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         override = getattr(type(self.scheduler), "cancel_load", None)
         return override is not KvCacheConnectorScheduler.cancel_load
 
+    def take_failed_load_requests(self) -> set:
+        """Requests the worker could not load pages for in this iteration.
+
+        Empty for connectors that raise on a failed load. See
+        `PyExecutor._recover_failed_connector_loads` for what happens to them.
+        """
+        take = getattr(self.worker, "take_failed_load_requests", None)
+        return set(take()) if take is not None else set()
+
+    def take_failed_async_load_requests(self) -> set:
+        """Parked requests whose asynchronous load lost a page.
+
+        Reported through `get_finished` like a completed load, so the request
+        leaves its parked state; the executor then drops its allocation and lets
+        it restart. See `PyExecutor._recover_failed_async_loads`.
+        """
+        take = getattr(self.worker, "take_failed_async_load_requests", None)
+        return set(take()) if take is not None else set()
+
+    def forget_request(self, request: LlmRequest) -> None:
+        """Drop everything keyed to a request that is about to restart from scratch."""
+        # Saves bound for this pass would publish pages the request never
+        # computed. The worker already drops them when a synchronous load
+        # fails, and a parked request has none bound; this covers any other
+        # caller that restarts a request after the metadata was built.
+        drop_saves = getattr(self.worker, "drop_bound_saves", None)
+        if drop_saves is not None:
+            drop_saves([request.request_id])
+        self.reset_request_state(request)
+        if self.scheduler is not None:
+            forget = getattr(self.scheduler, "forget_request", None)
+            if forget is not None:
+                forget(request.request_id)
+
     def reset_request_state(self, request: LlmRequest) -> None:
         """Tell the connector bookkeeping that this request's allocation died.
 
