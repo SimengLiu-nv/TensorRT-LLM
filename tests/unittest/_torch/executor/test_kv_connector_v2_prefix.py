@@ -216,7 +216,11 @@ class FakeConnectorManager:
         pass
 
 
-def make_manager(connector, num_extra_kv_tokens=0, is_draft=False):
+def make_manager(
+    connector: FakeConnectorManager | None,
+    num_extra_kv_tokens: int = 0,
+    is_draft: bool = False,
+) -> KVCacheManagerV2:
     """A cache manager carrying only the fields the prefix path reads.
 
     Constructing a real one needs a GPU and a pool allocation; what is under
@@ -267,14 +271,14 @@ def serve(manager, req, kv_cache):
     return manager._apply_connector_matched_prefix(req)
 
 
-def prepare(manager, req, kv_cache):
-    """Drive the real ``_prepare_context_impl``: one scheduling pass.
+def prepare(manager: KVCacheManagerV2, req: FakeRequest, kv_cache: FakeKvCache) -> bool:
+    """Drive the public ``prepare_context`` scheduling entry point.
 
     This is where ``aggressive_prefix_budgeting`` asks and reserves, so it is
     also where the scheduler would read ``context_remaining_length`` back.
     """
     manager.kv_cache_map[req.py_request_id] = kv_cache
-    return manager._prepare_context_impl(req)
+    return manager.prepare_context(req)
 
 
 class TestAskTiming:
@@ -906,13 +910,16 @@ class TestBudgetedAskTiming:
         "attribute",
         ["is_dummy", "is_generation_only_request", "is_disagg_generation_init_state"],
     )
-    def test_request_kinds_that_are_never_asked(self, attribute):
+    def test_request_kinds_that_are_never_asked(self, attribute: str) -> None:
         connector = budgeting(64)
         manager = make_manager(connector)
         req = FakeRequest()
         setattr(req, attribute, True)
 
-        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+        # Gen-init has its own scheduling entry point; exercise the connector
+        # eligibility gate directly for all excluded request kinds.
+        manager.kv_cache_map[req.py_request_id] = FakeKvCache(committed=0, capacity=PROMPT_LEN)
+        manager.prepare_connector_prefix(req)
 
         assert connector.queries == []
 
