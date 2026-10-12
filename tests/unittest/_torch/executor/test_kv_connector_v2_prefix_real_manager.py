@@ -91,7 +91,12 @@ class FakeConnectorManager:
         if end > start:
             self.cancels.append((request.py_request_id, start, end))
 
-    def build_scheduler_output(self, scheduled_batch, kv_cache_manager):
+    def build_scheduler_output(
+        self,
+        scheduled_batch: ScheduledRequests,
+        kv_cache_manager: KVCacheManagerV2,
+        additional_kv_cache_managers: tuple[KVCacheManagerV2, ...] = (),
+    ) -> None:
         pass
 
 
@@ -134,12 +139,13 @@ def schedule(manager: KVCacheManagerV2, request: LlmRequest, num_tokens: int | N
     return manager.resize_context(request, num_tokens)
 
 
-def run(manager, *requests):
-    """One ``prepare_resources``, i.e. the requests reached the final batch."""
+def run(manager: KVCacheManagerV2, *requests: LlmRequest) -> ScheduledRequests:
+    """Prepare the final batch and publish its completed allocation handoff."""
     batch = ScheduledRequests()
     for request in requests:
         batch.append_context_request(request)
     manager.prepare_resources(batch)
+    manager.report_batch_to_connector(batch)
     return batch
 
 

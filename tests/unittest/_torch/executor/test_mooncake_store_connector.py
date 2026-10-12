@@ -1587,12 +1587,13 @@ def test_scheduler_rejects_async_load_under_tensor_parallelism(store_config):
         MooncakeStoreConnectorScheduler(llm_args)
 
 
-def test_scheduler_starts_the_async_load_when_the_pages_are_reported(store_config):
+def test_scheduler_starts_the_async_load_when_the_pages_are_reported(store_config: Path) -> None:
     """The offer goes to the load thread with the pages the runtime reserved."""
     scheduler = make_async_scheduler(store_config, hit_blocks=2)
     tokens = list(range(5 * TOKENS_PER_BLOCK))
     request = make_request(1, tokens)
     assert scheduler.get_num_new_matched_tokens(request, 0) == (2 * TOKENS_PER_BLOCK, True)
+    request.py_num_connector_matched_tokens = 2 * TOKENS_PER_BLOCK
 
     scheduler.update_state_after_alloc_by_layer_group(request, [[10, 11, 12, 13, 14]])
 
@@ -1626,20 +1627,48 @@ def test_scheduler_starts_the_async_load_when_the_pages_are_reported(store_confi
     assert len(scheduler._worker.async_loads) == 1
 
 
-def test_scheduler_async_load_stops_at_the_pages_the_runtime_reserved(store_config):
+def test_scheduler_async_load_stops_at_the_honoured_prefix(store_config: Path) -> None:
     scheduler = make_async_scheduler(store_config, hit_blocks=3)
     request = make_request(1, list(range(6 * TOKENS_PER_BLOCK)))
     scheduler.get_num_new_matched_tokens(request, 0)
-    # Only two blocks have pages: the third offered block is left to recompute.
-    scheduler.update_state_after_alloc_by_layer_group(request, [[20, 21]])
+    # Three pages exist, but only two offered blocks were honoured. The third
+    # page holds the locally computed tail and must not be overwritten.
+    request.py_num_connector_matched_tokens = 2 * TOKENS_PER_BLOCK
+    scheduler.update_state_after_alloc_by_layer_group(request, [[20, 21, 22]])
     ((_request_id, transfers),) = scheduler._worker.async_loads
     assert [page.page_index for page in transfers.pages] == [20, 21]
+    assert scheduler._requests[1].async_loaded_upto == 2
 
 
-def test_scheduler_async_flat_alloc_is_a_single_group(store_config):
+@pytest.mark.parametrize("pages", [[], [[20]], [[20, BAD_PAGE_INDEX]]])
+def test_scheduler_async_load_rejects_incomplete_honoured_prefix(
+    store_config: Path, pages: list[list[int]]
+) -> None:
+    scheduler = make_async_scheduler(store_config, hit_blocks=2)
+    request = make_request(1, list(range(6 * TOKENS_PER_BLOCK)))
+    scheduler.get_num_new_matched_tokens(request, 0)
+    request.py_num_connector_matched_tokens = 2 * TOKENS_PER_BLOCK
+    with pytest.raises(RuntimeError, match="honoured prefix"):
+        scheduler.update_state_after_alloc_by_layer_group(request, pages)
+    assert scheduler._worker.async_loads == []
+
+
+def test_scheduler_async_load_with_no_honoured_tokens_loads_nothing(store_config: Path) -> None:
+    scheduler = make_async_scheduler(store_config, hit_blocks=2)
+    request = make_request(1, list(range(6 * TOKENS_PER_BLOCK)))
+    scheduler.get_num_new_matched_tokens(request, 0)
+    request.py_num_connector_matched_tokens = 0
+    scheduler.update_state_after_alloc_by_layer_group(request, [[20, 21]])
+    ((_request_id, transfers),) = scheduler._worker.async_loads
+    assert transfers.pages == []
+    assert scheduler._requests[1].async_loaded_upto == 0
+
+
+def test_scheduler_async_flat_alloc_is_a_single_group(store_config: Path) -> None:
     scheduler = make_async_scheduler(store_config, hit_blocks=1)
     request = make_request(1, list(range(4 * TOKENS_PER_BLOCK)))
     scheduler.get_num_new_matched_tokens(request, 0)
+    request.py_num_connector_matched_tokens = TOKENS_PER_BLOCK
     scheduler.update_state_after_alloc(request, [30, 31, 32, 33])
     ((_request_id, transfers),) = scheduler._worker.async_loads
     assert [(page.layer_group_id, page.page_index) for page in transfers.pages] == [(0, 30)]

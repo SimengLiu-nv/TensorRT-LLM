@@ -33,9 +33,12 @@ block-alignment assertion, so a version of this code that violates either fails
 here rather than only on hardware.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
@@ -204,7 +207,12 @@ class FakeConnectorManager:
         if end > start:
             self.cancels.append((request.request_id, start, end))
 
-    def build_scheduler_output(self, scheduled_batch, kv_cache_manager):
+    def build_scheduler_output(
+        self,
+        scheduled_batch: SimpleNamespace,
+        kv_cache_manager: KVCacheManagerV2,
+        additional_kv_cache_managers: tuple[KVCacheManagerV2, ...] = (),
+    ) -> None:
         pass
 
 
@@ -228,7 +236,7 @@ def make_manager(connector, num_extra_kv_tokens=0, is_draft=False):
     manager._stream = SimpleNamespace(cuda_stream=0)
     # One layer group, the shape every non-VSWA, non-hybrid model has. The real
     # accessor reads `impl.layer_grouping`, which only a pool allocation fills
-    # in, so it is stubbed here rather than bypassed -- `_run_kv_connector_hooks`
+    # in, so it is stubbed here rather than bypassed -- `report_batch_to_connector`
     # derives the flat list from this and hands the connector both forms.
     manager.get_page_indices_by_layer_group = lambda request: [[]]
     return manager
@@ -242,6 +250,13 @@ def scheduled(*requests):
 
     batch.reset_context_requests = reset_context_requests
     return batch
+
+
+def report_prepared_batch(manager: KVCacheManagerV2, batch: SimpleNamespace) -> None:
+    """Drive prefix preparation and the post-resource allocation handoff."""
+    manager._run_kv_connector_hooks(batch)
+    with patch.object(torch.cuda, "stream", side_effect=lambda stream: nullcontext()):
+        manager.report_batch_to_connector(batch)
 
 
 def serve(manager, req, kv_cache):
@@ -281,7 +296,7 @@ class TestAskTiming:
         assert connector.queries == []
         assert req.context_current_position == 64
 
-    def test_the_connector_is_asked_once_per_allocation(self):
+    def test_the_connector_is_asked_once_per_allocation(self) -> None:
         """Serving leaves ``is_first_context_chunk`` true, by design -- it is
         ``context_current_position == prepopulated_prompt_len`` and
         ``set_prepopulated_prompt_len`` moves both. So the first-chunk test
@@ -293,13 +308,13 @@ class TestAskTiming:
         kv_cache = FakeKvCache(committed=0, capacity=PROMPT_LEN)
         manager.kv_cache_map[req.py_request_id] = kv_cache
 
-        manager._run_kv_connector_hooks(scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
         assert req.is_first_context_chunk
-        manager._run_kv_connector_hooks(scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
 
         assert len(connector.queries) == 1
 
-    def test_a_second_pass_reports_one_allocation(self):
+    def test_a_second_pass_reports_one_allocation(self) -> None:
         """``should_add_sequence`` is not enough on its own.
 
         It only goes false once an asynchronous load has *completed*. A batch
@@ -314,13 +329,13 @@ class TestAskTiming:
         req = FakeRequest()
         manager.kv_cache_map[req.py_request_id] = FakeKvCache(committed=0, capacity=PROMPT_LEN)
 
-        manager._run_kv_connector_hooks(scheduled(req))
-        manager._run_kv_connector_hooks(scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
 
         assert len(connector.queries) == 1
         assert len(connector.allocs) == 1
 
-    def test_an_excluded_request_is_still_reported_once(self):
+    def test_an_excluded_request_is_still_reported_once(self) -> None:
         """The allocation is reported for every first-chunk sequence added,
         including the kinds the connector is never asked about."""
         connector = FakeConnectorManager(num_matched=64)
@@ -329,13 +344,13 @@ class TestAskTiming:
         req.is_disagg_generation_init_state = True
         manager.kv_cache_map[req.py_request_id] = FakeKvCache(committed=0, capacity=PROMPT_LEN)
 
-        manager._run_kv_connector_hooks(scheduled(req))
-        manager._run_kv_connector_hooks(scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
 
         assert connector.queries == []
         assert len(connector.allocs) == 1
 
-    def test_a_destroyed_allocation_is_asked_again(self):
+    def test_a_destroyed_allocation_is_asked_again(self) -> None:
         """A destructive pause replays the sequence add and with it the query,
         because the pages the first answer described are gone."""
         connector = FakeConnectorManager(num_matched=64)
@@ -343,15 +358,15 @@ class TestAskTiming:
         req = FakeRequest()
         manager.kv_cache_map[req.py_request_id] = FakeKvCache(committed=0, capacity=PROMPT_LEN)
 
-        manager._run_kv_connector_hooks(scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
         req.py_connector_allocation_reported = False  # what free_resources does
         req.context_current_position = 0
         req.prepopulated_prompt_len = 0
-        manager._run_kv_connector_hooks(scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
 
         assert len(connector.queries) == 2
 
-    def test_a_completed_async_load_is_not_asked_again(self):
+    def test_a_completed_async_load_is_not_asked_again(self) -> None:
         """``should_add_sequence`` is the re-entry gate.
 
         A request whose asynchronous load finished re-enters the batch still on
@@ -363,7 +378,7 @@ class TestAskTiming:
         req = FakeRequest()
         manager.kv_cache_map[req.py_request_id] = FakeKvCache(committed=0, capacity=PROMPT_LEN)
 
-        manager._run_kv_connector_hooks(scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
 
         assert connector.queries == []
         assert connector.allocs == []
@@ -684,7 +699,7 @@ class TestAsyncLoad:
 
 
 class TestBatchBookkeeping:
-    def test_a_served_prefix_rebuilds_the_chunking_split(self):
+    def test_a_served_prefix_rebuilds_the_chunking_split(self) -> None:
         """A shift can carry a request onto its last chunk, which moves it
         between ``context_requests_chunking`` and ``context_requests_last_chunk``
         -- the lists ``build_scheduler_output`` walks."""
@@ -694,22 +709,22 @@ class TestBatchBookkeeping:
         manager.kv_cache_map[req.py_request_id] = FakeKvCache(committed=0, capacity=PROMPT_LEN)
         batch = scheduled(req)
 
-        manager._run_kv_connector_hooks(batch)
+        report_prepared_batch(manager, batch)
 
         assert batch.reset_calls == 1
 
-    def test_an_unserved_batch_leaves_the_split_alone(self):
+    def test_an_unserved_batch_leaves_the_split_alone(self) -> None:
         connector = FakeConnectorManager(num_matched=0)
         manager = make_manager(connector)
         req = FakeRequest()
         manager.kv_cache_map[req.py_request_id] = FakeKvCache(committed=0, capacity=PROMPT_LEN)
         batch = scheduled(req)
 
-        manager._run_kv_connector_hooks(batch)
+        report_prepared_batch(manager, batch)
 
         assert batch.reset_calls == 0
 
-    def test_allocation_is_reported_after_the_prefix_is_served(self):
+    def test_allocation_is_reported_after_the_prefix_is_served(self) -> None:
         """The pages the connector may write into include the ones the grow
         added, so the report has to follow the serve."""
         seen = []
@@ -723,7 +738,7 @@ class TestBatchBookkeeping:
             kv_cache.capacity
         ) or [[]]
 
-        manager._run_kv_connector_hooks(scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
 
         assert seen == [192]
         # The per-layer-group form is what reaches the connector. Asserting it
@@ -748,7 +763,7 @@ class TestReEntryAfterAServe:
         req = FakeRequest()
         manager.kv_cache_map[req.py_request_id] = FakeKvCache(committed=0, capacity=PROMPT_LEN)
         assert manager.prepare_context(req)
-        manager._run_kv_connector_hooks(scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
         served_position = req.context_current_position
         assert manager.prepare_context(req)
         return req, served_position
@@ -780,7 +795,7 @@ class TestReEntryAfterAServe:
         assert req.context_current_position == served_position
         assert req.is_first_context_chunk
 
-    def test_a_dead_allocation_drops_the_floor(self):
+    def test_a_dead_allocation_drops_the_floor(self) -> None:
         """A replay recomputes from its own match: the served position vouches
         for pages that died with the allocation."""
         connector = FakeConnectorManager(num_matched=64, load_async=True)
@@ -788,7 +803,7 @@ class TestReEntryAfterAServe:
         req = FakeRequest()
         manager.kv_cache_map[req.py_request_id] = FakeKvCache(committed=0, capacity=PROMPT_LEN)
         assert manager.prepare_context(req)
-        manager._run_kv_connector_hooks(scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
         assert req.py_connector_served_position == 64
 
         req.py_connector_allocation_reported = False  # what free_resources does
@@ -1118,39 +1133,39 @@ class TestBudgetedCancellation:
 class TestBudgetedDelivery:
     """``prepare_resources`` still owns the commit and the page report."""
 
-    def test_the_commit_is_the_served_amount(self):
+    def test_the_commit_is_the_served_amount(self) -> None:
         connector = budgeting(64)
         manager = make_manager(connector)
         req = FakeRequest()
         prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
 
-        manager._run_kv_connector_hooks(scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
 
         assert connector.commits == [(0, 64, False)]
         assert len(connector.allocs) == 1
         assert req.py_connector_allocation_reported
 
-    def test_the_commit_is_the_served_amount_not_the_offer(self):
+    def test_the_commit_is_the_served_amount_not_the_offer(self) -> None:
         connector = budgeting(48)
         manager = make_manager(connector)
         req = FakeRequest()
         prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
 
-        manager._run_kv_connector_hooks(scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
 
         assert connector.commits == [(0, TOKENS_PER_BLOCK, False)]
 
-    def test_the_async_flag_reaches_the_commit(self):
+    def test_the_async_flag_reaches_the_commit(self) -> None:
         connector = budgeting(64, load_async=True)
         manager = make_manager(connector)
         req = FakeRequest()
         prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
 
-        manager._run_kv_connector_hooks(scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
 
         assert connector.commits == [(0, 64, True)]
 
-    def test_the_async_flag_survives_a_trimmed_offer(self):
+    def test_the_async_flag_survives_a_trimmed_offer(self) -> None:
         """The connector started the transfer inside its answer, whether or not
         the runtime kept the whole range."""
         connector = budgeting(48, load_async=True)
@@ -1158,23 +1173,23 @@ class TestBudgetedDelivery:
         req = FakeRequest()
         prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
 
-        manager._run_kv_connector_hooks(scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
 
         assert connector.commits == [(0, TOKENS_PER_BLOCK, True)]
 
-    def test_a_second_pass_delivers_once(self):
+    def test_a_second_pass_delivers_once(self) -> None:
         connector = budgeting(64)
         manager = make_manager(connector)
         req = FakeRequest()
         prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
 
-        manager._run_kv_connector_hooks(scheduled(req))
-        manager._run_kv_connector_hooks(scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
+        report_prepared_batch(manager, scheduled(req))
 
         assert len(connector.commits) == 1
         assert len(connector.allocs) == 1
 
-    def test_the_batch_split_is_left_alone(self):
+    def test_the_batch_split_is_left_alone(self) -> None:
         """The chunk moved in ``prepare_context``, before the scheduler built
         the chunking / last-chunk split, so there is nothing to rebuild."""
         connector = budgeting(64)
@@ -1183,6 +1198,6 @@ class TestBudgetedDelivery:
         prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
         batch = scheduled(req)
 
-        manager._run_kv_connector_hooks(batch)
+        report_prepared_batch(manager, batch)
 
         assert batch.reset_calls == 0
