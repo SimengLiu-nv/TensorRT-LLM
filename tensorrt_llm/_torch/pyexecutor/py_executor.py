@@ -3965,8 +3965,13 @@ class PyExecutor:
                     self.resource_manager.prepare_resources(
                         scheduled_batch, publish_connector_output=False)
             self.kv_connector_manager.handle_metadata()
-            self.kv_connector_manager.worker.start_load_kv(
-                torch.cuda.current_stream())
+            # V2 page reuse/COW runs on the execution stream. Restores must
+            # follow those operations rather than race them on the default
+            # stream (including copies issued by host-staged connectors).
+            load_stream = (self.execution_stream if isinstance(
+                self.kv_cache_manager, KVCacheManagerV2) else
+                           torch.cuda.current_stream())
+            self.kv_connector_manager.worker.start_load_kv(load_stream)
             failed = self.kv_connector_manager.take_failed_load_requests()
             if failed:
                 self._recover_failed_connector_loads(scheduled_batch, failed)

@@ -525,7 +525,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
     # ---- load path ----
 
-    def start_load_kv(self, stream: torch.cuda.Stream):
+    def start_load_kv(self, stream: torch.cuda.Stream) -> None:
         """Pull every scheduled page into its GPU slot before the forward pass."""
         metadata: Optional[MooncakeStoreMetadata] = self.get_connector_meta()
         if metadata is None or not metadata.loads:
@@ -541,6 +541,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         staging = self._load_staging
         handle = _stream_handle(stream) if staging is not None else 0
+        if staging is None and stream is not None:
+            # A CPU-issued GPU RDMA write does not join this CUDA stream.
+            # Retire its allocation/COW work before the store can overwrite
+            # a recycled destination. Staged scatters are ordered by stream.
+            stream.synchronize()
         failed_requests, num_failed_pages, first_failure, _ = self._load_pages(
             keys, addresses, sizes, owners, staging, handle
         )

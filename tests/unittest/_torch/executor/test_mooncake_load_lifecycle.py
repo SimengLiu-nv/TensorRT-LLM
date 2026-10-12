@@ -175,3 +175,40 @@ def test_failed_load_releases_speculative_slot_before_retry(async_load: bool) ->
     executor.kv_cache_manager.drop_context_allocation.assert_called_once_with(req)
     executor.draft_kv_cache_manager.free_resources.assert_called_once_with(req)
     executor.kv_connector_manager.forget_request.assert_called_once_with(req)
+
+
+@pytest.mark.parametrize("v2", [False, True])
+def test_sync_restore_uses_the_allocator_stream(v2: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = Mock()
+    executor.kv_connector_manager.take_failed_load_requests.return_value = set()
+    executor.enable_attention_dp = False
+    executor.kv_cache_manager = Mock(spec=KVCacheManagerV2) if v2 else object()
+    executor.execution_stream = Mock()
+    default_stream = Mock()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: default_stream)
+    executor._kv_connector_start_batch(ScheduledRequests())
+    expected = executor.execution_stream if v2 else default_stream
+    executor.kv_connector_manager.worker.start_load_kv.assert_called_once_with(expected)
+
+
+def test_sync_gpu_rdma_waits_for_allocation_readiness() -> None:
+    worker = object.__new__(MooncakeStoreConnectorWorker)
+    transfers = RequestTransfers(7, [PageTransfer(b"prefix", 0, 1)])
+    worker.get_connector_meta = Mock(return_value=SimpleNamespace(loads=[transfers]))
+    worker._reraise_background_error = Mock()
+    worker._resolve = Mock(return_value=(["key"], [[123]], [[64]], 1))
+    worker._load_staging = None
+    worker._rank = 0
+    sequence = Mock()
+    stream = Mock()
+    stream.synchronize.side_effect = lambda: sequence.ready()
+
+    def load_pages(*args: object) -> tuple[set[int], int, None, int]:
+        sequence.transfer()
+        assert stream.synchronize.call_count == 1
+        return set(), 0, None, 64
+
+    worker._load_pages = load_pages
+    worker.start_load_kv(stream)
+    assert [entry[0] for entry in sequence.mock_calls] == ["ready", "transfer"]
