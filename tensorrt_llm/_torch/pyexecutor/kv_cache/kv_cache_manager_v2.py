@@ -4012,7 +4012,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return by_group
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
         if self.is_draft:
             # Mirror the main manager. Under one-model spec decoding the
             # scheduler may already have created the context cache.
@@ -4026,12 +4026,13 @@ class KVCacheManagerV2(BaseResourceManager):
             self._run_kv_connector_hooks(scheduled_batch)
 
     def _run_kv_connector_hooks(self, scheduled_batch: ScheduledRequests) -> None:
-        """Serve the connector prefix, then report the pages it may write into.
+        """Reserve the connector prefix before the draft manager mirrors its capacity.
 
-        Runs on the batch the forward pass will actually execute, which is what
-        makes the page indices reported here the ones the connector may write
-        into. Under ``aggressive_prefix_budgeting`` the prefix was already
-        reserved in ``prepare_context``, so only the delivery is left.
+        Runs on the batch prepared for execution. Under
+        ``aggressive_prefix_budgeting`` the prefix was already reserved in
+        ``prepare_context``, so only the honoured count is left to commit.
+        ``report_batch_to_connector`` hands over the destination pages after
+        all resource managers have prepared them.
         """
         served_any = False
         for request in scheduled_batch.context_requests:
@@ -4054,13 +4055,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 self._deliver_connector_prefix(request)
             else:
                 served_any |= self._apply_connector_matched_prefix(request)
-            request.py_connector_allocation_reported = True
-            # Both forms are offered; the manager picks the one this connector
-            # implements. With several layer groups the flat list is empty,
-            # because a page index is scoped to a group.
-            by_group = self.get_page_indices_by_layer_group(request)
-            flat = by_group[0] if len(by_group) == 1 else []
-            self.kv_connector_manager.update_state_after_alloc(request, flat, by_group)
+            # Reporting page addresses may start an asynchronous write. Defer
+            # that handoff until report_batch_to_connector, after the draft
+            # manager has prepared its pages too.
 
         if served_any:
             # A served prefix can carry a request past its last chunk boundary,
@@ -4086,6 +4083,27 @@ class KVCacheManagerV2(BaseResourceManager):
             additional_managers = (
                 (draft_kv_cache_manager,) if draft_kv_cache_manager is not None else ()
             )
+            for request in scheduled_batch.context_requests:
+                if (
+                    not request.is_first_context_chunk
+                    or request.py_connector_allocation_reported
+                    or not self.kv_connector_manager.should_add_sequence(request)
+                ):
+                    continue
+                by_group = [
+                    indices
+                    for manager in (self, *additional_managers)
+                    for indices in manager.get_page_indices_by_layer_group(request)
+                ]
+                flat = by_group[0] if len(by_group) == 1 else []
+                # Allocation/COW copies and waits for recycled pages belong
+                # to the cache stream. Let a background loader record its
+                # readiness event after those operations, including draft KV.
+                for manager in additional_managers:
+                    self._stream.wait_stream(manager._stream)
+                with torch.cuda.stream(self._stream):
+                    self.kv_connector_manager.update_state_after_alloc(request, flat, by_group)
+                request.py_connector_allocation_reported = True
             self.kv_connector_manager.build_scheduler_output(
                 scheduled_batch, self, additional_managers
             )

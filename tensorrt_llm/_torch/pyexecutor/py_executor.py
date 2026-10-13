@@ -3965,14 +3965,20 @@ class PyExecutor:
                     self.resource_manager.prepare_resources(
                         scheduled_batch, publish_connector_output=False)
             self.kv_connector_manager.handle_metadata()
-            self.kv_connector_manager.worker.start_load_kv(
-                torch.cuda.current_stream())
+            # V2 page reuse/COW runs on the execution stream. Restores must
+            # follow those operations rather than race them on the default
+            # stream (including copies issued by host-staged connectors).
+            load_stream = (self.execution_stream if isinstance(
+                self.kv_cache_manager, KVCacheManagerV2) else
+                           torch.cuda.current_stream())
+            self.kv_connector_manager.worker.start_load_kv(load_stream)
             failed = self.kv_connector_manager.take_failed_load_requests()
             if failed:
                 self._recover_failed_connector_loads(scheduled_batch, failed)
 
-    def _recover_failed_connector_loads(self, scheduled_batch: ScheduledRequests,
-                                        failed_ids) -> None:
+    def _recover_failed_connector_loads(self,
+                                        scheduled_batch: ScheduledRequests,
+                                        failed_ids: set[int]) -> None:
         """Restart context requests whose connector prefix could not be loaded.
 
         The connector offered a stored prefix, the scheduler skipped the request
@@ -3991,11 +3997,7 @@ class PyExecutor:
                 (dropped if req.request_id in failed_ids else kept).append(req)
             setattr(scheduled_batch, key, kept)
         for req in dropped:
-            self.kv_cache_manager.drop_context_allocation(req)
-            draft_kv_cache_manager = getattr(self, "draft_kv_cache_manager", None)
-            if isinstance(draft_kv_cache_manager, KVCacheManagerV2):
-                draft_kv_cache_manager.free_resources(req)
-            self.kv_connector_manager.forget_request(req)
+            self._restart_failed_connector_load(req)
         logger.warning(
             f"kv connector: {len(dropped)} context request(s) restarted after a failed "
             f"prefix load: {[req.request_id for req in dropped]}")
@@ -4018,7 +4020,21 @@ class PyExecutor:
             if failed:
                 self._recover_failed_async_loads(failed)
 
-    def _recover_failed_async_loads(self, failed_ids) -> None:
+    def _restart_failed_connector_load(self, req: LlmRequest) -> None:
+        """Release the failed prefix and the first chunk's speculative state."""
+        self.kv_connector_manager.forget_request(req)
+        self.kv_cache_manager.drop_context_allocation(req)
+        if isinstance(self.draft_kv_cache_manager, KVCacheManagerV2):
+            self.draft_kv_cache_manager.free_resources(req)
+        # Resource preparation preceded the load. MTP already owns a hidden
+        # state slot, and its next first-chunk preparation must not allocate
+        # another slot for the same request.
+        spec_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if spec_manager is not None:
+            spec_manager.free_resources(req)
+
+    def _recover_failed_async_loads(self, failed_ids: set[int]) -> None:
         """Restart parked requests whose asynchronous prefix load lost a page.
 
         The same outcome as `_recover_failed_connector_loads`, reached from a
@@ -4036,11 +4052,7 @@ class PyExecutor:
                 # Finished or cancelled while parked; that path released the
                 # allocation, and there is nothing left to rewind.
                 continue
-            self.kv_cache_manager.drop_context_allocation(req)
-            draft_kv_cache_manager = getattr(self, "draft_kv_cache_manager", None)
-            if isinstance(draft_kv_cache_manager, KVCacheManagerV2):
-                draft_kv_cache_manager.free_resources(req)
-            self.kv_connector_manager.forget_request(req)
+            self._restart_failed_connector_load(req)
             req.state = LlmRequestState.CONTEXT_INIT
             restarted.append(request_id)
         logger.warning(

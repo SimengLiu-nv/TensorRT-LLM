@@ -271,7 +271,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             )
         # One shared FIFO: an idle worker thread takes the next request, so a
         # request is handled by exactly one worker and starts in arrival order.
-        self._load_queue: "Queue[Optional[Tuple[int, RequestTransfers, float]]]" = Queue()
+        self._load_queue: "Queue[Optional[Tuple[int, RequestTransfers, float, Optional[torch.cuda.Event]]]]" = Queue()
         self._async_workers = (
             max(1, int(self._config.async_load_workers)) if self._async_load else 0
         )
@@ -525,7 +525,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
     # ---- load path ----
 
-    def start_load_kv(self, stream: torch.cuda.Stream):
+    def start_load_kv(self, stream: torch.cuda.Stream) -> None:
         """Pull every scheduled page into its GPU slot before the forward pass."""
         metadata: Optional[MooncakeStoreMetadata] = self.get_connector_meta()
         if metadata is None or not metadata.loads:
@@ -541,6 +541,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         staging = self._load_staging
         handle = _stream_handle(stream) if staging is not None else 0
+        if staging is None and stream is not None:
+            # A CPU-issued GPU RDMA write does not join this CUDA stream.
+            # Retire its allocation/COW work before the store can overwrite
+            # a recycled destination. Staged scatters are ordered by stream.
+            stream.synchronize()
         failed_requests, num_failed_pages, first_failure, _ = self._load_pages(
             keys, addresses, sizes, owners, staging, handle
         )
@@ -649,12 +654,19 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if not self._async_load:
             raise RuntimeError("mooncake-store asynchronous loads are not enabled")
         self._reraise_background_error()
+        ready = None
+        if transfers.pages and torch.cuda.is_available():
+            # The allocation callback runs on the KV manager's stream. Its
+            # page-reuse waits and COW copies must retire before another
+            # stream or CPU-issued RDMA writes the same destinations.
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream())
         with self._load_lock:
             if not transfers.pages:
                 self._async_done[request_id] = False
                 return
             self._async_pending.add(request_id)
-        self._load_queue.put((request_id, transfers, time.monotonic()))
+        self._load_queue.put((request_id, transfers, time.monotonic(), ready))
 
     def take_failed_async_load_requests(self) -> Set[int]:
         """Parked requests reported by `get_finished` whose pages were not all loaded.
@@ -710,7 +722,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             item = self._load_queue.get()
             if item is None:
                 return
-            request_id, transfers, enqueued_at = item
+            request_id, transfers, enqueued_at, ready = item
             started_at = time.monotonic()
             with self._load_lock:
                 self._async_active.add(request_id)
@@ -718,6 +730,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             num_failed_pages = 0
             loaded_bytes = 0
             try:
+                if ready is not None:
+                    # A CUDA stream wait cannot order the host-side store
+                    # call. Wait on this load thread so both direct RDMA and
+                    # staged copies respect allocation readiness.
+                    ready.synchronize()
                 keys, addresses, sizes, total_pages = self._resolve([transfers])
                 owners = [request_id] * len(keys)
                 failed_requests, num_failed_pages, first_failure, loaded_bytes = self._load_pages(

@@ -232,29 +232,40 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         state = self._requests.get(request.request_id)
         if state is None or state.load_blocks == 0:
             return
+        # The synchronous metadata path is built from the honoured prefix.
+        # An asynchronous request never reaches that path while parked, so
+        # use the runtime's committed count here too. Capacity beyond this
+        # range is for local computation, not permission to restore more KV.
+        load_blocks = request.py_num_connector_matched_tokens // self._tokens_per_block
+        if not 0 <= load_blocks <= state.load_blocks:
+            raise RuntimeError("Mooncake honoured prefix exceeds the outstanding load offer")
+        load_end = state.load_first_block + load_blocks
         transfers = RequestTransfers(request.request_id)
         limit = min(
             len(state.chain.hashes),
             min((len(indices) for indices in block_ids_by_layer_group), default=0),
         )
-        for offset in range(state.load_blocks):
+        for offset in range(load_blocks):
             block = state.load_first_block + offset
             if block >= limit:
-                # The runtime reserved fewer pages than the offer covered. It
-                # recomputes that tail itself once the request resumes.
-                break
+                raise RuntimeError(
+                    "Mooncake honoured prefix has missing destination pages; "
+                    "cannot report an incomplete asynchronous load as finished"
+                )
             pages: List[PageTransfer] = []
             for layer_group_id, indices in enumerate(block_ids_by_layer_group):
                 page_index = int(indices[block])
                 if page_index == BAD_PAGE_INDEX:
-                    pages = []
-                    break
+                    raise RuntimeError(
+                        "Mooncake honoured prefix has an invalid destination page; "
+                        "cannot report an incomplete asynchronous load as finished"
+                    )
                 pages.append(PageTransfer(state.chain.hashes[block], layer_group_id, page_index))
             transfers.pages.extend(pages)
         # Consumed here rather than in `build_connector_meta`: the request is not
         # in the scheduler output while it is parked, and must not be loaded a
         # second time when it comes back.
-        state.async_loaded_upto = state.load_first_block + state.load_blocks
+        state.async_loaded_upto = load_end
         state.load_blocks = 0
         self._require_worker().start_async_load(request.request_id, transfers)
 
