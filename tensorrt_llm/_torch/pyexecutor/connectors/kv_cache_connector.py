@@ -1042,6 +1042,23 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             )
         )
 
+    def has_pending_async_loads(self) -> bool:
+        """Whether a request is parked outside the batch awaiting its prefix load.
+
+        A parked request keeps its allocation in
+        ``DISAGG_GENERATION_TRANS_IN_PROGRESS``, so the scheduler neither counts
+        it as a candidate nor sees progress while the load runs. `get_finished`
+        returns it to context state once every rank reports the load landed.
+        """
+        return any(
+            requests.loading
+            for requests in (
+                self.new_async_requests,
+                self.pending_async_requests,
+                self.local_finished_async_requests,
+            )
+        )
+
     def _validate_speculative_prefill_request(self, request: LlmRequest) -> None:
         """Keep MTP's append-only connector page lists on context-only work."""
         if (

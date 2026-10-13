@@ -281,9 +281,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         Args:
             active_requests: Requests still participating in model execution.
             inflight_request_ids: Requests held by queued model work.
-            has_pending_kv_transfers: Whether completed requests still retain
-                their KV pages for asynchronous transfer. They may already be
-                absent from active_requests.
+            has_pending_kv_transfers: Whether requests outside the batch still
+                retain KV pages for an asynchronous transfer: completed
+                requests sending or saving (possibly already absent from
+                active_requests), or context requests parked for a connector
+                load.
         """
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
         # Main scheduling loop

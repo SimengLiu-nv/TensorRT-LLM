@@ -6533,6 +6533,20 @@ class PyExecutor:
                 return context_requests[:i]
         return context_requests
 
+    def _has_pending_kv_transfers(self) -> bool:
+        """Whether KV pages are held by work that completes outside the batch.
+
+        Native sends and connector saves are claims on the transfer manager.
+        An asynchronous connector load is not: its request is parked outside
+        the batch with its allocation until `get_finished` reports the load.
+        Under a slow store that wait can outlast the scheduler's stall limit,
+        and the parked pages can be all that keeps other prompts out.
+        """
+        if self.async_transfer_manager.has_any_inflight_requests():
+            return True
+        return (self.kv_connector_manager is not None
+                and self.kv_connector_manager.has_pending_async_loads())
+
     @nvtx_range("_schedule")
     def _schedule(self) -> Tuple[ScheduledRequests, List[LlmRequest], int]:
         if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
@@ -6543,8 +6557,7 @@ class PyExecutor:
             scheduler_output = self.scheduler.schedule_request(
                 self.active_requests,
                 self.inflight_req_ids,
-                has_pending_kv_transfers=self.async_transfer_manager.
-                has_any_inflight_requests())
+                has_pending_kv_transfers=self._has_pending_kv_transfers())
         else:
             scheduler_output = self.scheduler.schedule_request(
                 self.active_requests, self.inflight_req_ids)

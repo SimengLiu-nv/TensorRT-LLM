@@ -1590,7 +1590,7 @@ class TestDeadlockDetection:
         self, transfer_count: int, pages_released: bool
     ) -> None:
         """Retained KV pages can block prefill after its owner left the active list."""
-        from tensorrt_llm._torch.disaggregation.executor.transfer_manager import (
+        from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import (
             AsyncTransferManager,
         )
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -1616,6 +1616,7 @@ class TestDeadlockDetection:
         executor.scheduler = sched
         executor.kv_cache_manager = mgr
         executor.async_transfer_manager = transfers
+        executor.kv_connector_manager = None
         executor.active_requests = [blocked]
         executor.inflight_req_ids = set()
         executor.enable_attention_dp = True
@@ -1642,6 +1643,85 @@ class TestDeadlockDetection:
                 executor._schedule()
             with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
                 executor._schedule()
+
+    def test_executor_waits_for_parked_connector_load(self) -> None:
+        """A prompt blocked behind pages held by a parked restore is not a deadlock.
+
+        An asynchronous connector load parks its request outside the batch in
+        DISAGG_GENERATION_TRANS_IN_PROGRESS with its allocation intact. It is
+        neither a candidate nor progress, and the transfer manager does not own
+        it, so a store slower than the stall limit used to abort the server.
+        """
+        from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import (
+            AsyncTransferManager,
+        )
+        from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
+            KvCacheConnectorManager,
+        )
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+        from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+
+        class _ADPConnectorMock(Mock):
+            supports_attention_dp = True
+
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        blocked = make_ctx_request(0, 100, is_first_context_chunk=False)
+        parked = make_ctx_request(7, 100)
+        parked.is_dummy_request = False
+
+        worker = _ADPConnectorMock()
+        worker.get_finished.return_value = ([], [])
+        connector = KvCacheConnectorManager(worker, _ADPConnectorMock(), enable_attention_dp=True)
+        connector.commit_new_matched_tokens(parked, 64, True)
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [parked]
+        connector.take_scheduled_requests_pending_load(batch)
+        assert batch.batch_size == 0
+        assert parked.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        # A mock's state_value does not follow its state.
+        parked.state_value = DISAGG_GEN_TRANS_IN_PROGRESS
+        parked.is_context_init_state = False
+
+        resources = Mock()
+        resources.resource_managers = {ResourceManagerType.KV_CACHE_MANAGER: mgr}
+        executor = object.__new__(PyExecutor)
+        executor.scheduler = sched
+        executor.kv_cache_manager = mgr
+        executor.async_transfer_manager = AsyncTransferManager(resources, should_store_blocks=False)
+        executor.kv_connector_manager = connector
+        executor.active_requests = [blocked, parked]
+        executor.inflight_req_ids = set()
+        executor.enable_attention_dp = True
+        executor.attention_dp_enable_balance = False
+        executor.is_encoder_decoder = False
+        executor._cap_context_by_total_kv_len = Mock(side_effect=lambda requests: requests)
+
+        # The load is outstanding across the executor's per-iteration poll.
+        for _ in range(sched._DEADLOCK_STALL_ITERS + 1):
+            batch, _, _ = executor._schedule()
+            assert batch.batch_size == 0
+            assert connector.get_finished() == []
+            assert connector.has_pending_async_loads()
+
+        # The load lands: the request returns to context state and stops
+        # shielding the scheduler.
+        worker.get_finished.return_value = ([], [parked.request_id])
+        connector.get_finished()
+        assert parked.state == LlmRequestState.CONTEXT_INIT
+        assert not connector.has_pending_async_loads()
+
+        # A persistent allocation failure once nothing is parked must still
+        # trip the deadlock guard.
+        for _ in range(sched._DEADLOCK_STALL_ITERS - 1):
+            executor._schedule()
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+            executor._schedule()
 
     def test_transient_stall_does_not_raise(self):
         """One bad iteration is normal; the counter has to reset."""
