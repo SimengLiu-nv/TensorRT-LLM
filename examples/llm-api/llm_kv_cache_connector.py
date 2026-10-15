@@ -73,22 +73,18 @@ python llm_kv_cache_connector.py meta-llama/Llama-3.1-8B-Instruct
 - This example uses content-based hashing to identify cache blocks
 - Cache files are stored in a temporary directory (cleaned up after the demo)
 - The implementation is simplified and not optimized for production use
-- Does not support chunked prefill or sharded attention TP in this example
-- ADP adapters may share a cache directory on a shared filesystem. Use a
-  separate directory for each model revision, KV dtype, layout and block size.
+- Does not support chunked prefill in this example
 - See `tensorrt_llm/_torch/pyexecutor/kv_cache_connector.py` for the full connector interface
 
 **NOTE:** This example connector implementation is designed for demonstration purposes
 and is NOT suitable for production use without additional optimizations and error handling.
 '''
 
-import hashlib
-import json
 import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from tempfile import NamedTemporaryFile, TemporaryDirectory
+from tempfile import TemporaryDirectory
 from typing import Optional
 
 import click
@@ -100,9 +96,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
 
-# The TLLM_ prefix is load-bearing: MpiPoolSession forwards only TRTLLM*/TLLM*
-# variables to spawned workers, and the scheduler reads this key inside them.
-CONNECTOR_CACHE_FOLDER_KEY = "TLLM_CONNECTOR_CACHE_FOLDER"
+CONNECTOR_CACHE_FOLDER_KEY = "CONNECTOR_CACHE_FOLDER"
 
 
 @dataclass
@@ -113,14 +107,8 @@ class PersistentKvCacheConnectorMetadata:
 
 class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
 
-    supports_attention_dp = True
-
-    def __init__(self, llm_args: TorchLlmArgs) -> None:
+    def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
-
-        if llm_args.tensor_parallel_size > 1 and not llm_args.enable_attention_dp:
-            raise NotImplementedError(
-                "The example requires unsharded attention KV cache.")
 
         self.kv_cache_tensor = None
 
@@ -143,10 +131,10 @@ class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
                 f"{sum(len(g.regions) for g in layout.groups)} region(s).")
         self.kv_cache_tensor = layout.groups[0].regions[0].as_tensor()
 
-    def start_load_kv(self, stream: torch.cuda.Stream) -> None:
+    def start_load_kv(self, stream: torch.cuda.Stream):
         # Do all loads synchronously, and blockwise.
         for path, block_id in self._metadata.load:
-            cpu_tensor = torch.load(path, map_location="cpu", weights_only=True)
+            cpu_tensor = torch.load(path, map_location="cpu")
 
             # Copy into the device block.
             self.kv_cache_tensor[block_id].copy_(cpu_tensor, non_blocking=False)
@@ -157,7 +145,7 @@ class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
     def save_kv_layer(self, layer_idx: int, stream: torch.cuda.Stream):
         pass
 
-    def wait_for_save(self, stream: torch.cuda.Stream) -> None:
+    def wait_for_save(self, stream: torch.cuda.Stream):
 
         # Make sure the forward pass is complete before beginning our save.
         stream.synchronize()
@@ -169,15 +157,8 @@ class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
             if Path(path).exists():
                 continue
 
-            # Publish only complete files. Multiple ADP owners can save the
-            # same prefix concurrently, while another owner starts a restore.
-            with NamedTemporaryFile(dir=Path(path).parent, delete=False) as tmp:
-                temporary_path = Path(tmp.name)
-            try:
-                torch.save(cpu_tensor, temporary_path)
-                os.replace(temporary_path, path)
-            finally:
-                temporary_path.unlink(missing_ok=True)
+            # Do a blocking save to the file. This way, we only return once all saves are complete.
+            torch.save(cpu_tensor, path)
 
     def get_finished(
             self, finished_gen_req_ids: list[int],
@@ -187,8 +168,6 @@ class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
 
 
 class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
-
-    supports_attention_dp = True
 
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
@@ -227,9 +206,8 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
             for block_pos in range(num_computed_blocks + len(pending_load),
                                    len(block_ids)):
                 if len(chunks[block_pos]) == self.block_size:
-                    # KV for a block depends on the entire preceding prefix.
-                    prefix = req.new_tokens[:(block_pos + 1) * self.block_size]
-                    hashed_tokens = self._hash_tokens(prefix, req.cache_salt)
+                    hashed_tokens = self._hash_tokens(chunks[block_pos],
+                                                      req.cache_salt)
 
                     file_path = self._file_path(hashed_tokens)
 
@@ -239,14 +217,12 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
         return metadata
 
-    def _hash_tokens(self, tokens: list[int], cache_salt: Optional[str]) -> str:
+    def _hash_tokens(self, tokens: list[int], cache_salt: Optional[str]) -> int:
         # cache_salt must participate in the hash so that requests carrying
         # different salts (or no salt) cannot collide on the same cache file.
-        # Python's hash is randomized independently in different processes.
-        content = json.dumps([cache_salt, tokens], separators=(",", ":"))
-        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return abs(hash((cache_salt, tuple(tokens))))
 
-    def _file_path(self, hash_value: str) -> Path:
+    def _file_path(self, hash_value: int) -> Path:
         return Path(self.cache_folder) / f"{hash_value}.pt"
 
     def _chunk_tokens(self, tokens: list[int]) -> list[list[int]]:
@@ -267,20 +243,16 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
         computed_blocks = num_computed_tokens // self.block_size
 
         # Get all the tokens that don't have a cache hit on device.
-        tokens = request.get_tokens(0)
-        # Leave the final prompt token for computing the first output logits.
-        remaining_tokens = tokens[computed_blocks * self.block_size:-1]
+        remaining_tokens = request.get_tokens(0)[computed_blocks *
+                                                 self.block_size:]
 
         remaining_chunks = self._chunk_tokens(remaining_tokens)
 
         # For each chunk, check if it exists in our cache.
-        for block_offset, chunk in enumerate(remaining_chunks):
+        for chunk in remaining_chunks:
             # Only do full blocks.
             if len(chunk) == self.block_size:
-                prefix_end = (computed_blocks + block_offset +
-                              1) * self.block_size
-                hashed_tokens = self._hash_tokens(tokens[:prefix_end],
-                                                  request.cache_salt)
+                hashed_tokens = self._hash_tokens(chunk, request.cache_salt)
 
                 file_path = self._file_path(hashed_tokens)
 
