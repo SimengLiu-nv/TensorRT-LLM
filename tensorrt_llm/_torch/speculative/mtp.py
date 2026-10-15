@@ -85,11 +85,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
         # allocate hidden state tensors
         for req in context_batch:
             if req.is_first_context_chunk:
-                # A request that was loaded asynchronously re-enters the batch
-                # still on its first context chunk, already holding its slot.
-                slot_id = self.slot_manager.get_slot(req.request_id)
-                if slot_id is None:
-                    slot_id = self.slot_manager.add_slot(req.request_id)
+                slot_id = self.slot_manager.add_slot(req.request_id)
                 if self.use_relaxed_acceptance_for_thinking:
                     self.mtp_relaxed_delta_pool[slot_id].copy_(
                         0, non_blocking=True)
