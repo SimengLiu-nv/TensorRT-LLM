@@ -389,7 +389,6 @@ class TestStatsSerializer:
                     window_size=16,
                     kind="attention",
                     stats=life_cycle_stats,
-                    connector_reused_blocks=2,
                 ),
                 4: KVCacheV2SsmLifeCycleIterationStats(
                     life_cycle_id=4,
@@ -440,7 +439,6 @@ class TestStatsSerializer:
         assert life_cycle["kind"] == "attention"
         assert life_cycle["iterReusedBlocks"] == 5
         assert life_cycle["iterMissedBlocks"] == 3
-        assert life_cycle["iterConnectorReusedBlocks"] == 2
         assert "iterGenAllocBlocks" not in life_cycle
         ssm_life_cycle = d["kvCacheIterationStatsByLifecycle"]["4"]
         assert ssm_life_cycle == {
