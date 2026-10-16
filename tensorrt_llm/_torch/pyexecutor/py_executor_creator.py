@@ -336,6 +336,26 @@ def log_memory_usage(stage: str):
     )
 
 
+def _connector_runs_speculative_prefill_only(spec_config, kv_connector_config,
+                                             cache_transceiver_config) -> bool:
+    """Whether a Mooncake connector may run alongside speculative decoding.
+
+    Context-only requests on a disaggregated prefill server never reject draft
+    tokens, so the append-only page deltas the connector relies on stay valid
+    there. That holds for one-model drafting, MTP and EAGLE3 alike: the draft
+    KV lives in the target pool or in a paired draft pool that is registered
+    with the connector. Generation work is rejected at the connector boundary
+    (`KvCacheConnectorManager.speculative_prefill_only`).
+    """
+    if spec_config is None:
+        return False
+    one_model_draft = (isinstance(spec_config, MTPDecodingConfig)
+                       or spec_config.spec_dec_mode.is_eagle3_one_model())
+    return (one_model_draft
+            and uses_connector(kv_connector_config, "mooncake-store")
+            and is_disagg_enabled(cache_transceiver_config))
+
+
 def create_py_executor(
     llm_args: TorchLlmArgs,
     checkpoint_dir: Optional[str] = None,
@@ -868,13 +888,8 @@ def create_py_executor(
                 "kv_cache_config.use_kv_cache_manager_v2=True to use another policy."
             )
 
-        # Context-only requests do not reject draft tokens. Keep Mooncake's
-        # target-plus-MTP prefill layout available, and reject generation work
-        # at the connector boundary before it can use append-only page deltas.
-        speculative_prefill_only = (
-            isinstance(spec_config, MTPDecodingConfig)
-            and uses_connector(kv_connector_config, "mooncake-store")
-            and is_disagg_enabled(cache_transceiver_config))
+        speculative_prefill_only = _connector_runs_speculative_prefill_only(
+            spec_config, kv_connector_config, cache_transceiver_config)
 
         # Rejected draft tokens shrink a request's page list, and the freed slot
         # goes to whichever request allocates next. The connector is only told
