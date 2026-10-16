@@ -2918,7 +2918,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if req.is_dummy:
             # A dummy request has no prompt to serve.
             return False
-        if req.is_generation_only_request:
+        if req.is_generation_only_request():
             # The connector API rejects these outright; a disagg generation
             # server gets its prompt KV from the context worker.
             return False

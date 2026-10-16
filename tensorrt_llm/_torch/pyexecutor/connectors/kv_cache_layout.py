@@ -41,7 +41,7 @@ import torch
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
 
 if TYPE_CHECKING:
-    from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from ..kv_cache_manager_v2 import KVCacheManagerV2
 
 __all__ = [
     "KvCacheBufferRef",

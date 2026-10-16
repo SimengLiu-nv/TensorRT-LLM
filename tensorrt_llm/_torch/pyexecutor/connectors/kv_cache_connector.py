@@ -540,7 +540,7 @@ class KvCacheConnectorSchedulerOutputRequest:
         kv_cache_manager: "KVCacheManager",
         additional_kv_cache_managers: Sequence["KVCacheManager"] = (),
     ) -> RequestData:
-        from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+        from ..kv_cache_manager_v2 import KVCacheManagerV2
 
         is_v2 = isinstance(kv_cache_manager, KVCacheManagerV2)
         if additional_kv_cache_managers and not is_v2:
@@ -807,7 +807,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if request.is_dummy_request:
             return 0, False
         self._validate_speculative_prefill_request(request)
-        if request.is_generation_only_request:
+        if request.is_generation_only_request():
             raise RuntimeError("Connector API is not supported for generation-only requests!")
         num_tokens, load_kv_async = self._run_on_leader(
             lambda: self.scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
@@ -873,7 +873,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         ``LlmRequest`` rather than the ``_torch`` subclass, so only what
         ``nanobind/batch_manager/bindings.cpp`` binds is readable below.
         """
-        if request.is_generation_only_request:
+        if request.is_generation_only_request():
             raise RuntimeError("Connector API is not supported for generation-only requests!")
 
         num_tokens, load_kv_async = self.query_num_new_matched_tokens(request, num_computed_tokens)

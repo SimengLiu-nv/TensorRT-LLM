@@ -2214,3 +2214,40 @@ class SpecWorkerBase(nn.Module, ABC):
             sampled_tokens = torch.argmax(logits, dim=-1)
 
         return sampled_tokens
+
+
+def draft_prompt_lookahead(spec_config) -> Optional[int]:
+    """Prompt tokens past position ``i`` that a one-model draft consumes at ``i``:
+    Eagle reads the shift-by-1 input ids, vanilla MTP chains ``D`` layers.
+
+    Read by the context-chunk tail token (``_prepare_context_input_ids``) and by a
+    separate draft pool's ``reuse_match_backoff``. ``None`` = span not established.
+    """
+    if spec_config is None:
+        return None
+    spec_mode = spec_config.spec_dec_mode
+    if not spec_mode.use_one_engine():
+        # Two-model drafting runs the draft as its own engine over its own
+        # request view, so nothing here is shifted against the target prompt.
+        return None
+    if spec_mode.is_mtp_vanilla():
+        # Known limitation: an internal chunk lacks target_hidden[i + k], so reuse
+        # can attach draft KV an unchunked prefill would not produce. Acceptance only.
+        return spec_config.max_draft_len
+    # main's is_eagle_one_model(): MTP-Eagle or EAGLE3 on the one-model worker.
+    if spec_mode.is_mtp_eagle_one_model() or spec_mode.is_eagle3_one_model():
+        return 1
+    if spec_mode.is_pard():
+        # PARDWorker feeds the drafter input_ids[:num_ctx_tokens] verbatim, so
+        # its draft state at i is a function of tokens [0, i] like the target's.
+        return 0
+    if spec_mode.is_dflash() or spec_mode.is_dspark():
+        # precompute_context_kv(projected_hidden, positions) writes the drafter's
+        # OWN post-norm post-RoPE K/V, one entry per context token, and the
+        # target hidden at i already depends on exactly tokens [0, i]. Same
+        # dependency face as the target's own KV, so raw-prompt keys describe it
+        # and no chunk-tail lookahead token is needed. The paged pool then makes
+        # a matched prefix addressable again (dflash.py _store_prefill_context).
+        return 0
+    # DraftTargetOneModel likely shifts by 1 but is unvalidated upstream.
+    return None
