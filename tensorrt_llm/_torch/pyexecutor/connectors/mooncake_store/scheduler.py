@@ -1,0 +1,425 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Leader side of the Mooncake store KV cache connector.
+
+Runs on every ADP owner, or only rank 0 for TP. It decides what to load and
+what to save; the local worker owns the store connection. Two pieces of
+bookkeeping make that possible, and both exist because
+`KVCacheManagerV2` reports `RequestData.block_hashes` empty:
+
+* a hash chain per request, so a block has a content identity at all;
+* the page slot index per block ordinal, accumulated across iterations. The
+  manager reports only *newly allocated* indices each step, but a block is
+  allocated before it is full and is only savable once it is full, so the index
+  has to be remembered from the step that reported it.
+"""
+
+from typing import Dict, List, Optional, Tuple
+
+from tensorrt_llm._torch.speculative.interface import draft_prompt_lookahead
+from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.logger import logger
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
+from ..kv_cache_connector import KvCacheConnectorScheduler, RequestData, SchedulerOutput
+from .config import MooncakeStoreConnectorConfig
+from .keys import BlockHashChain
+from .metadata import MooncakeStoreMetadata, PageTransfer, RequestTransfers
+from .validation import validate_llm_args
+from .worker import MooncakeStoreConnectorWorker, resolve_local_worker
+
+__all__ = ["MooncakeStoreConnectorScheduler"]
+
+
+class _RequestState:
+    """Per-request bookkeeping that has to outlive a single iteration."""
+
+    __slots__ = (
+        "chain",
+        "tokens",
+        "pages",
+        "saved_upto",
+        "load_first_block",
+        "load_blocks",
+        "async_loaded_upto",
+        "emitted_saves",
+    )
+
+    def __init__(self, chain: BlockHashChain):
+        self.chain = chain
+        #: The request's tokens, accumulated from the per-step deltas.
+        self.tokens: List[int] = []
+        #: Page slot index per block ordinal, per layer group.
+        self.pages: Dict[int, List[int]] = {}
+        #: First block ordinal not yet considered for saving.
+        self.saved_upto = 0
+        #: The offer made by `get_num_new_matched_tokens`, in block ordinals.
+        self.load_first_block = 0
+        self.load_blocks = 0
+        #: End of the offer handed to the load thread, in block ordinals. Those
+        #: blocks are the store's already, so they are never written back.
+        self.async_loaded_upto = 0
+        self.emitted_saves = False
+
+
+class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
+    """Chooses which pages the Mooncake pool serves and which it receives."""
+
+    supports_attention_dp = True
+
+    def __init__(self, llm_args: TorchLlmArgs) -> None:
+        super().__init__(llm_args)
+
+        validate_llm_args(llm_args)
+        self._config = MooncakeStoreConnectorConfig.from_env()
+        self._tokens_per_block = int(llm_args.kv_cache_config.tokens_per_block)
+        self._prompt_lookahead = (
+            draft_prompt_lookahead(getattr(llm_args, "speculative_config", None)) or 0
+        )
+        self._requests: Dict[int, _RequestState] = {}
+        self._worker: Optional[MooncakeStoreConnectorWorker] = None
+        # Asynchronous offers park the request and are loaded by the owner's
+        # worker in this process; see `update_state_after_alloc_by_layer_group`.
+        self._async_load = bool(self._config.async_load) and self._config.role.loads
+        if self._async_load and not (
+            getattr(llm_args, "enable_attention_dp", False)
+            or getattr(llm_args, "tensor_parallel_size", 1) == 1
+        ):
+            raise NotImplementedError(
+                "mooncake_store.async_load needs attention DP or a single rank: the "
+                "scheduler adapter hands each parked request's pages to the worker in "
+                "its own process, which under tensor parallelism only rank 0 has."
+            )
+
+        logger.info(
+            f"mooncake-store scheduler adapter ready (role={self._config.role.value}, "
+            f"tokens_per_block={self._tokens_per_block}, async_load={self._async_load})"
+        )
+
+    def wait_for_initialization(self):
+        """Bind to the process-local worker, which owns the store handle.
+
+        Called after the executor has built both halves and registered the KV
+        cache layout, which is what the worker needs before it can name a key.
+        """
+        self._worker = resolve_local_worker()
+
+    # ---- lookup ----
+
+    def get_num_new_matched_tokens(
+        self, request: LlmRequest, num_computed_tokens: int
+    ) -> Tuple[int, bool]:
+        """Offer the longest stored prefix beyond what the device already has.
+
+        Args:
+            request: The request being scheduled.
+            num_computed_tokens: Tokens already matched in the local KV cache.
+
+        Returns:
+            Tokens the store can supply, and whether they arrive asynchronously.
+            With `async_load` a non-empty offer is asynchronous: the runtime
+            parks the request and the worker loads the pages off the executor
+            iteration; otherwise the load is synchronous.
+        """
+        tokens = request.get_tokens(0)
+        state = self._state_for(request, tokens)
+        state.load_first_block = 0
+        state.load_blocks = 0
+        state.async_loaded_upto = 0
+
+        if not self._config.role.loads:
+            return 0, False
+
+        # A partial local match means the boundary block is half computed on
+        # device. Overwriting it with a stored page would discard tokens the
+        # runtime already counted, so only whole-block offers are made.
+        if num_computed_tokens % self._tokens_per_block:
+            return 0, False
+
+        first_block = num_computed_tokens // self._tokens_per_block
+        # Stop one token short of the prompt: the runtime still has to run a
+        # forward pass for this request, and it cannot do that with nothing left
+        # to compute.
+        last_block = (len(tokens) - 1) // self._tokens_per_block
+        candidates = state.chain.hashes[first_block:last_block]
+        if not candidates:
+            return 0, False
+
+        hit_blocks = self._require_worker().count_prefix_hit(candidates)
+        if hit_blocks == 0:
+            return 0, False
+
+        state.load_first_block = first_block
+        state.load_blocks = hit_blocks
+        logger.debug(
+            f"mooncake-store matched {hit_blocks} blocks "
+            f"({hit_blocks * self._tokens_per_block} tokens) "
+            f"for request {request.request_id}"
+        )
+        return hit_blocks * self._tokens_per_block, self._async_load
+
+    def cancel_load(self, request: LlmRequest, start: int, end: int) -> None:
+        """Trim a leading or trailing range from an unconsumed load offer.
+
+        The local cache can overtake the beginning of an offer while scheduling
+        waits. Preserve the remaining suffix in that case: the runtime still
+        counts it as externally loaded. Tail cancellation instead releases
+        blocks for which the runtime could not reserve pages.
+        """
+        state = self._requests.get(request.request_id)
+        if state is None or state.load_blocks == 0 or end <= start:
+            return
+        first = state.load_first_block
+        last = first + state.load_blocks
+        cancel_first = max(first, start // self._tokens_per_block)
+        cancel_last = min(last, (end + self._tokens_per_block - 1) // self._tokens_per_block)
+        if cancel_first >= cancel_last:
+            return
+        if cancel_first == first:
+            state.load_first_block = cancel_last
+            state.load_blocks = last - cancel_last
+        elif cancel_last == last:
+            state.load_blocks = cancel_first - first
+        else:
+            raise ValueError(
+                "Mooncake load cancellation must trim the beginning or end of an offer"
+            )
+
+    def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
+        """Start an asynchronous load from a flat page list; otherwise a no-op.
+
+        The flat `block_ids` here are a single space, but a V2 page index is
+        scoped to a layer group. `RequestData.new_block_ids_by_layer_group` is
+        the form that stays correct for every model, so for synchronous loads
+        that is the only source this connector uses. The manager only offers
+        the flat form for a single-group cache, where it is that group's list.
+        """
+        if self._async_load:
+            self.update_state_after_alloc_by_layer_group(request, [list(block_ids)])
+
+    def update_state_after_alloc_by_layer_group(
+        self, request: LlmRequest, block_ids_by_layer_group: List[List[int]]
+    ) -> None:
+        """Hand an asynchronous offer to the worker now that its pages exist.
+
+        The runtime calls this once per allocation, right after it has reserved
+        pages for the offer and committed the honoured count, and before the
+        parked request could be touched by anything else: its pages are held
+        by its cache but never committed to the reuse tree until it computes,
+        so nothing reads them while the load thread writes. The lists are every
+        page of the request, by block ordinal, which is what makes the transfer
+        computable here rather than from a later scheduler output; the parked
+        request is skipped by `build_scheduler_output` until its load lands.
+
+        For synchronous loads this is a no-op: the pages are read from the
+        scheduler output in `build_connector_meta`, the same iteration.
+        """
+        if not self._async_load:
+            return
+        state = self._requests.get(request.request_id)
+        if state is None or state.load_blocks == 0:
+            return
+        # The synchronous metadata path is built from the honoured prefix.
+        # An asynchronous request never reaches that path while parked, so
+        # use the runtime's committed count here too. Capacity beyond this
+        # range is for local computation, not permission to restore more KV.
+        load_blocks = request.py_num_connector_matched_tokens // self._tokens_per_block
+        if not 0 <= load_blocks <= state.load_blocks:
+            raise RuntimeError("Mooncake honoured prefix exceeds the outstanding load offer")
+        load_end = state.load_first_block + load_blocks
+        transfers = RequestTransfers(request.request_id)
+        limit = min(
+            len(state.chain.hashes),
+            min((len(indices) for indices in block_ids_by_layer_group), default=0),
+        )
+        for offset in range(load_blocks):
+            block = state.load_first_block + offset
+            if block >= limit:
+                raise RuntimeError(
+                    "Mooncake honoured prefix has missing destination pages; "
+                    "cannot report an incomplete asynchronous load as finished"
+                )
+            pages: List[PageTransfer] = []
+            for layer_group_id, indices in enumerate(block_ids_by_layer_group):
+                page_index = int(indices[block])
+                if page_index == BAD_PAGE_INDEX:
+                    raise RuntimeError(
+                        "Mooncake honoured prefix has an invalid destination page; "
+                        "cannot report an incomplete asynchronous load as finished"
+                    )
+                pages.append(PageTransfer(state.chain.hashes[block], layer_group_id, page_index))
+            transfers.pages.extend(pages)
+        # Consumed here rather than in `build_connector_meta`: the request is not
+        # in the scheduler output while it is parked, and must not be loaded a
+        # second time when it comes back.
+        state.async_loaded_upto = load_end
+        state.load_blocks = 0
+        self._require_worker().start_async_load(request.request_id, transfers)
+
+    # ---- work lists ----
+
+    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> MooncakeStoreMetadata:
+        """Turn this iteration's scheduled requests into load and save lists."""
+        metadata = MooncakeStoreMetadata()
+        for request_data in (*scheduler_output.new_requests, *scheduler_output.cached_requests):
+            state = self._requests.get(request_data.request_id)
+            if state is None:
+                # Only requests that went through get_num_new_matched_tokens have
+                # a hash chain. Generation-only requests never do, and the
+                # connector manager refuses them outright.
+                continue
+
+            state.tokens.extend(request_data.new_tokens)
+            state.chain.extend(state.tokens)
+            self._record_pages(state, request_data)
+
+            loads = self._loads_for(state, request_data)
+            if loads.pages:
+                metadata.loads.append(loads)
+            num_loaded_tokens = state.load_blocks * self._tokens_per_block
+
+            # Whatever the store just supplied, and whatever the local cache
+            # matched, is not ours to write back: the store already has the
+            # former, and the latter was never allocated during this run. An
+            # asynchronous offer was consumed when the load started, so its end
+            # is remembered separately.
+            state.saved_upto = max(
+                state.saved_upto,
+                state.load_first_block + state.load_blocks,
+                state.async_loaded_upto,
+            )
+            # An offer is consumed once. The load is issued in exactly the
+            # iteration the runtime allocated pages to hold it.
+            state.load_blocks = 0
+
+            if self._config.role.saves:
+                saves = self._saves_for(state, request_data, num_loaded_tokens)
+                if saves.pages:
+                    state.emitted_saves = True
+                    metadata.saves.append(saves)
+        return metadata
+
+    def request_finished(self, request: LlmRequest, cache_block_ids: List[int]) -> bool:
+        """Report whether pages must stay pinned for in-flight saves.
+
+        Returns:
+            True when this request handed any page to the background save
+            thread. Its pages are the source of those RDMA reads, so freeing
+            them now would let a later request overwrite bytes mid-transfer.
+        """
+        state = self._requests.pop(request.request_id, None)
+        return bool(state is not None and state.emitted_saves)
+
+    def request_finished_by_layer_group(
+        self, request: LlmRequest, cache_block_ids_by_layer_group: List[List[int]]
+    ) -> bool:
+        """Finish a request whose pages span more than one layer group."""
+        return self.request_finished(request, [])
+
+    def forget_request(self, request_id: int) -> None:
+        """Drop the bookkeeping of a request that restarts from scratch.
+
+        Its saved-up-to mark and page table describe an allocation that is
+        gone; the next lookup rebuilds them, so the blocks it now recomputes
+        are saved again rather than treated as already stored.
+        """
+        self._requests.pop(request_id, None)
+
+    # ---- internals ----
+
+    def _require_worker(self) -> MooncakeStoreConnectorWorker:
+        if self._worker is None:
+            self._worker = resolve_local_worker()
+        return self._worker
+
+    def _state_for(self, request: LlmRequest, tokens: List[int]) -> _RequestState:
+        state = self._requests.get(request.request_id)
+        if state is None:
+            state = _RequestState(
+                BlockHashChain(
+                    self._tokens_per_block,
+                    cache_salt=request.cache_salt,
+                    prompt_lookahead=self._prompt_lookahead,
+                )
+            )
+            self._requests[request.request_id] = state
+        # Hashing the prompt here rather than waiting for the first scheduler
+        # output is the whole point: the lookup happens before the request is
+        # scheduled, so the chain has to be ready before any metadata exists.
+        state.chain.extend(tokens)
+        return state
+
+    def _record_pages(self, state: _RequestState, request_data: RequestData) -> None:
+        """Append this step's newly allocated page indices, by block ordinal."""
+        by_group = request_data.new_block_ids_by_layer_group
+        if not by_group:
+            # Under a single layer group the manager also mirrors that group's
+            # indices into the flat `new_block_ids`, but it does not say which
+            # group they belong to, so there is nothing safe to record from it.
+            return
+        for layer_group_id, indices in enumerate(by_group):
+            state.pages.setdefault(layer_group_id, []).extend(int(index) for index in indices)
+
+    def _addressable_blocks(self, state: _RequestState) -> int:
+        """Block ordinals that are both hashed and backed by a page everywhere."""
+        if not state.pages:
+            return 0
+        return min(len(state.chain.hashes), min(len(indices) for indices in state.pages.values()))
+
+    def _loads_for(self, state: _RequestState, request_data: RequestData) -> RequestTransfers:
+        transfers = RequestTransfers(request_data.request_id)
+        limit = self._addressable_blocks(state)
+        for offset in range(state.load_blocks):
+            block = state.load_first_block + offset
+            if block >= limit:
+                # The runtime allocated fewer pages than it accepted tokens for.
+                # It reports the shortfall through cancel_load; until then the
+                # unaddressable tail is simply not loaded.
+                break
+            self._append_pages(state, transfers, block)
+        return transfers
+
+    def _saves_for(
+        self, state: _RequestState, request_data: RequestData, num_loaded_tokens: int
+    ) -> RequestTransfers:
+        transfers = RequestTransfers(request_data.request_id)
+        # Prompt hashes are known before prefill. Capacity and scratch pages
+        # can also run ahead of computation. The worker waits for this forward
+        # pass before saving, so only its completed full blocks are publishable.
+        # The initial scheduler position excludes this iteration's connector
+        # restore. Add it back before locating the newly computed tail.
+        computed_end = (
+            request_data.computed_position + num_loaded_tokens + request_data.num_scheduled_tokens
+        )
+        limit = min(self._addressable_blocks(state), computed_end // self._tokens_per_block)
+        for block in range(state.saved_upto, limit):
+            self._append_pages(state, transfers, block)
+        state.saved_upto = max(state.saved_upto, limit)
+        return transfers
+
+    def _append_pages(self, state: _RequestState, transfers: RequestTransfers, block: int) -> None:
+        """Add one block's page from every layer group, or none of them."""
+        block_hash = state.chain.hashes[block]
+        pages: List[PageTransfer] = []
+        for layer_group_id, indices in state.pages.items():
+            page_index = indices[block]
+            if page_index == BAD_PAGE_INDEX:
+                # The block has no page in this group, because a sliding window
+                # dropped it. A partial page is not a usable cache entry,
+                # so the whole block is skipped.
+                return
+            pages.append(PageTransfer(block_hash, layer_group_id, page_index))
+        transfers.pages.extend(pages)

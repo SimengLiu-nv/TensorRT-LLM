@@ -15,7 +15,8 @@
 
 import enum
 import os
-from typing import Optional
+import time
+from typing import TYPE_CHECKING, Callable, Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
@@ -30,6 +31,9 @@ from .scheduler import (
     _is_forced_context_chunk_boundary,
     drop_decoder_context_requests_waiting_for_encoder_output,
 )
+
+if TYPE_CHECKING:
+    from ..kv_cache_manager_v2 import KVCacheManagerV2
 
 
 class ScheduleAction(enum.Enum):
@@ -154,8 +158,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         draft_kv_cache_manager: object | None = None,  # KVCacheManagerV2 for MTP draft layers
         cross_kv_cache_manager: object | None = None,  # KVCacheManagerV2 for enc-dec cross-attn
         enable_prefix_aware_scheduling: bool = True,
+        max_input_len: int = 0x7FFFFFFF,
     ) -> None:
         self.max_num_tokens = max_num_tokens
+        # Only read when preempting: LlmRequest.pause clamps the rewritten
+        # prompt, the original plus tokens generated so far, to this.
+        self.max_input_len = max_input_len
+        self._stalled_schedules = 0
+        self._stall_reports = 0
+        self._stall_started_at: Optional[float] = None
         self.max_num_requests = (
             scheduler_capacity if scheduler_capacity is not None else max_batch_size
         )
@@ -221,8 +232,23 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
 
     def schedule_request(
-        self, active_requests: RequestList, inflight_request_ids: set[int]
+        self,
+        active_requests: RequestList,
+        inflight_request_ids: set[int],
+        *,
+        has_pending_kv_transfers: bool = False,
     ) -> SchedulerOutput:
+        """Schedule work while allowing pending KV transfers to release pages.
+
+        Args:
+            active_requests: Requests still participating in model execution.
+            inflight_request_ids: Requests held by queued model work.
+            has_pending_kv_transfers: Whether requests outside the batch still
+                retain KV pages for an asynchronous transfer: completed
+                requests sending or saving (possibly already absent from
+                active_requests), or context requests parked for a connector
+                load.
+        """
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
         # Main scheduling loop
         (
@@ -232,7 +258,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             evicted,
             disagg_candidates,
             has_chunking,
-        ) = self._schedule_loop(active_requests, inflight_request_ids)
+        ) = self._schedule_loop(
+            active_requests,
+            inflight_request_ids,
+            has_pending_kv_transfers=has_pending_kv_transfers,
+        )
 
         # Sort by LoRA task ID
         scheduled_encoder.sort(key=_get_lora_task_id)
@@ -249,7 +279,13 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     # ---- Main scheduling loop ----
 
-    def _schedule_loop(self, active_requests, inflight_request_ids):
+    def _schedule_loop(
+        self,
+        active_requests: RequestList,
+        inflight_request_ids: set[int],
+        *,
+        has_pending_kv_transfers: bool = False,
+    ) -> tuple[RequestList, RequestList, RequestList, RequestList, RequestList, bool]:
         scheduled_ctx: RequestList = []
         scheduled_encoder: RequestList = []
         scheduled_gen: RequestList = []
@@ -398,11 +434,26 @@ class KVCacheV2Scheduler(RequestScheduler):
 
             req_it += 1
 
+        # Requests whose pages were given up during this pass. A victim that is
+        # itself a started context request still sits in pending_ctx, so
+        # re-admitting it would spend the pages its own preemption released.
+        preempted_ids: set[int] = set()
+
+        def preempt_for_pages(req: LlmRequest) -> bool:
+            protected = {r.py_request_id for r in scheduled_gen}
+            protected.update(r.py_request_id for r in scheduled_ctx)
+            protected.add(req.py_request_id)
+            return self._try_preempt_for_pages(
+                requests_list, protected, inflight_request_ids, evicted, preempted_ids
+            )
+
         # --- Phase 2: schedule deferred context / encoder requests ---
         # Generation PEFT pages are now fully committed in the budget.
         for req in pending_ctx:
             if budget.requests_full:
                 break
+            if req.py_request_id in preempted_ids:
+                continue
             peft_pages = budget.peft_pages_needed(req)
             if peft_pages is None:
                 continue
@@ -413,7 +464,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                 scheduled_encoder.append(req)
                 budget.commit(req, tokens, peft_pages)
             else:
-                action, tokens, chunking_flag = self._try_schedule_context(req, budget)
+                action, tokens, chunking_flag = self._try_schedule_context(
+                    req, budget, preempt_for_pages
+                )
                 if action is ScheduleAction.STOP:
                     break
                 if action is ScheduleAction.SKIP:
@@ -422,47 +475,16 @@ class KVCacheV2Scheduler(RequestScheduler):
                 scheduled_ctx.append(req)
                 budget.commit(req, tokens, peft_pages)
 
-        # Deadlock detection: if generation requests exist but none were
-        # scheduled and none were evicted, no forward pass will run and no
-        # KV cache pages will ever be freed — the scheduler will spin
-        # forever.  This typically happens when the KV cache pool is
-        # exhausted and no host cache tier is available for suspend/resume.
-        if not scheduled_gen and not scheduled_ctx:
-            num_gen_candidates = sum(
-                1
-                for r in active_requests
-                if r.is_generation_in_progress_state
-                and not r.is_generation_to_complete_state
-                and r.request_id not in inflight_request_ids
-            )
-            if (
-                num_gen_candidates > 0
-                and not evicted
-                and not inflight_request_ids
-            ):
-                # A connector rejects every tier below GPU at bring-up
-                # (`PyExecutor._reject_non_gpu_cache_tiers`), so offering those
-                # two settings there is advice the user cannot act on.
-                if getattr(self.kv_cache_manager, "kv_connector_manager", None) is not None:
-                    remedy = (
-                        "A KV connector is attached, which requires a GPU-only cache, "
-                        "so no secondary tier can be configured. Increase "
-                        "kv_cache_config.max_tokens or kv_cache_config."
-                        "free_gpu_memory_fraction, or lower max_num_tokens to hand "
-                        "memory back to the KV pool."
-                    )
-                else:
-                    remedy = (
-                        "Configure kv_cache_config.host_cache_size or "
-                        "kv_cache_config.disk_cache_size, or increase "
-                        "kv_cache_config.max_tokens."
-                    )
-                raise RuntimeError(
-                    f"V2 scheduler deadlock: {num_gen_candidates} generation "
-                    f"request(s) active but none could be scheduled or "
-                    f"evicted. KV cache pool is likely exhausted with no "
-                    f"secondary cache tier for suspend/resume offload. {remedy}"
-                )
+        self._detect_deadlock(
+            active_requests,
+            inflight_request_ids,
+            pending_ctx,
+            preempted_ids,
+            made_progress=bool(
+                scheduled_gen or scheduled_ctx or scheduled_encoder or disagg_candidates or evicted
+            ),
+            has_pending_kv_transfers=has_pending_kv_transfers,
+        )
 
         return (
             scheduled_encoder,
@@ -524,31 +546,43 @@ class KVCacheV2Scheduler(RequestScheduler):
         return ScheduleAction.SCHEDULED, 0
 
     def _try_schedule_context(
-        self, req: LlmRequest, budget: BudgetTracker
+        self,
+        req: LlmRequest,
+        budget: BudgetTracker,
+        preempt_for_pages: Callable[[LlmRequest], bool],
     ) -> tuple[ScheduleAction, int, bool]:
         """Try to schedule a context request (chunked or non-chunked).
 
         Returns ``(action, tokens, chunking_flag)``.  *tokens* and
         *chunking_flag* are meaningful only when *action* is ``SCHEDULED``.
 
-        Deliberately connector-blind: the connector is asked later, in
-        the cache manager's ``prepare_resources``, so the budget here assumes it
-        serves nothing. That is safe because honouring an offer only ever
-        removes tokens from the forward pass, and it costs only that a served
-        prefix frees no budget for another request in the same iteration.
+        A KV connector reaches the budget only through
+        ``context_remaining_length``. ``prepare_context`` asks it and skips the
+        request past what it offers, so the length read after that call already
+        excludes the served prefix; without ``aggressive_prefix_budgeting`` the
+        query runs after this pass instead and the length is the full one. Both
+        arms are safe -- honouring an offer only ever removes tokens from the
+        forward pass -- so nothing here branches on the mode. What differs is
+        whether the saving frees budget for another request in this iteration.
+        This is also why ``enable_prefix_aware_scheduling`` must be on for that
+        mode: with it off, both context paths budget against the length
+        captured before ``prepare_context`` ran.
 
-        ``should_add_sequence`` must not gate scheduling either: it stays false
+        ``should_add_sequence`` must not gate scheduling: it stays false
         from the moment an asynchronous load completes until
         ``request_finished``, so a request gated on it would be skipped forever
         and never run the prefill the load was for. A loading request is kept
         out of the batch by its ``DISAGG_GENERATION_TRANS_IN_PROGRESS`` state.
         """
         if self.chunking_enabled:
-            return self._try_schedule_context_chunked(req, budget)
-        return self._try_schedule_context_full(req, budget)
+            return self._try_schedule_context_chunked(req, budget, preempt_for_pages)
+        return self._try_schedule_context_full(req, budget, preempt_for_pages)
 
     def _try_schedule_context_full(
-        self, req: LlmRequest, budget: BudgetTracker
+        self,
+        req: LlmRequest,
+        budget: BudgetTracker,
+        preempt_for_pages: Callable[[LlmRequest], bool],
     ) -> tuple[ScheduleAction, int, bool]:
         """Try to schedule a non-chunked context request.
 
@@ -586,7 +620,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # V2 resizes KV cache directly in the scheduler (no separate
         # prepareResources for main cache), so include draft tokens.
-        if not self.kv_cache_manager.resize_context(req, context_tokens + draft_len):
+        if not self._try_allocate_context(req, context_tokens + draft_len, preempt_for_pages):
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)
@@ -597,7 +631,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         return ScheduleAction.SCHEDULED, req_tokens, False
 
     def _try_schedule_context_chunked(
-        self, req: LlmRequest, budget: BudgetTracker
+        self,
+        req: LlmRequest,
+        budget: BudgetTracker,
+        preempt_for_pages: Callable[[LlmRequest], bool],
     ) -> tuple[ScheduleAction, int, bool]:
         """FCFS interleaved chunking for a single context request.
 
@@ -688,7 +725,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # V2 resizes KV cache directly in the scheduler, so include
         # draft tokens for last chunk.
-        if not self.kv_cache_manager.resize_context(req, resize_tokens):
+        if not self._try_allocate_context(req, resize_tokens, preempt_for_pages):
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)
@@ -699,6 +736,21 @@ class KVCacheV2Scheduler(RequestScheduler):
         chunking_flag = req.context_chunk_size < req.context_remaining_length
 
         return ScheduleAction.SCHEDULED, chunk_tokens, chunking_flag
+
+    def _try_allocate_context(
+        self, req: LlmRequest, num_tokens: int, preempt_for_pages: Callable[[LlmRequest], bool]
+    ) -> bool:
+        """Reserve a connector prefill's completion, then admit one context chunk."""
+        if not self.kv_cache_manager.reserve_context_completion(req):
+            # An admitted request owns this headroom. Let it finish instead of
+            # preempting it to make room for another prompt.
+            return False
+        if not self.kv_cache_manager.resize_context(req, num_tokens):
+            # A physical allocation failure can still require preemption.
+            # Retry on the next pass, after prepare_context resumes the cache.
+            preempt_for_pages(req)
+            return False
+        return True
 
     def _align_chunk_to_mm_block(
         self,
@@ -1033,6 +1085,194 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _clear_request_runtime_state(self, req: LlmRequest) -> None:
         req.py_batch_idx = None
 
+    def _free_kv_caches(self, req: LlmRequest) -> None:
+        self.kv_cache_manager.free_resources(req)
+        if self.draft_kv_cache_manager is not None:
+            self.draft_kv_cache_manager.free_resources(req)
+
+    def _connector_peer_kv_cache_managers(self) -> tuple["KVCacheManagerV2", ...]:
+        """Other V2 pools whose pages share the connector request lifetime."""
+        if self.draft_kv_cache_manager is None:
+            return ()
+        return (self.draft_kv_cache_manager,)
+
+    def _preempt_request(self, req: LlmRequest) -> bool:
+        """Preempt target KV and include a separate draft pool when present."""
+        peers = self._connector_peer_kv_cache_managers()
+        if peers:
+            return self.kv_cache_manager.preempt_request(req, peers)
+        return self.kv_cache_manager.preempt_request(req)
+
+    def _try_preempt_for_pages(
+        self,
+        requests_list: RequestList,
+        protected_ids: set[int],
+        inflight_request_ids: set[int],
+        evicted: RequestList,
+        preempted_ids: set[int],
+    ) -> bool:
+        """Release one started request's KV cache so another can allocate.
+
+        The fallback for a pool that suspension cannot drain; see
+        `KVCacheManagerV2.preempt_request`. With a cache tier below GPU,
+        suspension is cheaper and keeps the pages, so that path is left alone.
+
+        Returns True when pages became available in this iteration. A
+        connector defers the release until its in-flight saves retire, in
+        which case this returns False and the pages arrive a few iterations
+        later.
+        """
+        if self.kv_cache_manager.has_cache_tier_below_gpu:
+            return False
+
+        if self.kv_cache_manager.has_pending_preemption():
+            # One victim at a time, or a full pool would preempt the whole
+            # batch while the first release is still draining.
+            return False
+
+        # Newest first, so the requests closest to completing keep their
+        # pages and the pool drains instead of thrashing.
+        for i in range(len(requests_list) - 1, -1, -1):
+            victim = requests_list[i]
+            if victim.py_request_id in protected_ids:
+                continue
+            if victim.request_id in inflight_request_ids:
+                continue
+            if not self._is_started_request(victim):
+                continue
+            if not self.kv_cache_manager.is_request_active(victim.py_request_id):
+                continue
+
+            released = self._preempt_request(victim)
+            logger.debug(
+                f"[V2Scheduler] Preempting request {victim.py_request_id} "
+                f"(state={victim.state.name}), pages "
+                f"{'released' if released else 'pending connector saves'}"
+            )
+            self._clear_request_runtime_state(victim)
+            if released and self.draft_kv_cache_manager is not None:
+                self.draft_kv_cache_manager.free_resources(victim)
+            if released:
+                # Rewrites the prompt to include what was generated and resets
+                # state to CONTEXT_INIT, so the request re-enters as an
+                # ordinary prefill. Deferred releases are paused by the
+                # executor once the connector reports the saves retired.
+                victim.pause(self.max_input_len)
+            evicted.append(victim)
+            preempted_ids.add(victim.py_request_id)
+            return released
+
+        return False
+
+    # Consecutive scheduling passes that reclaimed nothing before this counts
+    # as a suspected deadlock. A stalled pass costs ~2ms, so it trips within
+    # seconds, while transient one-iteration deferrals (multimodal chunk
+    # alignment, PEFT budget, IndexMapper slots) clear long before.
+    _DEADLOCK_STALL_ITERS = 1000
+
+    def _reset_stall_state(self) -> None:
+        self._stalled_schedules = 0
+        self._stall_reports = 0
+        self._stall_started_at = None
+
+    def _detect_deadlock(
+        self,
+        active_requests: RequestList,
+        inflight_request_ids: set[int],
+        pending_ctx: RequestList,
+        preempted_ids: set[int],
+        made_progress: bool,
+        has_pending_kv_transfers: bool = False,
+    ) -> None:
+        """Report when no request can be scheduled or reclaimed.
+
+        Without this the executor spins at full speed while scheduling
+        nothing, which looks healthy to the hang detector and to `/health`
+        while the job burns its wall clock. Context candidates count alongside
+        generation ones because a disaggregated prefill server has no
+        generation requests at all.
+
+        A stall is not proof of a deadlock — a connector still draining pages
+        clears on its own — so this only reports. Tearing the job down is the
+        deadlock detector's call.
+        """
+        # Finished requests can leave active_requests while native KV sends
+        # or connector saves retain their pages. The executor keeps polling
+        # those transfers and enforcing their timeout while no batch fits.
+        # Counting that wait as a scheduling deadlock can abort a healthy
+        # prefill worker before the decode worker admits its pending transfers.
+        if made_progress or has_pending_kv_transfers:
+            self._reset_stall_state()
+            return
+
+        num_gen_candidates = sum(
+            1
+            for r in active_requests
+            if r.is_generation_in_progress_state
+            and not r.is_generation_to_complete_state
+            and r.request_id not in inflight_request_ids
+        )
+        num_ctx_candidates = sum(
+            1
+            for r in pending_ctx
+            if r.py_request_id not in preempted_ids and r.request_id not in inflight_request_ids
+        )
+        if num_gen_candidates == 0 and num_ctx_candidates == 0:
+            # Legitimately idle: nothing to schedule.
+            self._reset_stall_state()
+            return
+
+        now = time.monotonic()
+        if self._stall_started_at is None:
+            self._stall_started_at = now
+        self._stalled_schedules += 1
+        # Repeat on a doubling stall count so a stall that outlives its first
+        # report keeps leaving a trail without flooding the log at the few
+        # hundred passes per second a stalled loop runs at.
+        if self._stalled_schedules < self._DEADLOCK_STALL_ITERS * (2**self._stall_reports):
+            return
+        self._stall_reports += 1
+        stalled_seconds = now - self._stall_started_at
+
+        self._log_stalled_pool_report()
+        logger.warning(
+            f"V2 scheduler suspected deadlock: {num_gen_candidates} generation "
+            f"and {num_ctx_candidates} context request(s) active but none could "
+            f"be scheduled, suspended or preempted in "
+            f"{self._stalled_schedules} consecutive attempts over "
+            f"{stalled_seconds:.3f}s. The KV cache "
+            f"pool is likely exhausted. Configure "
+            f"kv_cache_config.host_cache_size, increase "
+            f"kv_cache_config.max_tokens, or lower max_batch_size. "
+            f"See the [V2Scheduler] scheduling stalled report logged above "
+            f"for the pool breakdown."
+        )
+
+    def _log_stalled_pool_report(self) -> None:
+        """Log GPU block counts per pool so the exhausted pool is identifiable.
+
+        The draft and cross pools are sized independently of the self pool, so
+        either can be the one that ran dry while the others look healthy.
+        """
+        managers = [("self", self.kv_cache_manager)]
+        if self.draft_kv_cache_manager is not None:
+            managers.append(("draft", self.draft_kv_cache_manager))
+        if self.cross_kv_cache_manager is not None:
+            managers.append(("cross", self.cross_kv_cache_manager))
+
+        for name, manager in managers:
+            stats = manager.get_kv_cache_stats()
+            free_by_window = ", ".join(
+                f"{window_size}:{num_free}"
+                for window_size, num_free in sorted(stats.num_free_blocks_per_window_size.items())
+            )
+            logger.warning(
+                f"[V2Scheduler] scheduling stalled report: {name} pool has "
+                f"{stats.free_num_blocks}/{stats.max_num_blocks} GPU blocks free "
+                f"at {stats.tokens_per_block} tokens per block, free blocks by "
+                f"window size: {free_by_window}"
+            )
+
     def _is_evictable(self, req: LlmRequest) -> bool:
         """A started request whose KV cache is still active on GPU.
 
@@ -1110,7 +1350,6 @@ class KVCacheV2Scheduler(RequestScheduler):
         TODO: V2's try-and-see model lacks a free-blocks query API.
         Implementing this requires exposing storage statistics from the
         V2 runtime (e.g., free GPU slots per pool group). For now,
-        always returns True — PP is not yet supported (asserted in
-        KVCacheManagerV2 constructor via kv_connector_manager=None).
+        always returns True.
         """
         return True

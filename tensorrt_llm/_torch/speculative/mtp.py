@@ -80,11 +80,16 @@ class MTPHiddenStatesManager(BaseResourceManager):
                 device='cuda',
             )
 
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
         context_batch = scheduled_batch.context_requests
         # allocate hidden state tensors
         for req in context_batch:
             if req.is_first_context_chunk:
+                # An asynchronous connector restore parks the request after
+                # preparation. It resumes on the same first chunk and still
+                # owns this slot; no model work has consumed it in between.
+                if self.slot_manager.get_slot(req.request_id) is not None:
+                    continue
                 slot_id = self.slot_manager.add_slot(req.request_id)
                 if self.use_relaxed_acceptance_for_thinking:
                     self.mtp_relaxed_delta_pool[slot_id].copy_(

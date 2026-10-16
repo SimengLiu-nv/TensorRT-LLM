@@ -2612,7 +2612,10 @@ class ResourceManager:
         return self.resource_managers.get(type)
 
     @nvtx_range("prepare_resources")
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(self,
+                          scheduled_batch: ScheduledRequests,
+                          *,
+                          publish_connector_output: bool = True) -> None:
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
                 resource_manager.prepare_resources(scheduled_batch)
@@ -2621,8 +2624,12 @@ class ResourceManager:
         # manager has prepared. See `report_batch_to_connector`.
         kv_cache_manager = self.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if hasattr(kv_cache_manager, "report_batch_to_connector"):
-            kv_cache_manager.report_batch_to_connector(scheduled_batch)
+        if publish_connector_output and hasattr(kv_cache_manager,
+                                                "report_batch_to_connector"):
+            draft_kv_cache_manager = self.resource_managers.get(
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+            kv_cache_manager.report_batch_to_connector(
+                scheduled_batch, draft_kv_cache_manager=draft_kv_cache_manager)
 
     @nvtx_range("update_resources")
     def update_resources(

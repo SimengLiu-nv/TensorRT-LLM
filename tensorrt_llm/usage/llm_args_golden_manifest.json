@@ -802,10 +802,16 @@
       "path": "kv_cache_config.use_uvm"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_connector_config.aggressive_prefix_budgeting"
+    },
+    {
       "allowed_values": [
         "lmcache",
         "lmcache-mp",
-        "kvbm"
+        "kvbm",
+        "mooncake-store"
       ],
       "annotation": "Optional[str]",
       "converter": "allowlist",

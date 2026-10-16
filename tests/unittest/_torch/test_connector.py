@@ -20,11 +20,14 @@ from unittest.mock import MagicMock
 import cloudpickle
 import mpi4py
 import pytest
+from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     AsyncRequests, KvCacheConnectorManager, KvCacheConnectorScheduler,
     KvCacheConnectorSchedulerOutputManager, KvCacheConnectorWorker)
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.logger import logger
@@ -58,7 +61,7 @@ def test_connector_manager_get_finished_allgather(mpi_pool_executor):
 
         manager = KvCacheConnectorManager(worker, scheduler=scheduler)
 
-        req = MagicMock()
+        req = MagicMock(is_dummy_request=False)
 
         req.request_id = 42
 
@@ -111,7 +114,7 @@ def test_connector_manager_num_matched_tokens(mpi_pool_executor):
 
         manager = KvCacheConnectorManager(worker, scheduler=scheduler)
 
-        req = MagicMock()
+        req = MagicMock(is_dummy_request=False)
 
         req.request_id = 42
         req.is_generation_only_request = False
@@ -141,11 +144,11 @@ def test_connector_manager_take_scheduled_requests(mpi_pool_executor):
 
         scheduled_requests = ScheduledRequests()
 
-        req0 = MagicMock()
+        req0 = MagicMock(is_dummy_request=False)
         req0.request_id = 0
         req0.is_generation_only_request = False
 
-        req1 = MagicMock()
+        req1 = MagicMock(is_dummy_request=False)
         req1.request_id = 1
         req1.is_generation_only_request = False
 
@@ -198,7 +201,7 @@ def test_connector_manager_query_is_side_effect_free(mpi_pool_executor):
 
         manager = KvCacheConnectorManager(worker, scheduler=scheduler)
 
-        req = MagicMock()
+        req = MagicMock(is_dummy_request=False)
         req.request_id = 42
         req.is_generation_only_request = False
         req.py_num_connector_matched_tokens = 0
@@ -240,7 +243,7 @@ def test_connector_manager_commits_only_what_is_honoured(mpi_pool_executor):
 
         manager = KvCacheConnectorManager(worker, scheduler=scheduler)
 
-        req = MagicMock()
+        req = MagicMock(is_dummy_request=False)
         req.request_id = 7
         req.is_generation_only_request = False
         req.py_num_connector_matched_tokens = 0
@@ -271,7 +274,7 @@ def test_scheduler_output_resets_a_destroyed_allocation():
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
     kv_cache_manager.get_priority_by_block_id.return_value = 0
 
-    req = MagicMock()
+    req = MagicMock(is_dummy_request=False)
     req.request_id = 7
     req.state = LlmRequestState.CONTEXT_INIT
     req.get_tokens.return_value = list(range(64))
@@ -308,7 +311,7 @@ def test_scheduler_output_keeps_deltas_while_the_allocation_lives():
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
     kv_cache_manager.get_priority_by_block_id.return_value = 0
 
-    req = MagicMock()
+    req = MagicMock(is_dummy_request=False)
     req.request_id = 8
     req.state = LlmRequestState.CONTEXT_INIT
     req.get_tokens.return_value = list(range(64))
@@ -331,6 +334,48 @@ def test_scheduler_output_keeps_deltas_while_the_allocation_lives():
     assert again.cached_requests[0].new_block_ids == []
 
 
+def test_scheduler_output_combines_target_and_one_model_draft_v2_groups():
+    """Separate MTP pages occupy one dense connector layer-group space."""
+    target_manager = object.__new__(KVCacheManagerV2)
+    target_manager.get_page_indices_by_layer_group = MagicMock(
+        side_effect=[[[10, 11]], [[10, 11, 12]]])
+    draft_manager = object.__new__(KVCacheManagerV2)
+    draft_manager.get_page_indices_by_layer_group = MagicMock(
+        side_effect=[[[20, 21]], [[20, 21, 22]]])
+
+    req = MagicMock(is_dummy_request=False)
+    req.request_id = 9
+    req.state = LlmRequestState.CONTEXT_INIT
+    req.get_tokens.side_effect = [list(range(32)), list(range(48))]
+    req.context_current_position = 0
+    req.context_remaining_length = 32
+    req.context_chunk_size = 32
+    req.kv_cache_retention_config = None
+    req.cache_salt = None
+
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [req]
+    manager = KvCacheConnectorSchedulerOutputManager()
+
+    first = manager.build_scheduler_output(
+        batch,
+        AsyncRequests({}, {}),
+        target_manager,
+        (draft_manager, ),
+    ).new_requests[0]
+    assert first.new_block_ids_by_layer_group == [[10, 11], [20, 21]]
+    assert first.new_block_ids == []
+
+    second = manager.build_scheduler_output(
+        batch,
+        AsyncRequests({}, {}),
+        target_manager,
+        (draft_manager, ),
+    ).cached_requests[0]
+    assert second.new_block_ids_by_layer_group == [[12], [22]]
+    assert second.new_block_ids == []
+
+
 def test_scheduler_output_num_scheduled_tokens_with_mtp():
     """Test that num_scheduled_tokens is correctly set for MTP (multi-token prediction)."""
     NUM_DRAFT_TOKENS = 3
@@ -340,7 +385,7 @@ def test_scheduler_output_num_scheduled_tokens_with_mtp():
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
 
     # Create a mock request in generation state with draft tokens
-    req = MagicMock()
+    req = MagicMock(is_dummy_request=False)
     req.request_id = 42
     req.state = LlmRequestState.GENERATION_IN_PROGRESS
     req.get_tokens.return_value = [1, 2, 3, 4, 5]  # 5 tokens already generated
@@ -379,7 +424,7 @@ def test_scheduler_output_block_hashes_read_through():
     # one full block whose hash has just been committed by the manager.
     kv_cache_manager.commit_and_get_block_hashes.side_effect = [[], [12345]]
 
-    req = MagicMock()
+    req = MagicMock(is_dummy_request=False)
     req.request_id = 42
     req.state = LlmRequestState.GENERATION_IN_PROGRESS
     req.py_draft_tokens = []
@@ -487,7 +532,7 @@ def test_an_empty_group_list_reaches_the_flat_callbacks():
     scheduler = _FlatOnlyScheduler()
     manager = KvCacheConnectorManager(MagicMock(), scheduler)
 
-    req = MagicMock()
+    req = MagicMock(is_dummy_request=False)
     req.request_id = 3
 
     manager.update_state_after_alloc(req, [], [])
@@ -676,3 +721,110 @@ def test_nothing_is_said_where_nothing_changed(monkeypatch):
         scheduler=both(llm_args=None)).warn_flat_scheduler_under_swa(4096)
 
     assert warnings == []
+
+
+# ---------------------------------------------------------------------------
+# cancel_load.
+#
+# `aggressive_prefix_budgeting` asks the connector before the batch is final,
+# so an answered query no longer implies the request runs. This is the callback
+# that closes the gap, and the check that refuses to start without it.
+# ---------------------------------------------------------------------------
+
+
+class _CancellingScheduler(_FlatOnlyScheduler):
+
+    def __init__(self):
+        super().__init__()
+        self.cancelled = []
+
+    def cancel_load(self, request, start, end):
+        self.cancelled.append((request.request_id, start, end))
+
+
+def test_cancel_load_reaches_the_connector():
+    scheduler = _CancellingScheduler()
+    manager = KvCacheConnectorManager(MagicMock(), scheduler)
+    req = MagicMock(is_dummy_request=False)
+    req.request_id = 7
+
+    manager.cancel_load(req, 0, 64)
+
+    assert scheduler.cancelled == [(7, 0, 64)]
+
+
+@pytest.mark.parametrize("start,end", [(64, 64), (64, 0)])
+def test_an_empty_cancellation_never_reaches_the_connector(start, end):
+    """Call sites hand back whatever the runtime declined, which is routinely
+    nothing. Dropping those here keeps every site free of the same guard."""
+    scheduler = _CancellingScheduler()
+    manager = KvCacheConnectorManager(MagicMock(), scheduler)
+    req = MagicMock(is_dummy_request=False)
+    req.request_id = 7
+
+    manager.cancel_load(req, start, end)
+
+    assert scheduler.cancelled == []
+
+
+def test_a_connector_without_cancel_load_is_detected():
+    """The failure this catches -- a connector holding remote blocks it was
+    told to release -- has no runtime symptom, so it is caught at bring-up."""
+    manager = KvCacheConnectorManager(MagicMock(), _FlatOnlyScheduler())
+
+    assert manager.supports_load_cancellation() is False
+
+
+def test_a_connector_with_cancel_load_is_detected():
+    manager = KvCacheConnectorManager(MagicMock(), _CancellingScheduler())
+
+    assert manager.supports_load_cancellation() is True
+
+
+def test_the_default_cancel_load_refuses_by_name():
+    scheduler = _FlatOnlyScheduler()
+
+    with pytest.raises(NotImplementedError, match="_FlatOnlyScheduler"):
+        scheduler.cancel_load(MagicMock(), 0, 64)
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.threadleak(enabled=False)
+def test_connector_adp_disjoint_requests(
+        mpi_pool_executor: MPIPoolExecutor) -> None:
+    """A busy owner must finish without request callbacks on its idle peer."""
+
+    def test() -> None:
+
+        class AdapterMock(MagicMock):
+            supports_attention_dp = True
+
+        worker = AdapterMock()
+        scheduler = AdapterMock()
+        scheduler.get_num_new_matched_tokens.return_value = (4, False)
+        scheduler.request_finished.return_value = True
+        manager = KvCacheConnectorManager(worker,
+                                          scheduler,
+                                          enable_attention_dp=True)
+        requests = []
+        # Different callback counts would deadlock the old per-request MPI
+        # broadcasts; intersecting all owners' completions would never release.
+        if mpi_rank() == 1:
+            for request_id in (10, 20, 30):
+                req = MagicMock(is_dummy_request=False,
+                                is_generation_only_request=False)
+                req.request_id = request_id
+                assert manager.get_num_new_matched_tokens(req, 0) == 4
+                manager.update_state_after_alloc(req, [request_id])
+                assert manager.request_finished(req, [request_id])
+                requests.append(req)
+        worker.get_finished.return_value = ([
+            req.request_id for req in requests
+        ], [])
+        assert {req.request_id
+                for req in manager.get_finished()
+                } == {req.request_id
+                      for req in requests}
+        assert not manager.pending_async_requests.saving
+
+    run_across_mpi(mpi_pool_executor, test, 2)

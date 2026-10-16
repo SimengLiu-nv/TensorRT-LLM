@@ -21,9 +21,11 @@ import shutil
 import sys
 import tempfile
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
@@ -114,6 +116,8 @@ def model_with_connector(use_kv_cache_manager_v2):
 
         importlib_mock.import_module.return_value.KvConnectorScheduler.return_value = mock_scheduler
         importlib_mock.import_module.return_value.KvConnectorWorker.return_value = mock_worker
+        importlib_mock.import_module.return_value.KvConnectorScheduler.supports_attention_dp = False
+        importlib_mock.import_module.return_value.KvConnectorWorker.supports_attention_dp = False
 
         # A cache that reports per layer group always calls the per-group form,
         # so mirror what a real connector's default does with it: fold a single
@@ -1566,8 +1570,8 @@ def test_connector_max_utilization_is_rejected_on_v1_only(
         ),
         pytest.param(
             dict(enable_attention_dp=True),
-            "attention data parallelism",
-            "attention data parallelism",
+            "supports_attention_dp=True",
+            "supports_attention_dp=True",
             id="attention_dp",
         ),
     ],
@@ -1593,8 +1597,11 @@ def test_connector_rejects_unsupported_config(enforce_single_worker,
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
                          ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
                          indirect=True)
-def test_connector_e2e_persistent_cache(enforce_single_worker,
-                                        use_kv_cache_manager_v2, monkeypatch):
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+def test_connector_e2e_persistent_cache(enforce_single_worker: None,
+                                        use_kv_cache_manager_v2: bool,
+                                        monkeypatch: pytest.MonkeyPatch,
+                                        enable_attention_dp: bool) -> None:
     """End-to-end KV connector test using PersistentKvCacheConnector from examples.
 
     Runs the same prompt through two separate LLM instances sharing a
@@ -1655,6 +1662,8 @@ def test_connector_e2e_persistent_cache(enforce_single_worker,
             kv_cache_config=KvCacheConfig(
                 free_gpu_memory_fraction=0.1,
                 use_kv_cache_manager_v2=use_kv_cache_manager_v2),
+            enable_attention_dp=enable_attention_dp,
+            enable_chunked_prefill=False,
         )
 
         prompt = (
@@ -1666,7 +1675,9 @@ def test_connector_e2e_persistent_cache(enforce_single_worker,
             "high-performance computing, and mobile and automotive "
             "applications. Tell me about the company.")
 
-        sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+        sampling_params = SamplingParams(max_tokens=32,
+                                         ignore_eos=True,
+                                         temperature=0)
 
         llm1 = LLM(**llm_kwargs)
         try:
@@ -2626,3 +2637,176 @@ def test_connector_transfers_only_in_window_blocks_to_the_sliding_group(
         if examples_dir in sys.path:
             sys.path.remove(examples_dir)
         shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+# The budgeting claim, end to end. Two prompts sized so that they fit one
+# iteration's token budget together only if the served prefix comes off first:
+# each asks for the whole budget on its own, and half of it once the connector
+# has served half its prompt.
+BUDGETING_PROMPT_TOKENS = 256
+BUDGETING_OFFER_TOKENS = 128
+
+
+def _max_prefills_in_one_iteration(scheduler):
+    """The most context requests any one reported iteration carried.
+
+    Each `build_connector_meta` call is one iteration. A generation iteration
+    schedules exactly one token per request, which is what separates prefill
+    from generation here.
+    """
+    most = 0
+    for call in scheduler.build_connector_meta.call_args_list:
+        sched_output = call.args[0]
+        requests = sched_output.new_requests + sched_output.cached_requests
+        prefills = sum(1 for req in requests if req.num_scheduled_tokens > 1)
+        most = max(most, prefills)
+    return most
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("aggressive_prefix_budgeting", [False, True],
+                         ids=["default_budgeting", "aggressive_budgeting"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
+                         ids=["kv_cache_manager_v2"],
+                         indirect=True)
+def test_connector_prefix_frees_scheduler_budget(enforce_single_worker,
+                                                 model_with_connector,
+                                                 use_kv_cache_manager_v2,
+                                                 aggressive_prefix_budgeting):
+    """A served prefix admits a second request in the same iteration.
+
+    Both modes remove the same work from the forward pass. What the opt-in
+    changes is when the runtime learns of it: asked during the scheduling pass,
+    the saving is off the request's remaining length before the token budget is
+    checked, so it is budget another request can spend. Asked once the batch is
+    final, the budget was already committed against the full prompt.
+
+    Two prompts of `BUDGETING_PROMPT_TOKENS` against a budget of exactly that:
+    on their own each one fills it, and with half of each served they both fit.
+    """
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(
+        disable_overlap_scheduler=True,
+        max_num_tokens=BUDGETING_PROMPT_TOKENS,
+        kv_connector_config=KvCacheConnectorConfig(
+            connector_module="",
+            connector_scheduler_class="KvConnectorScheduler",
+            connector_worker_class="KvConnectorWorker",
+            aggressive_prefix_budgeting=aggressive_prefix_budgeting,
+        ),
+    )
+
+    record_connector_queries(scheduler, BUDGETING_OFFER_TOKENS)
+    worker.get_finished.return_value = [], []
+
+    # Distinct prompts: identical ones would give the second request a full
+    # local match and never reach the budget question.
+    generate_and_wait(
+        model, scheduler, worker,
+        [[0] * BUDGETING_PROMPT_TOKENS, [1] * BUDGETING_PROMPT_TOKENS],
+        SamplingParams(max_tokens=4, ignore_eos=True))
+
+    expected = 2 if aggressive_prefix_budgeting else 1
+    assert _max_prefills_in_one_iteration(scheduler) == expected
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
+                         ids=["kv_cache_manager_v2"],
+                         indirect=True)
+def test_aggressive_prefix_budgeting_still_asks_once_and_shrinks_the_prefill(
+        enforce_single_worker, model_with_connector, use_kv_cache_manager_v2):
+    """What a connector observes is unchanged by the earlier ask.
+
+    The query moves, the contract does not: one query per allocation, anchored
+    at the local match, and a prefill shortened by exactly the served range. A
+    connector that never sets the flag and one that does see the same sequence.
+    """
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(
+        disable_overlap_scheduler=True,
+        kv_connector_config=KvCacheConnectorConfig(
+            connector_module="",
+            connector_scheduler_class="KvConnectorScheduler",
+            connector_worker_class="KvConnectorWorker",
+            aggressive_prefix_budgeting=True,
+        ),
+    )
+
+    queries = record_connector_queries(scheduler, BUDGETING_OFFER_TOKENS)
+    worker.get_finished.return_value = [], []
+
+    generate_and_wait(model, scheduler, worker, [0] * BUDGETING_PROMPT_TOKENS,
+                      SamplingParams(max_tokens=4, ignore_eos=True))
+
+    assert len(queries) == 1
+    _, num_computed_tokens, _ = queries[0]
+    assert num_computed_tokens == 0
+
+    req = scheduler.build_connector_meta.call_args_list[0].args[0].new_requests[
+        0]
+    assert req.computed_position == 0
+    assert req.num_scheduled_tokens == (BUDGETING_PROMPT_TOKENS -
+                                        BUDGETING_OFFER_TOKENS)
+
+    # Nothing was declined, so the connector is never asked to hand anything
+    # back: the offer is a whole number of blocks, below prompt_len - 1, and
+    # covered by pages.
+    scheduler.cancel_load.assert_not_called()
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+def test_connector_adp_persistent_pool(monkeypatch: pytest.MonkeyPatch,
+                                       tmp_path: Path,
+                                       disable_overlap_scheduler: bool) -> None:
+    """Two ADP owners share persisted KV across executor restarts.
+
+    A single request exercises an idle owner; four equal requests exercise
+    balanced batches; unequal prompt lengths exercise uneven prefill work.
+    """
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Requires two GPUs")
+    monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
+    examples_dir = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "../../../../examples/llm-api"))
+    monkeypatch.syspath_prepend(examples_dir)
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join([examples_dir,
+                         os.environ.get("PYTHONPATH", "")]))
+    monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path))
+    config = KvCacheConnectorConfig(
+        connector_module="llm_kv_cache_connector",
+        connector_scheduler_class="PersistentKvCacheConnectorLeader",
+        connector_worker_class="PersistentKvCacheConnectorWorker",
+    )
+    kwargs = dict(
+        model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
+        backend="pytorch",
+        tensor_parallel_size=2,
+        enable_attention_dp=True,
+        kv_connector_config=config,
+        enable_chunked_prefill=False,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        cuda_graph_config=None,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
+    )
+    params = SamplingParams(max_tokens=8, ignore_eos=True, temperature=0)
+    short_prompt = "Explain how a computer stores information. " * 16
+    workloads = [[short_prompt], [short_prompt] * 4,
+                 [short_prompt * 4, short_prompt, short_prompt, short_prompt]]
+    expected = []
+    with LLM(**kwargs) as producer:
+        for prompts in workloads:
+            outputs = producer.generate(prompts, params)
+            expected.append([output.outputs[0].token_ids for output in outputs])
+    assert list(
+        tmp_path.glob("*.pt")), "The first executor must publish cache blocks"
+    with LLM(**kwargs) as consumer:
+        for prompts, token_ids in zip(workloads, expected):
+            outputs = consumer.generate(prompts, params)
+            assert [output.outputs[0].token_ids
+                    for output in outputs] == token_ids

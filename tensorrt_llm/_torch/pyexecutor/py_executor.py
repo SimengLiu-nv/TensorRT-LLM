@@ -61,7 +61,8 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .connectors.kv_cache_layout import build_kv_cache_layout_v2
+from .connectors.kv_cache_layout import (build_kv_cache_layout_v2,
+                                         combine_kv_cache_layouts)
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
@@ -92,6 +93,7 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter
+from .scheduler.scheduler_v2 import KVCacheV2Scheduler
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -1004,7 +1006,7 @@ class PyExecutor:
         if start_worker:
             self.start_worker()
 
-    def _maybe_init_kv_connector_manager(self):
+    def _maybe_init_kv_connector_manager(self) -> None:
         if self.kv_connector_manager is not None:
             if self.kv_cache_transceiver is not None:
                 logger.warning(
@@ -1025,13 +1027,9 @@ class PyExecutor:
                     "list has no notion of beams, so non-leading beams would "
                     "save and restore the wrong KV state.")
 
-            if self.enable_attention_dp:
-                raise NotImplementedError(
-                    "KV Cache Connector is not supported with attention data "
-                    "parallelism (enable_attention_dp). Dummy requests "
-                    "inserted for cross-DP balancing flow through the "
-                    "connector scheduler / worker hooks and are not "
-                    "distinguished from real requests.")
+            if self.enable_attention_dp != self.kv_connector_manager.enable_attention_dp:
+                raise ValueError(
+                    "KV connector and executor attention-DP modes must agree.")
 
             if self.kv_cache_manager is None:
                 raise ValueError(
@@ -1040,7 +1038,8 @@ class PyExecutor:
             is_kv_cache_manager_v2 = isinstance(self.kv_cache_manager,
                                                 KVCacheManagerV2)
 
-            if is_kv_cache_manager_v2 and self.max_draft_len > 0:
+            if (is_kv_cache_manager_v2 and self.max_draft_len > 0
+                    and not self.kv_connector_manager.speculative_prefill_only):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with speculative "
                     "decoding. Rejected draft tokens "
@@ -1099,6 +1098,9 @@ class PyExecutor:
                     "per-layer load/save hooks have nothing meaningful to "
                     "transfer for those layers.")
 
+            self._check_aggressive_prefix_budgeting(is_kv_cache_manager_v2)
+            self._warn_on_unvalidated_capacity_policy(is_kv_cache_manager_v2)
+
             if is_kv_cache_manager_v2:
                 # Registered regions are device addresses, so every page has
                 # to stay pinned to GPU for as long as the connector holds
@@ -1106,7 +1108,19 @@ class PyExecutor:
                 self._reject_non_gpu_cache_tiers(self.kv_cache_manager)
                 self._reject_connector_prefix_without_block_reuse(
                     self.kv_cache_manager)
-                layout = build_kv_cache_layout_v2(self.kv_cache_manager)
+                layouts = [build_kv_cache_layout_v2(self.kv_cache_manager)]
+                if self.draft_kv_cache_manager is not None:
+                    if not isinstance(self.draft_kv_cache_manager,
+                                      KVCacheManagerV2):
+                        raise NotImplementedError(
+                            "KV Cache Connector requires a V2 draft cache manager "
+                            "when one-model speculative decoding uses a separate "
+                            "draft cache.")
+                    self._reject_non_gpu_cache_tiers(
+                        self.draft_kv_cache_manager)
+                    layouts.append(
+                        build_kv_cache_layout_v2(self.draft_kv_cache_manager))
+                layout = combine_kv_cache_layouts(layouts)
                 self.kv_connector_manager.reject_flat_only_scheduler(
                     len(layout.groups))
                 window = (layout.groups[0].window_size
@@ -1128,6 +1142,93 @@ class PyExecutor:
                         self.kv_connector_manager.layer_post_hook)
 
             self.kv_connector_manager.wait_for_initialization()
+
+    def _warn_on_unvalidated_capacity_policy(
+            self, is_kv_cache_manager_v2: bool) -> None:
+        """Warn when a connector runs on the flat-tensor manager under a
+        capacity policy it has never been exercised against.
+
+        `GUARANTEED_NO_EVICT` is the only policy that manager's connector path
+        is validated for: it is the one under which a scheduled request keeps
+        its allocation, so the query answered when the sequence was added stays
+        binding. The others can pause and replay a live request.
+
+        `create_py_executor` refuses the same combination outright, but it can
+        only see the *configured* manager, and `use_kv_cache_manager_v2` is
+        tri-state -- under "auto" the choice is made during model loading and
+        can land on either. That leaves this the only place the real manager is
+        known. It warns rather than refuses because the two arms mean different
+        things: `use_kv_cache_manager_v2=False` is the user asserting a manager
+        the policy is wrong for, while "auto" is the runtime picking one, and
+        the combination is unvalidated rather than known-broken.
+        """
+        policy = getattr(getattr(self.llm_args, 'scheduler_config', None),
+                         'capacity_scheduler_policy', None)
+        if is_kv_cache_manager_v2 or policy is None:
+            return
+        if policy == CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
+            return
+        # Preformatted: the repository logger joins its arguments with spaces
+        # rather than applying printf substitution.
+        logger.warning(
+            "KV connector is running on the V1 KV cache manager under "
+            f"capacity_scheduler_policy={policy.name}, which is not a validated "
+            "combination; only GUARANTEED_NO_EVICT is. The manager was chosen "
+            "by kv_cache_config.use_kv_cache_manager_v2='auto'. Set it to True "
+            "to get the V2 manager, which supports every policy, or set "
+            "scheduler_config.capacity_scheduler_policy=GUARANTEED_NO_EVICT.")
+
+    def _check_aggressive_prefix_budgeting(
+            self, is_kv_cache_manager_v2: bool) -> None:
+        """Reject a configuration that cannot support the speculative prefix query.
+
+        Three requirements, each of which fails silently rather than loudly if
+        it is not checked here.
+
+        The flat-tensor manager asks inside ``addSequence``, once the batch is
+        final, and has no way to unask; there is nowhere for the query to move
+        to.
+
+        ``cancel_load`` is what makes the query safe to ask early. A connector
+        that does not implement it leaks ownership of every offer the runtime
+        declines, and nothing at runtime reports that.
+
+        Prefix-aware scheduling is what carries the saving into the budget: with
+        it off, both context paths size the request against the remaining length
+        captured before the query ran, so the mode costs a cancellation path and
+        buys nothing.
+        """
+        if not self.kv_connector_manager.aggressive_prefix_budgeting:
+            return
+
+        if not is_kv_cache_manager_v2:
+            raise NotImplementedError(
+                "kv_connector_config.aggressive_prefix_budgeting requires the "
+                "V2 KV cache manager, which allocates during scheduling and can "
+                "suspend a request whose allocation is refuted. Set "
+                "kv_cache_config.use_kv_cache_manager_v2=True, or unset "
+                "aggressive_prefix_budgeting.")
+
+        if not self.kv_connector_manager.supports_load_cancellation():
+            scheduler = self.kv_connector_manager.scheduler
+            raise NotImplementedError(
+                f"{type(scheduler).__name__} does not implement cancel_load, "
+                "which kv_connector_config.aggressive_prefix_budgeting "
+                "requires. Asking during the scheduling pass makes the query "
+                "speculative: an offer can be clamped, outrun by the local "
+                "cache, left uncovered by pages, or dropped with the request, "
+                "and cancel_load is the only way the connector is told to "
+                "release it.")
+
+        scheduler_config = getattr(self.llm_args, 'scheduler_config', None)
+        if scheduler_config is not None and \
+                not scheduler_config.enable_prefix_aware_scheduling:
+            raise NotImplementedError(
+                "kv_connector_config.aggressive_prefix_budgeting requires "
+                "scheduler_config.enable_prefix_aware_scheduling=True. Without "
+                "it the scheduler budgets a context request against the length "
+                "it had before the connector was asked, so a served prefix "
+                "frees no budget and the mode has no effect.")
 
     @staticmethod
     def _reject_connector_prefix_without_block_reuse(kv_cache_manager) -> None:
@@ -3413,6 +3514,10 @@ class PyExecutor:
         """
         if self._is_kv_manager_v2:
             for req in scheduled_batch.generation_requests:
+                # The empty-batch ADP padding dummy was never grown by the
+                # V2 scheduler; see _pad_empty_attention_dp_batch.
+                if getattr(req, "py_skip_gen_alloc_revert", False):
+                    continue
                 self.kv_cache_manager.revert_allocate_generation(req)
 
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
@@ -3800,19 +3905,133 @@ class PyExecutor:
             f'{scheduled_batch.num_generation_requests} generation requests')
         return scheduled_batch, iter_stats
 
-    def _kv_connector_start_batch(self, scheduled_batch):
+    def _kv_connector_start_batch(self,
+                                  scheduled_batch: ScheduledRequests) -> None:
         if self.kv_connector_manager:
             self.kv_connector_manager.take_scheduled_requests_pending_load(
                 scheduled_batch)
+            if self.enable_attention_dp and scheduled_batch.batch_size == 0:
+                # Async restores can empty a batch after the usual ADP padding
+                # and resource preparation. Keep ready owners computing while
+                # this owner's worker makes progress on the restore.
+                self._pad_empty_attention_dp_batch(scheduled_batch)
+                if scheduled_batch.batch_size:
+                    self.resource_manager.prepare_resources(
+                        scheduled_batch, publish_connector_output=False)
             self.kv_connector_manager.handle_metadata()
-            self.kv_connector_manager.worker.start_load_kv(
-                torch.cuda.current_stream())
+            # V2 page reuse/COW runs on the execution stream. Restores must
+            # follow those operations rather than race them on the default
+            # stream (including copies issued by host-staged connectors).
+            load_stream = (self.execution_stream if isinstance(
+                self.kv_cache_manager, KVCacheManagerV2) else
+                           torch.cuda.current_stream())
+            self.kv_connector_manager.worker.start_load_kv(load_stream)
+            failed = self.kv_connector_manager.take_failed_load_requests()
+            if failed:
+                self._recover_failed_connector_loads(scheduled_batch, failed)
+
+    def _recover_failed_connector_loads(self,
+                                        scheduled_batch: ScheduledRequests,
+                                        failed_ids: set[int]) -> None:
+        """Restart context requests whose connector prefix could not be loaded.
+
+        The connector offered a stored prefix, the scheduler skipped the request
+        past it, and the pages were then not there to load (evicted from a full
+        pool, or never completely written). Those positions already count as
+        computed, so the request cannot take part in this forward pass. Drop
+        its allocation and progress and leave it active: the scheduler admits
+        it again next iteration from local reuse, and the connector is asked
+        afresh without the lost pages. Rank-local by construction, so only
+        attention-DP owners and single-rank servers report failures here.
+        """
+        dropped = []
+        for key in ("context_requests_chunking", "context_requests_last_chunk"):
+            kept = []
+            for req in getattr(scheduled_batch, key):
+                (dropped if req.request_id in failed_ids else kept).append(req)
+            setattr(scheduled_batch, key, kept)
+        for req in dropped:
+            self._restart_failed_connector_load(req)
+        logger.warning(
+            f"kv connector: {len(dropped)} context request(s) restarted after a failed "
+            f"prefix load: {[req.request_id for req in dropped]}")
+        if self.enable_attention_dp and scheduled_batch.batch_size == 0:
+            # Same as the asynchronous-restore case above: keep this owner in
+            # the collective forward while it has nothing of its own to run.
+            self._pad_empty_attention_dp_batch(scheduled_batch)
+            if scheduled_batch.batch_size:
+                self.resource_manager.prepare_resources(
+                    scheduled_batch, publish_connector_output=False)
 
     def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
             for req in reqs_to_terminate:
+                if self._resume_preempted_request(req):
+                    continue
                 self._end_transfer_and_maybe_terminate(req)
+            failed = self.kv_connector_manager.take_failed_async_load_requests()
+            if failed:
+                self._recover_failed_async_loads(failed)
+
+    def _restart_failed_connector_load(self, req: LlmRequest) -> None:
+        """Release the failed prefix and the first chunk's speculative state."""
+        self.kv_connector_manager.forget_request(req)
+        self.kv_cache_manager.drop_context_allocation(req)
+        if isinstance(self.draft_kv_cache_manager, KVCacheManagerV2):
+            self.draft_kv_cache_manager.free_resources(req)
+        # Resource preparation preceded the load. MTP already owns a hidden
+        # state slot, and its next first-chunk preparation must not allocate
+        # another slot for the same request.
+        spec_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if spec_manager is not None:
+            spec_manager.free_resources(req)
+
+    def _recover_failed_async_loads(self, failed_ids: set[int]) -> None:
+        """Restart parked requests whose asynchronous prefix load lost a page.
+
+        The same outcome as `_recover_failed_connector_loads`, reached from a
+        different place: the request was parked outside the batch while its
+        pages were fetched, `get_finished` has just moved it back to context
+        state, and the bytes it was skipped past are not all there. Drop the
+        allocation and progress before the scheduler can admit it; it then
+        restarts from local reuse and the connector is asked afresh.
+        """
+        restarted = []
+        for request_id in failed_ids:
+            req = self.kv_connector_manager.finished_async_loading_requests.pop(
+                request_id, None)
+            if req is None:
+                # Finished or cancelled while parked; that path released the
+                # allocation, and there is nothing left to rewind.
+                continue
+            self._restart_failed_connector_load(req)
+            req.state = LlmRequestState.CONTEXT_INIT
+            restarted.append(request_id)
+        logger.warning(
+            f"kv connector: {len(restarted)} parked context request(s) restarted after a "
+            f"failed asynchronous prefix load: {restarted}")
+
+    def _resume_preempted_request(self, request: LlmRequest) -> bool:
+        """Complete a preemption whose connector saves have now retired.
+
+        The scheduler preempts a request by handing it to the connector the
+        same way a finished request is handed over, so its pages stay put until
+        every rank reports the in-flight saves done. Both kinds come back
+        through `get_finished`, and only the KV cache manager knows which is
+        which.
+
+        Returns True when *request* was preempted rather than finished, in
+        which case its pages are now released and it is back in context state
+        awaiting a re-prefill.
+        """
+        if not self._is_kv_manager_v2:
+            return False
+        if not self.kv_cache_manager.try_complete_preemption(request):
+            return False
+        request.pause(self.max_input_len)
+        return True
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
@@ -5346,14 +5565,124 @@ class PyExecutor:
         self.batch_wait_iters_count = 0
         return context_requests
 
+    def _has_pending_kv_transfers(self) -> bool:
+        """Whether KV pages are held by work that completes outside the batch.
+
+        Native sends and connector saves are claims on the transfer manager.
+        An asynchronous connector load is not: its request is parked outside
+        the batch with its allocation until `get_finished` reports the load.
+        Under a slow store that wait can outlast the scheduler's stall limit,
+        and the parked pages can be all that keeps other prompts out.
+        """
+        if self.async_transfer_manager.has_any_inflight_requests():
+            return True
+        return (self.kv_connector_manager is not None
+                and self.kv_connector_manager.has_pending_async_loads())
+
+
+    def _pad_empty_attention_dp_batch(
+            self, scheduled_batch: ScheduledRequests) -> None:
+        """Pad an empty scheduled batch so attention DP can make progress.
+
+        `_can_queue` vetoes the forward pass on every rank when any rank's
+        *scheduled* batch is empty. `_pad_attention_dp_dummy_request` cannot
+        prevent that: it guarantees every rank has an *active* request, and runs
+        before `_schedule()`, so a rank whose only active request does not fit
+        the free KV cache is left unpadded and schedules an empty batch. Peers
+        then never advance their context chunks (`_update_request_states` runs
+        under `if can_queue:`), so no KV cache is freed and the rank stays
+        starved -- silently, since nothing on that path raises or times out.
+
+        Padding is rank-local because `_schedule()` allgathers inside
+        `_balance_adp_requests`. A generation dummy is used rather than the
+        context dummy the pre-schedule path would pick, since this rank is empty
+        precisely because it is short of KV cache. Not reached under pipeline
+        parallelism, which does not call `_prepare_and_schedule_batch`.
+        """
+        if not self.enable_attention_dp:
+            return
+        if scheduled_batch is None or scheduled_batch.batch_size != 0:
+            return
+        if not self.active_requests or self.expected_num_active_requests <= 0:
+            return
+        # Unlike the pre-schedule path, this one pads a rank that already holds
+        # active requests, so it must respect the cap that
+        # `_pad_attention_dp_dummy_request` asserts against. A rank at the cap
+        # is not starved anyway.
+        if len(self.active_requests) >= self.max_num_active_requests:
+            return
+        # The fill gate suppresses forwards on purpose; dummies added then are
+        # never terminated (termination follows a forward pass).
+        if self._should_skip_dummy_for_benchmark_disagg(
+                self._count_schedulable_active_requests()):
+            return
+        # ATTENTION_DP_DUMMY_REQUEST_ID is a singleton resource.
+        if any(request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
+               for request in self.active_requests):
+            return
+        if not self._has_adp_dummy_kv_capacity(None):
+            logger.warning_once(
+                "attention-DP rank scheduled an empty batch and cannot afford "
+                "even a padding dummy; the forward pass is vetoed fleet-wide "
+                "this iteration",
+                key="attention_dp_empty_batch_no_pad_capacity")
+            return
+
+        dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
+        try:
+            # Degrade to an empty batch rather than propagate: the ranks have
+            # yet to agree on can_queue, so a rank-local raise would strand the
+            # peers in the collectives that follow.
+            dummy_requests = self.kv_cache_manager.add_dummy_requests(
+                request_ids=dummy_request_ids,
+                token_nums=None,
+                is_gen=True,
+                prepare_resource=True,
+                max_num_draft_tokens=self.max_total_draft_tokens,
+            )
+        except (OutOfPagesError, NoFreeSlotsError):
+            dummy_requests = None
+        if not dummy_requests:
+            logger.warning_once(
+                "Could not allocate the attention-DP empty-batch padding "
+                "dummy; retrying next iteration",
+                key="attention_dp_empty_batch_pad_alloc_failed")
+            return
+
+        dummy_request = dummy_requests[0]
+        spec_resource_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if spec_resource_manager is not None:
+            try:
+                spec_resource_manager.add_dummy_requests(dummy_request_ids)
+            except NoFreeSlotsError:
+                self.kv_cache_manager.free_resources(dummy_request)
+                return
+
+        dummy_request.is_attention_dp_dummy = True
+        # Never grown by the V2 scheduler, so `_revert_gen_alloc` must skip it.
+        dummy_request.py_skip_gen_alloc_revert = True
+        self.active_requests.append(dummy_request)
+        scheduled_batch.generation_requests.append(dummy_request)
+        # Let `_finalize_adp_dummy_allocation` roll this back if the fleet still
+        # cannot queue: no forward runs then, so the usual dummy teardown in
+        # `_handle_responses` is not reached this iteration.
+        self._pending_adp_dummy_request = dummy_request
+
     @nvtx_range("_schedule")
-    def _schedule(self):
+    def _schedule(self) -> Tuple[ScheduledRequests, List[LlmRequest], int]:
         if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
-        scheduler_output = self.scheduler.schedule_request(
-            self.active_requests, self.inflight_req_ids)
+        if isinstance(self.scheduler, KVCacheV2Scheduler):
+            scheduler_output = self.scheduler.schedule_request(
+                self.active_requests,
+                self.inflight_req_ids,
+                has_pending_kv_transfers=self._has_pending_kv_transfers())
+        else:
+            scheduler_output = self.scheduler.schedule_request(
+                self.active_requests, self.inflight_req_ids)
 
         scheduled_context_requests = scheduler_output.context_requests
         if self.enable_attention_dp and self.attention_dp_enable_balance:
@@ -6201,7 +6530,7 @@ class PyExecutor:
                 # swallows that, leaving `request_finished` uncalled and the
                 # connector never told to save anything.
                 if isinstance(self.kv_cache_manager, KVCacheManagerV2):
-                    by_layer_group = self.kv_cache_manager.get_page_indices_by_layer_group(
+                    by_layer_group = self._connector_page_indices_by_layer_group(
                         req)
                     cache_block_ids = by_layer_group[0] if len(
                         by_layer_group) == 1 else []
@@ -6225,6 +6554,17 @@ class PyExecutor:
         for req in requests:
             if req.is_finished:
                 kv_connector_request_finished(req)
+
+    def _connector_page_indices_by_layer_group(
+            self, request: LlmRequest) -> List[List[int]]:
+        """Return the connector's dense target-plus-draft group index space."""
+        by_layer_group = self.kv_cache_manager.get_page_indices_by_layer_group(
+            request)
+        if isinstance(self.draft_kv_cache_manager, KVCacheManagerV2):
+            by_layer_group.extend(
+                self.draft_kv_cache_manager.get_page_indices_by_layer_group(
+                    request))
+        return by_layer_group
 
     @staticmethod
     def _request_vote_id(request: LlmRequest) -> int:
@@ -6723,12 +7063,18 @@ class PyExecutor:
                 or request.state
                 == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS)
 
-    def _try_cancel_request(self, request) -> bool:
+    def _try_cancel_request(self, request: LlmRequest) -> bool:
         """Check if a request can be canceled and attempt cancellation if needed.
 
         Returns:
             bool: True if the request can be canceled (either successfully cancelled or doesn't need cancellation).
         """
+        connector = getattr(self, "kv_connector_manager", None)
+        if connector is not None and connector.has_pending_transfers(
+                request.request_id):
+            # The generic worker API cannot cancel DMA. Defer cancellation
+            # until get_finished confirms that the blocks are no longer used.
+            return False
         if self.kv_cache_transceiver is None:
             return True
 
