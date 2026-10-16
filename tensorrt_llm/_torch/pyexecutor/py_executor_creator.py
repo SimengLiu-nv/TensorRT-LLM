@@ -22,8 +22,7 @@ from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ExecutorMemoryType,
                                           GuidedDecodingConfig, KvCacheConfig,
                                           LoadFormat, MTPDecodingConfig,
-                                          SpeculativeConfig,
-                                          TorchLlmArgs)
+                                          SpeculativeConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
                                            _xgrammar_tokenizer_info)

@@ -237,6 +237,9 @@ class _ContextRequest:
     is_disagg_generation_init_state: bool = False
     is_dummy_request: bool = False
     context_current_position: int = 0
+    # Read by _settle_context_cursor when it re-spans the chunk.
+    context_chunk_size: int = 0
+    py_connector_served_position: int = 0
     prepopulated_prompt: tuple[int, int] | None = None
     multimodal_hashes: None = None
     multimodal_positions: None = None

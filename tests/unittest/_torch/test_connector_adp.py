@@ -26,7 +26,7 @@ class ADPAdapterMock(MagicMock):
 
 
 def _request(request_id: int, *, dummy: bool = False) -> MagicMock:
-    req = MagicMock(is_dummy_request=dummy, is_generation_only_request=False)
+    req = MagicMock(is_dummy_request=dummy, is_generation_only_request=lambda: False)
     req.request_id = request_id
     req.state = LlmRequestState.CONTEXT_INIT
     req.context_current_position = 0
@@ -213,6 +213,8 @@ def test_async_padding_preserves_connector_plan() -> None:
         manager.set_scheduler_output(SchedulerOutput())
     )
     executor.resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: cache})
+    # Read when choosing the restore stream; a non-V2 manager uses the current stream.
+    executor.kv_cache_manager = cache
     dummy = _request(999, dummy=True)
 
     def pad_batch(scheduled_batch: ScheduledRequests) -> None:
@@ -304,7 +306,7 @@ def test_mtp_prefill_rejects_generation_before_lookup(generation_only: bool) -> 
     manager.speculative_prefill_only = True
     request = _request(7)
     request.is_context_only_request = False
-    request.is_generation_only_request = generation_only
+    request.is_generation_only_request = lambda: generation_only
 
     with pytest.raises(NotImplementedError, match="context-only prefill"):
         manager.query_num_new_matched_tokens(request, 0)

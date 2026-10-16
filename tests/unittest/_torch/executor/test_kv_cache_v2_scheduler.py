@@ -926,7 +926,9 @@ class TestContextPreemption:
 
         mgr.preempt_request.assert_called_once_with(victim)
         victim.pause.assert_not_called()
-        assert ids(out.paused_requests) == []
+        # The victim is reported as evicted so the executor stops scheduling
+        # it; the executor pauses it once the connector retires its saves.
+        assert ids(out.paused_requests) == [99]
         assert ids(out.context_requests) == []
         assert ids(out.generation_requests) == []
 

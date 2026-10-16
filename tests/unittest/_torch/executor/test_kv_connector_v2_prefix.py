@@ -40,7 +40,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 
 # Nothing here touches a device: the manager is built with `object.__new__` and
 # the cache is a stub. Declaring that puts these on the GPU-less stage, which
@@ -111,7 +111,8 @@ class FakeRequest:
         self.context_current_position = 0
         self.prepopulated_prompt_len = 0
         self.is_dummy = False
-        self.is_generation_only_request = False
+        # A method on this branch's LlmRequest, not a property.
+        self.is_generation_only_request = lambda: False
         self.is_disagg_generation_init_state = False
         self.py_num_connector_matched_tokens = 0
         self.py_connector_allocation_reported = False
@@ -615,6 +616,14 @@ class TestExtraKvTokens:
         assert kv_cache.capacity == 192 + 4
 
 
+def _set_request_kind(req, attribute, value):
+    """Set a request-kind flag; is_generation_only_request is a method here."""
+    if attribute == "is_generation_only_request":
+        setattr(req, attribute, lambda: value)
+    else:
+        setattr(req, attribute, value)
+
+
 class TestExclusions:
     @pytest.mark.parametrize(
         "attribute, excluded",
@@ -628,7 +637,7 @@ class TestExclusions:
         connector = FakeConnectorManager(num_matched=64)
         manager = make_manager(connector)
         req = FakeRequest()
-        setattr(req, attribute, excluded)
+        _set_request_kind(req, attribute, excluded)
 
         assert not serve(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
 
@@ -913,7 +922,7 @@ class TestBudgetedAskTiming:
         connector = budgeting(64)
         manager = make_manager(connector)
         req = FakeRequest()
-        setattr(req, attribute, True)
+        _set_request_kind(req, attribute, True)
 
         # Gen-init has its own scheduling entry point; exercise the connector
         # eligibility gate directly for all excluded request kinds.

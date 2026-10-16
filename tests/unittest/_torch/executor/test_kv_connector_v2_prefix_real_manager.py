@@ -27,7 +27,7 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import valid_page_slots
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
@@ -183,6 +183,7 @@ def test_a_request_dropped_before_the_batch_is_never_asked(manager, connector):
     assert request.context_current_position == 0
 
 
+@pytest.mark.skip(reason="needs reuse_match_backoff, which feat/m3_with_msa does not have")
 @pytest.mark.parametrize("partial_reuse", [False, True])
 @pytest.mark.parametrize("aggressive", [False, True])
 def test_mtp_local_backoff_keeps_whole_block_connector_queryable(
@@ -340,7 +341,8 @@ def test_freeing_the_allocation_makes_the_request_askable_again(manager, connect
     # request a `new_requests`-only connector never loads for.
     assert connector.forgotten == [request.py_request_id]
 
-    request.reset_for_recompute(PROMPT_LEN)
+    # This branch replays a preempted request through LlmRequest.pause.
+    request.pause(PROMPT_LEN)
     assert schedule(manager, request)
     run(manager, request)
 
@@ -815,6 +817,7 @@ def test_a_delivered_offer_is_not_handed_back(budgeting_manager, budgeting_conne
     assert budgeting_connector.cancels == []
 
 
+@pytest.mark.skip(reason="needs recompute pause, which feat/m3_with_msa does not have")
 def test_a_delivered_offer_is_re_asked_after_a_recompute_pause(
     budgeting_manager, budgeting_connector
 ):
@@ -933,7 +936,8 @@ def test_refuted_connector_chunk_releases_unused_completion_reservation() -> Non
     try:
         assert schedule(manager, request, TOKENS_PER_BLOCK)
         assert request.py_request_id in manager._disagg_completion_limits
-        assert manager.revert_allocate_context(request)
+        # This branch's revert returns nothing; the quota release is what matters.
+        manager.revert_allocate_context(request)
         assert request.py_request_id not in manager._disagg_completion_limits
         assert connector.queries == []
         assert schedule(manager, request, TOKENS_PER_BLOCK)

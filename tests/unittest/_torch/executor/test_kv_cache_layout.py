@@ -29,7 +29,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
     combine_kv_cache_layouts,
     valid_page_slots,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2

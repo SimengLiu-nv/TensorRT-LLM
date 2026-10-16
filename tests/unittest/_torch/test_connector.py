@@ -26,8 +26,7 @@ from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     AsyncRequests, KvCacheConnectorManager, KvCacheConnectorScheduler,
     KvCacheConnectorSchedulerOutputManager, KvCacheConnectorWorker)
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
-    KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.logger import logger
@@ -117,7 +116,7 @@ def test_connector_manager_num_matched_tokens(mpi_pool_executor):
         req = MagicMock(is_dummy_request=False)
 
         req.request_id = 42
-        req.is_generation_only_request = False
+        req.is_generation_only_request = lambda: False
 
         assert manager.get_num_new_matched_tokens(req, 32) == 16
 
@@ -146,11 +145,11 @@ def test_connector_manager_take_scheduled_requests(mpi_pool_executor):
 
         req0 = MagicMock(is_dummy_request=False)
         req0.request_id = 0
-        req0.is_generation_only_request = False
+        req0.is_generation_only_request = lambda: False
 
         req1 = MagicMock(is_dummy_request=False)
         req1.request_id = 1
-        req1.is_generation_only_request = False
+        req1.is_generation_only_request = lambda: False
 
         if mpi_rank() == 0:
             scheduler.get_num_new_matched_tokens.return_value = (16, True)
@@ -203,7 +202,7 @@ def test_connector_manager_query_is_side_effect_free(mpi_pool_executor):
 
         req = MagicMock(is_dummy_request=False)
         req.request_id = 42
-        req.is_generation_only_request = False
+        req.is_generation_only_request = lambda: False
         req.py_num_connector_matched_tokens = 0
 
         assert manager.query_num_new_matched_tokens(req, 32) == (16, True)
@@ -245,7 +244,7 @@ def test_connector_manager_commits_only_what_is_honoured(mpi_pool_executor):
 
         req = MagicMock(is_dummy_request=False)
         req.request_id = 7
-        req.is_generation_only_request = False
+        req.is_generation_only_request = lambda: False
         req.py_num_connector_matched_tokens = 0
 
         num_tokens, load_async = manager.query_num_new_matched_tokens(req, 0)
@@ -513,6 +512,8 @@ def test_a_released_request_reaches_the_per_layer_group_callbacks():
 
     req = MagicMock()
     req.request_id = 4
+    # A bare MagicMock attribute is truthy, which the dummy-request guard skips.
+    req.is_dummy_request = False
 
     manager.update_state_after_alloc(req, [], [[], []])
     assert scheduler.allocs == [[[], []]]
@@ -812,7 +813,7 @@ def test_connector_adp_disjoint_requests(
         if mpi_rank() == 1:
             for request_id in (10, 20, 30):
                 req = MagicMock(is_dummy_request=False,
-                                is_generation_only_request=False)
+                                is_generation_only_request=lambda: False)
                 req.request_id = request_id
                 assert manager.get_num_new_matched_tokens(req, 0) == 4
                 manager.update_state_after_alloc(req, [request_id])

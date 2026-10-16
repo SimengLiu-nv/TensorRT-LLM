@@ -30,8 +30,7 @@ import torch
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     V2_RETENTION_IGNORED_LOG_KEY, KvCacheConnectorWorker)
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
-    KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
                                           CapacitySchedulerPolicy,

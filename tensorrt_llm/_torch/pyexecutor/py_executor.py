@@ -39,8 +39,8 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
-from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy, PeftCacheConfig,
-                                          WaitingQueuePolicy)
+from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
+                                          PeftCacheConfig, WaitingQueuePolicy)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
@@ -5578,7 +5578,6 @@ class PyExecutor:
             return True
         return (self.kv_connector_manager is not None
                 and self.kv_connector_manager.has_pending_async_loads())
-
 
     def _pad_empty_attention_dp_batch(
             self, scheduled_batch: ScheduledRequests) -> None:
