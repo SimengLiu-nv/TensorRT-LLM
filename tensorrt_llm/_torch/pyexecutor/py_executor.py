@@ -640,8 +640,7 @@ class PyExecutor:
         self._event_loop_error: Optional[BaseException] = None
 
         # kv cache events
-        self.kv_cache_manager = self.resource_manager.resource_managers.get(
-            ResourceManagerType.KV_CACHE_MANAGER)
+        self._bind_kv_cache_managers()
         # V2 owns KV allocation, suspend, resume, and context finalization.
         # The executor skips the V1 terminate/pause paths and finalizes V2
         # context resources before transfer or response handling can terminate
@@ -1005,6 +1004,19 @@ class PyExecutor:
 
         if start_worker:
             self.start_worker()
+
+    def _bind_kv_cache_managers(self) -> None:
+        """Bind the target and (one-model) draft KV cache managers.
+
+        The draft manager is None unless one-model speculative decoding keeps
+        its draft KV in a separate pool. The KV connector registers both pools
+        and frees both per request, so the two are bound together here.
+        """
+        managers = self.resource_manager.resource_managers
+        self.kv_cache_manager = managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        self.draft_kv_cache_manager = managers.get(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
 
     def _maybe_init_kv_connector_manager(self) -> None:
         if self.kv_connector_manager is not None:

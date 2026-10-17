@@ -204,6 +204,23 @@ def _make_executor_with_kv_cache_manager(kv_cache_manager):
     return executor
 
 
+@pytest.mark.parametrize("draft", [None, "draft"], ids=["no_draft_pool", "draft_pool"])
+def test_bind_kv_cache_managers_binds_target_and_draft(draft):
+    """The KV connector reads draft_kv_cache_manager at startup; it must exist even when None."""
+    target = Mock(name="target")
+    draft_manager = None if draft is None else Mock(name="draft")
+    executor = _make_executor_with_kv_cache_manager(target)
+    if draft_manager is not None:
+        executor.resource_manager.resource_managers[ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = (
+            draft_manager
+        )
+
+    executor._bind_kv_cache_managers()
+
+    assert executor.kv_cache_manager is target
+    assert executor.draft_kv_cache_manager is draft_manager
+
+
 def test_get_kv_cache_capacity_without_manager():
     executor = _make_executor_with_kv_cache_manager(None)
 
