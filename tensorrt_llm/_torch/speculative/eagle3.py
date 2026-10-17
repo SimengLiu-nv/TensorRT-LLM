@@ -108,10 +108,15 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.slot_ids = []
         for req in context_batch:
             if req.is_first_context_chunk:
-                slot_id = self.slot_manager.add_slot(req.request_id)
+                # An asynchronous connector restore parks the request after
+                # preparation. It resumes on the same first chunk and still
+                # owns this slot; no model work has consumed it in between.
+                slot_id = self.slot_manager.get_slot(req.request_id)
+                if slot_id is None:
+                    slot_id = self.slot_manager.add_slot(req.request_id)
+                    if self.use_relaxed_acceptance_for_thinking:
+                        self.relaxed_delta_pool[slot_id].fill_(0)
                 self.slot_ids.append(slot_id)
-                if self.use_relaxed_acceptance_for_thinking:
-                    self.relaxed_delta_pool[slot_id].fill_(0)
         # reset the flag before model forward
         self.is_first_draft = True
 
