@@ -56,7 +56,11 @@ class MooncakeStoreMetadata:
 
     loads: List[RequestTransfers] = field(default_factory=list)
     saves: List[RequestTransfers] = field(default_factory=list)
+    #: Asynchronous loads to start on every rank. Only used under tensor
+    #: parallelism, where the scheduler adapter lives on rank 0 alone and each
+    #: rank must load its own shard of the parked request's pages.
+    async_loads: List[RequestTransfers] = field(default_factory=list)
 
     def __bool__(self) -> bool:
         """Whether there is any work at all this iteration."""
-        return bool(self.loads or self.saves)
+        return bool(self.loads or self.saves or self.async_loads)

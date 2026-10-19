@@ -1453,11 +1453,58 @@ def test_worker_has_no_load_thread_by_default(store_config, fake_store):
         assert worker.get_finished([], [5]) == ([], [5])
 
 
-def test_worker_rejects_async_load_under_tensor_parallelism(store_config, fake_store, monkeypatch):
+def test_worker_starts_async_loads_from_metadata_under_tensor_parallelism(
+    store_config, fake_store, monkeypatch
+):
+    """Under TP every rank starts its own shard's load from the broadcast metadata."""
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
+        MooncakeStoreMetadata,
+    )
+
     enable_async_load(store_config)
     monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 2)
-    with pytest.raises(NotImplementedError, match="attention DP"):
-        MooncakeStoreConnectorWorker(make_llm_args())
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        assert worker._async_via_metadata
+        block_hash = b"\x07" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+
+        worker.bind_connector_meta(
+            MooncakeStoreMetadata(
+                async_loads=[RequestTransfers(9, [PageTransfer(block_hash, 0, 2)])]
+            )
+        )
+        wait_async_idle(worker)
+
+        assert worker.get_finished([], [9]) == ([], [9])
+        assert [keys for keys, _addresses, _sizes in fake_store.get_calls] == [
+            [worker._namespaces[0].key(block_hash)]
+        ]
+
+
+def test_worker_async_load_failure_is_fatal_under_tensor_parallelism(
+    store_config, fake_store, monkeypatch
+):
+    """TP ranks cannot agree on restarting a request, so a failed shard load raises."""
+    enable_async_load(store_config)
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 2)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        worker.start_async_load(4, RequestTransfers(4, [PageTransfer(b"\x08" * 16, 0, 1)]))
+        wait_async_idle(worker)
+        with pytest.raises(RuntimeError, match="cannot agree on restarting"):
+            worker.get_finished([], [4])
+
+
+def test_worker_rejects_async_loads_in_metadata_without_tensor_parallelism(
+    store_config, fake_store
+):
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
+        MooncakeStoreMetadata,
+    )
+
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as worker:
+        with pytest.raises(RuntimeError, match="only tensor parallelism uses"):
+            worker.bind_connector_meta(MooncakeStoreMetadata(async_loads=[RequestTransfers(1, [])]))
 
 
 def test_worker_async_load_is_reported_once_the_runtime_announces_it(store_config, fake_store):
@@ -1579,12 +1626,28 @@ def test_scheduler_offers_asynchronously_when_enabled(store_config):
     assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
 
 
-def test_scheduler_rejects_async_load_under_tensor_parallelism(store_config):
+def test_scheduler_sends_async_loads_through_metadata_under_tensor_parallelism(store_config):
+    """Under TP the offer reaches every rank in the broadcast metadata, not rank 0's worker."""
     enable_async_load(store_config)
     llm_args = make_llm_args()
     llm_args.tensor_parallel_size = 2
-    with pytest.raises(NotImplementedError, match="attention DP"):
-        MooncakeStoreConnectorScheduler(llm_args)
+    scheduler = MooncakeStoreConnectorScheduler(llm_args)
+    scheduler._worker = FakeAsyncWorker(hit_blocks=2)
+    tokens = list(range(5 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (2 * TOKENS_PER_BLOCK, True)
+    request.py_num_connector_matched_tokens = 2 * TOKENS_PER_BLOCK
+
+    scheduler.update_state_after_alloc_by_layer_group(request, [[10, 11, 12, 13, 14]])
+
+    assert scheduler._worker.async_loads == []
+    metadata = scheduler.build_connector_meta(SchedulerOutput())
+    (transfers,) = metadata.async_loads
+    assert transfers.request_id == 1
+    assert [page.page_index for page in transfers.pages] == [10, 11]
+    assert metadata.loads == [] and metadata.saves == []
+    # Sent once only.
+    assert scheduler.build_connector_meta(SchedulerOutput()).async_loads == []
 
 
 def test_scheduler_starts_the_async_load_when_the_pages_are_reported(store_config: Path) -> None:

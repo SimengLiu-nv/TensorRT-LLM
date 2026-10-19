@@ -262,13 +262,13 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # only once its bytes are on the device (or once a page turned out to be
         # missing, in which case the executor restarts it without the offer).
         self._async_load = bool(self._config.async_load) and self._config.role.loads
-        if self._async_load and not self._recover_failed_loads:
-            raise NotImplementedError(
-                "mooncake_store.async_load needs attention DP or a single rank: "
-                "a parked request is loaded and reported by the rank that owns its "
-                "pages, and under tensor parallelism the ranks hold shards of the "
-                "same page and would have to agree on completion and on restarts."
-            )
+        # Under tensor parallelism every rank loads its own shard of a parked
+        # request, started from the broadcast metadata (`bind_connector_meta`).
+        # The runtime resumes the request only once every rank has reported it
+        # (`KvCacheConnectorManager.get_finished` intersects across ranks). The
+        # ranks cannot agree on restarting it, so a failed load is fatal there,
+        # exactly as a failed synchronous load already is.
+        self._async_via_metadata = self._async_load and not self._recover_failed_loads
         # One shared FIFO: an idle worker thread takes the next request, so a
         # request is handled by exactly one worker and starts in arrival order.
         self._load_queue: "Queue[Optional[Tuple[int, RequestTransfers, float, Optional[torch.cuda.Event]]]]" = Queue()
@@ -643,6 +643,25 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
     # ---- asynchronous load path ----
 
+    def bind_connector_meta(self, metadata: object) -> None:
+        """Bind this iteration's work; under TP, also start this rank's async loads."""
+        super().bind_connector_meta(metadata)
+        async_loads = getattr(metadata, "async_loads", None)
+        if not async_loads:
+            return
+        if not self._async_via_metadata:
+            raise RuntimeError(
+                "mooncake-store received asynchronous loads in the metadata, which only "
+                "tensor parallelism uses"
+            )
+        if torch.cuda.is_available():
+            # Only rank 0 saw the allocation callback that reserved these pages,
+            # so no event orders their page-reuse waits and copies on the other
+            # ranks. Retire all device work before any load writes them.
+            torch.cuda.synchronize()
+        for transfers in async_loads:
+            self.start_async_load(transfers.request_id, transfers)
+
     def start_async_load(self, request_id: int, transfers: RequestTransfers) -> None:
         """Queue a parked request's offered pages for the load workers.
 
@@ -884,6 +903,12 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             for request_id in list(self._async_announced):
                 if request_id in self._async_done:
                     failed = self._async_done.pop(request_id)
+                    if failed and self._async_via_metadata:
+                        raise RuntimeError(
+                            f"mooncake-store rank {self._rank}: the asynchronous load of request "
+                            f"{request_id} failed under tensor parallelism, where the ranks "
+                            "cannot agree on restarting it"
+                        )
                 elif request_id in self._async_pending:
                     continue
                 else:

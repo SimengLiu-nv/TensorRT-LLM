@@ -94,15 +94,15 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         # Asynchronous offers park the request and are loaded by the owner's
         # worker in this process; see `update_state_after_alloc_by_layer_group`.
         self._async_load = bool(self._config.async_load) and self._config.role.loads
-        if self._async_load and not (
+        # Under tensor parallelism this adapter exists on rank 0 only, so a
+        # parked request's pages cannot be handed to the worker in-process: every
+        # rank holds a shard of them. They travel in the broadcast metadata
+        # instead, and each rank's worker starts its own shard's load.
+        self._async_via_metadata = self._async_load and not (
             getattr(llm_args, "enable_attention_dp", False)
             or getattr(llm_args, "tensor_parallel_size", 1) == 1
-        ):
-            raise NotImplementedError(
-                "mooncake_store.async_load needs attention DP or a single rank: the "
-                "scheduler adapter hands each parked request's pages to the worker in "
-                "its own process, which under tensor parallelism only rank 0 has."
-            )
+        )
+        self._pending_async_loads: List[RequestTransfers] = []
 
         logger.info(
             f"mooncake-store scheduler adapter ready (role={self._config.role.value}, "
@@ -267,13 +267,18 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         # second time when it comes back.
         state.async_loaded_upto = load_end
         state.load_blocks = 0
-        self._require_worker().start_async_load(request.request_id, transfers)
+        if self._async_via_metadata:
+            self._pending_async_loads.append(transfers)
+        else:
+            self._require_worker().start_async_load(request.request_id, transfers)
 
     # ---- work lists ----
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> MooncakeStoreMetadata:
         """Turn this iteration's scheduled requests into load and save lists."""
         metadata = MooncakeStoreMetadata()
+        # Offers parked during this scheduling pass; see `update_state_after_alloc_by_layer_group`.
+        metadata.async_loads, self._pending_async_loads = self._pending_async_loads, []
         for request_data in (*scheduler_output.new_requests, *scheduler_output.cached_requests):
             state = self._requests.get(request_data.request_id)
             if state is None:
