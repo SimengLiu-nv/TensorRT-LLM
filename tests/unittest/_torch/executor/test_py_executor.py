@@ -1320,6 +1320,7 @@ class _StubADPExecutor:
         self.max_total_draft_tokens = 0
         self.max_num_tokens = max_num_tokens
         self._adp_dummy_is_gen = True
+        self._adp_ctx_dummy_tokens = 0
         self._pending_adp_dummy_request = None
         self._enable_dsv4_adp_dummy_fixes = enable_dsv4_adp_dummy_fixes
         self.add_dummy_calls = []
