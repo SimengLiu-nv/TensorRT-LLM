@@ -221,6 +221,32 @@ def test_bind_kv_cache_managers_binds_target_and_draft(draft):
     assert executor.draft_kv_cache_manager is draft_manager
 
 
+@pytest.mark.parametrize("override, expected", [(0, 8192), (512, 512)], ids=["default", "override"])
+def test_adp_context_pad_dummy_size(override, expected):
+    """A context-role pad dummy is max_num_tokens unless TRTLLM_ADP_CTX_DUMMY_TOKENS says otherwise."""
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.enable_attention_dp = True
+    executor.expected_num_active_requests = 1
+    executor.active_requests = []
+    executor._count_schedulable_active_requests = lambda: 0
+    executor._should_skip_dummy_for_benchmark_disagg = lambda _num: False
+    executor._adp_dummy_is_gen = False
+    executor._adp_ctx_dummy_tokens = override
+    executor.kv_cache_transceiver = Mock()
+    executor.max_num_tokens = 8192
+    executor.max_total_draft_tokens = 0
+    executor._enable_dsv4_adp_dummy_fixes = False
+    executor.kv_cache_manager = Mock()
+    executor.kv_cache_manager.add_dummy_requests.return_value = [Mock()]
+    executor.resource_manager = Mock()
+    executor.resource_manager.get_resource_manager.return_value = None
+
+    executor._pad_attention_dp_dummy_request()
+
+    assert executor.kv_cache_manager.add_dummy_requests.call_args.kwargs["token_nums"] == [expected]
+    assert len(executor.active_requests) == 1
+
+
 def test_get_kv_cache_capacity_without_manager():
     executor = _make_executor_with_kv_cache_manager(None)
 

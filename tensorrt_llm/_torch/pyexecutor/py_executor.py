@@ -715,6 +715,12 @@ class PyExecutor:
         # ADP dummy role for _pad_attention_dp_dummy_request. Default is gen;
         # updated from observed request types.
         self._adp_dummy_is_gen: bool = True
+        # Token count of a context-role ADP pad dummy. Defaults to
+        # max_num_tokens, which keeps MoE all-to-all token counts comparable
+        # across ranks. Under MoE tensor parallelism every rank computes every
+        # gathered token, so a large dummy only adds work; a small one helps.
+        self._adp_ctx_dummy_tokens: int = int(
+            os.environ.get("TRTLLM_ADP_CTX_DUMMY_TOKENS", "0"))
         # Dummy allocated by the current scheduling iteration. It is committed
         # to the normal forward/termination lifecycle only after every ADP rank
         # can queue; otherwise only this exact allocation is rolled back.
@@ -6193,7 +6199,7 @@ class PyExecutor:
         token_nums = None
         if (not self._adp_dummy_is_gen and self.kv_cache_transceiver is not None
                 and self.max_num_tokens is not None):
-            token_nums = [self.max_num_tokens]
+            token_nums = [self._adp_ctx_dummy_tokens or self.max_num_tokens]
 
         if (not self._enable_dsv4_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
