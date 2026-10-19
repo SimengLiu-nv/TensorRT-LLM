@@ -1490,7 +1490,8 @@ def test_worker_async_load_failure_is_fatal_under_tensor_parallelism(
     with make_worker(fake_store, layout=make_layout()) as worker:
         worker.start_async_load(4, RequestTransfers(4, [PageTransfer(b"\x08" * 16, 0, 1)]))
         wait_async_idle(worker)
-        with pytest.raises(RuntimeError, match="cannot agree on restarting"):
+        # The load thread records the failure and the next executor call re-raises it.
+        with pytest.raises(RuntimeError, match="background load failed|cannot agree on restarting"):
             worker.get_finished([], [4])
 
 
