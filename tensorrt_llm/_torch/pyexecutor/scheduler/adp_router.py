@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import os
 import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
@@ -161,6 +162,9 @@ class ADPRouter(ABC):
                 async_transfer_manager=async_transfer_manager,
                 account_for_in_transfer=attention_dp_config.kv_cache_routing_account_for_in_transfer,
             )
+
+        if os.environ.get("TRTLLM_ADP_WORK_AWARE_ROUTING", "0") == "1":
+            return WorkAwareADPRouter(dist=dist, has_seq_slot_headroom=has_seq_slot_headroom)
 
         return DefaultADPRouter(dist=dist, has_seq_slot_headroom=has_seq_slot_headroom)
 
@@ -988,3 +992,122 @@ class ConversationAwareADPRouter(ADPRouter):
         )
 
         return all_ranks_new_requests, expected_num_active_requests
+
+
+class WorkAwareADPRouter(DefaultADPRouter):
+    """Balances attention-DP ranks by estimated prefill work, not prompt length.
+
+    With prefix reuse (and especially a shared KV store), most of a prompt is
+    restored rather than computed, so prompt length says little about the work a
+    request brings: two prompts of the same length can differ by 50x in the
+    tokens they actually prefill. The default router balances by prompt length,
+    which leaves one rank working through a large uncached prefill while the
+    others run padding iterations in lockstep.
+
+    The estimate for a request is how much its prompt grew since the previous
+    request of the same conversation (the earlier prompt is the reusable part);
+    a request with no known predecessor counts its whole prompt. A rank's load
+    is the summed estimate of its requests still in the context phase, and each
+    new request goes to the least-loaded rank with room for it.
+
+    Every rank routes the same new requests in the same order, so the
+    conversation and per-request bookkeeping stay identical across ranks.
+    """
+
+    DEFAULT_MAX_ENTRIES = 1 << 16
+
+    def __init__(
+        self,
+        dist: "Distributed",
+        has_seq_slot_headroom: bool = False,
+        max_entries: int = DEFAULT_MAX_ENTRIES,
+    ):
+        super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
+        self._max_entries = max(1, int(max_entries))
+        # conversation_id -> prompt length of its latest request.
+        self._conv_prompt_len: "OrderedDict[str, int]" = OrderedDict()
+        # request id -> estimated prefill tokens.
+        self._estimated_work: "OrderedDict[int, int]" = OrderedDict()
+        logger.info("Attention DP routing: work-aware (estimated uncached prefill tokens)")
+
+    @staticmethod
+    def _conversation_id(req_item) -> "str | None":
+        params = getattr(req_item.request, "py_conversation_params", None)
+        return None if params is None else params.conversation_id
+
+    @staticmethod
+    def _bounded_put(table: "OrderedDict", key, value, cap: int) -> None:
+        table[key] = value
+        table.move_to_end(key)
+        while len(table) > cap:
+            table.popitem(last=False)
+
+    def estimate_work(self, req_item) -> int:
+        """Estimated prefill tokens of a new request (records it for later requests)."""
+        prompt_len = _num_input_tokens(req_item.request)
+        conv_id = self._conversation_id(req_item)
+        work = prompt_len
+        if conv_id is not None:
+            previous = self._conv_prompt_len.get(conv_id)
+            if previous is not None and prompt_len >= previous:
+                work = prompt_len - previous
+            self._bounded_put(self._conv_prompt_len, conv_id, prompt_len, self._max_entries)
+        work = max(1, work)
+        self._bounded_put(self._estimated_work, req_item.id, work, self._max_entries)
+        return work
+
+    def create_rank_state(
+        self,
+        active_requests: list[LlmRequest],
+        new_requests: list[RequestQueueItem],
+    ) -> RankState:
+        load = 0
+        for req in active_requests:
+            if not getattr(req, "is_context_init_state", True):
+                continue
+            load += self._estimated_work.get(req.py_request_id, req.py_orig_prompt_len)
+        return RankState(
+            rank=self.dist.tp_rank,
+            num_active_requests=len(active_requests),
+            num_active_tokens=load,
+        )
+
+    def route_requests(
+        self,
+        all_rank_states: list[RankState],
+        new_requests: list[RequestQueueItem],
+        max_num_active_requests: int,
+    ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
+        tp_size = len(all_rank_states)
+        all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
+            s.rank: [] for s in all_rank_states
+        }
+        counts = [s.num_active_requests for s in all_rank_states]
+        loads = [s.num_active_tokens for s in all_rank_states]
+
+        def get_relax_value(req_item):
+            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+            if scheduling_params is None or scheduling_params.attention_dp_rank is None:
+                return True
+            val = scheduling_params.attention_dp_relax
+            return True if val is None else val
+
+        remaining = self._assign_explicit_dp_ranks(
+            sorted(new_requests, key=get_relax_value),
+            all_ranks_new_requests,
+            counts,
+            max_num_active_requests,
+        )
+        estimated = [(self.estimate_work(item), item) for item in remaining]
+        # Largest first, so the big prefills spread before the small ones fill in.
+        estimated.sort(key=lambda pair: pair[0], reverse=True)
+        for work, item in estimated:
+            candidates = [r for r in range(tp_size) if counts[r] < max_num_active_requests]
+            if not candidates:
+                candidates = list(range(tp_size))
+            rank = min(candidates, key=lambda r: (loads[r], counts[r], r))
+            all_ranks_new_requests[rank].append(item)
+            loads[rank] += work
+            counts[rank] += 1
+        # The padding invariant needs the expectation to cover every rank's count.
+        return all_ranks_new_requests, max(counts) if counts else 0
