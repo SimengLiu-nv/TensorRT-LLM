@@ -28,6 +28,7 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponse,
     CompletionRequest,
     CompletionResponse,
+    DisaggregatedParams,
     UCompletionRequest,
     UCompletionResponse,
 )
@@ -56,6 +57,35 @@ if _MSGSPEC_ENABLED:
             "(listed in requirements.txt)."
         ) from exc
     _msgpack_encoder = msgspec.msgpack.Encoder()
+
+# Wire compat with a generation server from a newer build (e.g. 1.4.0rc1): its
+# non-streaming responses carry disaggregated_params fields this build does not
+# define, which DisaggregatedParams rejects (extra="forbid"). With either flag
+# set, those keys are dropped from generation responses before validation.
+# Streaming chunks are relayed to the client unparsed and need no change.
+_GEN_RESPONSE_COMPAT = (
+    os.getenv("TRTLLM_DISAGG_GEN_COMPAT", "0") == "1"
+    or os.getenv("TRTLLM_DISAGG_GEN_DROP_CONVERSATION_ID", "0") == "1"
+)
+
+
+def _drop_unknown_disaggregated_params(response: Dict[str, Any]) -> None:
+    """Remove disaggregated_params keys that DisaggregatedParams does not define.
+
+    Args:
+        response: A decoded completion or chat completion response, edited in
+            place.
+    """
+    known_fields = DisaggregatedParams.model_fields
+    for choice in response.get("choices") or ():
+        params = choice.get("disaggregated_params") if isinstance(choice, dict) else None
+        if not isinstance(params, dict):
+            continue
+        unknown_keys = [key for key in params if key not in known_fields]
+        for key in unknown_keys:
+            del params[key]
+        if unknown_keys:
+            logger.debug(f"Dropped generation-response disaggregated_params keys {unknown_keys}")
 
 
 class OpenAIClient(ABC):
@@ -180,6 +210,8 @@ class OpenAIHttpClient(OpenAIClient):
                 # consume the generator to get the response and return it directly when it's not streaming
                 response = None
                 async for resp_json in resp_generator:
+                    if _GEN_RESPONSE_COMPAT and self._role == ServerRole.GENERATION:
+                        _drop_unknown_disaggregated_params(resp_json)
                     response = response_type(**resp_json)
                     if hooks:
                         if self._role == ServerRole.CONTEXT:

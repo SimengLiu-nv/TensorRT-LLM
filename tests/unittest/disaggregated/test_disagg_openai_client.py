@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -566,3 +566,76 @@ class TestSelectiveTransientTcpRetry:
 
         # 1 original + 5 retries
         assert session.post.call_count == 6
+
+
+class TestGenerationResponseCompat:
+    """A newer generation server's extra disaggregated_params keys."""
+
+    # Fields a 1.4.0rc1 generation server returns that this build lacks.
+    NEWER_KEYS = ("remote_tail_start", "multimodal_positions", "multimodal_lengths")
+
+    def _response_body(self):
+        body = CompletionResponse(
+            id="gen-1",
+            object="text_completion",
+            created=1234567890,
+            model="test-model",
+            usage=UsageInfo(prompt_tokens=10, completion_tokens=1),
+            choices=[
+                CompletionResponseChoice(
+                    index=0,
+                    text="Hello!",
+                    disaggregated_params=DisaggregatedParams(
+                        request_type="generation_only", ctx_request_id=7
+                    ),
+                )
+            ],
+        ).model_dump()
+        for key in self.NEWER_KEYS:
+            body["choices"][0]["disaggregated_params"][key] = None
+        return body
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "role, compat, accepted",
+        [
+            (ServerRole.GENERATION, True, True),
+            (ServerRole.GENERATION, False, False),
+            (ServerRole.CONTEXT, True, False),
+        ],
+        ids=["gen_compat", "gen_strict", "ctx_strict"],
+    )
+    async def test_unknown_disaggregated_params_keys(
+        self, role, compat, accepted, completion_request, monkeypatch
+    ):
+        import pydantic
+        from prometheus_client.registry import REGISTRY
+
+        import tensorrt_llm.serve.openai_client as openai_client_module
+
+        monkeypatch.setattr(openai_client_module, "_GEN_RESPONSE_COMPAT", compat)
+        REGISTRY._names_to_collectors = {}
+        REGISTRY._collector_to_names = {}
+        router = AsyncMock(spec=Router)
+        router.servers = ["localhost:8000"]
+        router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
+        router.finish_request = AsyncMock()
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {"Content-Type": "application/json"}
+        http_response.json = AsyncMock(return_value=self._response_body())
+        http_response.__aenter__ = AsyncMock(return_value=http_response)
+        http_response.__aexit__ = AsyncMock()
+        session.post.return_value = http_response
+        client = OpenAIHttpClient(
+            router=router, role=role, timeout_secs=10, max_retries=0, session=session
+        )
+
+        if accepted:
+            response = await client.send_request(completion_request)
+            assert response.choices[0].disaggregated_params.ctx_request_id == 7
+            assert response.choices[0].text == "Hello!"
+        else:
+            with pytest.raises(pydantic.ValidationError, match="extra_forbidden"):
+                await client.send_request(completion_request)
