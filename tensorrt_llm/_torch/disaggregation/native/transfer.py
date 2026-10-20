@@ -124,12 +124,38 @@ class RecvReqInfo:
     def from_bytes(cls, data: bytes) -> "RecvReqInfo":
         d = msgpack.unpackb(data, raw=False)
         d["block_ids_per_layer_groups"] = [
-            np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
+            _positional_to_suffix(np.frombuffer(b, dtype=np.int64).copy())
+            for b in d["block_ids_per_layer_groups"]
         ]
         # Drop keys this build does not know: a newer peer's extra field must not raise here and
         # hang the transfer.
         known = cls.__dataclass_fields__
         return cls(**{k: v for k, v in d.items() if k in known})
+
+
+def _positional_to_suffix(block_ids: np.ndarray) -> np.ndarray:
+    """Accept a newer (1.4) receiver's positional table on this suffix-list sender.
+
+    A 1.4 receiver sends ceil(prompt_len / tpb) entries per paged group with -1 where it accepts
+    nothing (its cached prefix). This sender reads the list as the suffix of the block range, so a
+    leading run of -1 is equivalent to dropping those entries. Any other -1 (interior or tail)
+    has no suffix form; refuse it instead of writing to a wrong slot.
+    """
+    holes = block_ids < 0
+    if not holes.any():
+        return block_ids
+    first_valid = int(np.argmax(~holes)) if (~holes).any() else block_ids.size
+    if holes[first_valid:].any():
+        raise ValueError(
+            "RecvReqInfo: receiver block table has non-leading -1 holes "
+            f"({int(holes.sum())} of {block_ids.size}); not representable for this sender"
+        )
+    logger.warning_once(
+        "[wire-compat] receiver sent a positional block table with a cached-prefix hole; "
+        "translated to the suffix form",
+        key="wire-compat-positional-holes",
+    )
+    return block_ids[first_valid:]
 
 
 @dataclass

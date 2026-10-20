@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from dataclasses import asdict, dataclass
 from typing import List, Optional
 
@@ -24,6 +25,27 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_
 from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
+
+# Wire-compat smoke aid: when set, every RankInfo this rank serves (to_bytes) or receives
+# (from_bytes) is written once to this directory, for offline layout comparison.
+_DUMP_DIR = os.environ.get("TRTLLM_WC_RANKINFO_DUMP_DIR")
+_DUMPED: set = set()
+
+
+def _dump_rank_info(direction: str, data: bytes, name: str, rank: int) -> None:
+    if not _DUMP_DIR:
+        return
+    key = (direction, name, rank)
+    if key in _DUMPED:
+        return
+    _DUMPED.add(key)
+    try:
+        os.makedirs(_DUMP_DIR, exist_ok=True)
+        path = os.path.join(_DUMP_DIR, f"rankinfo_{direction}_{name}_{rank}_pid{os.getpid()}.msgpack")
+        with open(path, "wb") as f:
+            f.write(data)
+    except OSError:
+        pass
 
 
 @dataclass
@@ -58,10 +80,21 @@ class RankInfo:
 
     def to_bytes(self) -> bytes:
         data = asdict(self)
+        # This endpoint is unused by the attention transfer implementation.
+        if data.pop("server_endpoint"):
+            raise ValueError("Cannot translate a nonempty legacy server endpoint")
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
-        return msgpack.packb(data)
+        if data["page_table"] is not None:
+            for group in data["page_table"]["layer_groups"]:
+                # PAGED=0 is the newer peer's explicit attention-cache kind.
+                if group.get("kv_head_num_per_rank") is None:
+                    raise ValueError("CTX wire adapter supports attention groups only")
+                group["kind"] = 0
+        packed = msgpack.packb(data)
+        _dump_rank_info("served", packed, self.instance_name, self.instance_rank)
+        return packed
 
     @classmethod
     def from_kv_cache_manager(
@@ -119,6 +152,13 @@ class RankInfo:
     @classmethod
     def from_bytes(cls, data: bytes) -> "RankInfo":
         unpacked = msgpack.unpackb(data, strict_map_key=False)
+        _dump_rank_info(
+            "received", data, str(unpacked.get("instance_name")), int(unpacked.get("instance_rank", -1))
+        )
+        unpacked.setdefault("server_endpoint", "")
+        # r7: main3018-era GEN peers send bounded_replay_on_generation; this CTX cannot honour True.
+        if unpacked.pop("bounded_replay_on_generation", False):
+            raise ValueError("CTX wire adapter: peer requires bounded_replay_on_generation")
         if unpacked.get("attention") is not None:
             unpacked["attention"] = AttentionInfo.from_dict(unpacked["attention"])
         if unpacked.get("page_table") is not None:

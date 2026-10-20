@@ -41,6 +41,12 @@ from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareR
 # the CTX request already completed and the disagg KV-cache handoff was never set up.
 _GEN_PENDING_FINISH_REASONS = ("length", "not_finished")
 
+# Wire compat with a generation server from a newer build (e.g. 1.4.0rc1): its
+# DisaggregatedParams forbids extra fields and has no conversation_id, so a
+# generation request carrying the key (even as null) is rejected with HTTP 400.
+# Context requests keep it; the per_conversation reuse policy reads it there.
+_GEN_DROP_CONVERSATION_ID = os.getenv("TRTLLM_DISAGG_GEN_DROP_CONVERSATION_ID", "0") == "1"
+
 
 class OpenAIDisaggregatedService(OpenAIService):
     def __init__(
@@ -276,6 +282,11 @@ class OpenAIDisaggregatedService(OpenAIService):
                 )
 
         request.disaggregated_params.disagg_request_id = disagg_request_id
+        if _GEN_DROP_CONVERSATION_ID:
+            params = request.disaggregated_params
+            params.conversation_id = None
+            # Serialization uses exclude_unset, so an unset field is omitted from the body.
+            params.__pydantic_fields_set__.discard("conversation_id")
         return request
 
     async def _check_conditional_disagg(self, request: UCompletionRequest, req_id: int) -> bool:
