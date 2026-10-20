@@ -610,6 +610,84 @@ def test_worker_prefix_hit_stops_at_the_first_gap(store_config, fake_store):
         assert worker.count_prefix_hit(hashes) == 1
 
 
+def _store_blocks(fake_store, worker, hashes, blocks):
+    for block in blocks:
+        fake_store.objects.add(worker._namespaces[0].key(hashes[block]))
+
+
+def test_worker_counts_a_single_block_hole(store_config, fake_store, monkeypatch):
+    monkeypatch.setenv(worker_module.HOLE_STATS_ENV, "1")
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        hashes = [bytes([index]) * 16 for index in range(5)]
+        # Block 2 was evicted from the middle of a chain the pool still holds.
+        _store_blocks(fake_store, worker, hashes, [0, 1, 3, 4])
+
+        # The hit is unchanged: it stops at the hole's index.
+        assert worker.count_prefix_hit(hashes) == 2
+
+        stats = worker._hole_stats
+        assert (stats.lookups, stats.lookup_blocks, stats.hit_blocks) == (1, 5, 2)
+        assert (stats.holes, stats.hole_blocks) == (1, 1)
+        assert stats.holed_tokens == 2 * TOKENS_PER_BLOCK
+        assert stats.max_holed_tokens == 2 * TOKENS_PER_BLOCK
+        # No extra store traffic: holes come from the one existence probe.
+        assert len(fake_store.exist_calls) == 1
+
+        # Not due yet, so nothing is logged and nothing is reset.
+        assert worker._maybe_log_hole_stats() is None
+        line = worker._maybe_log_hole_stats(force=True)
+        assert line is not None
+        assert "holes=1" in line
+        assert f"holed_tokens={2 * TOKENS_PER_BLOCK}" in line
+        assert stats.lookups == 0
+
+
+def test_worker_hole_stats_ignore_a_clean_prefix(store_config, fake_store, monkeypatch):
+    monkeypatch.setenv(worker_module.HOLE_STATS_ENV, "1")
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        hashes = [bytes([index]) * 16 for index in range(4)]
+        _store_blocks(fake_store, worker, hashes, [0, 1])
+
+        assert worker.count_prefix_hit(hashes) == 2
+        assert worker._hole_stats.lookups == 1
+        assert worker._hole_stats.holes == 0
+        assert worker._hole_stats.holed_tokens == 0
+
+
+def test_worker_hole_stats_log_once_per_interval(store_config, fake_store, monkeypatch):
+    monkeypatch.setenv(worker_module.HOLE_STATS_ENV, "1")
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        hashes = [bytes([index]) * 16 for index in range(3)]
+        _store_blocks(fake_store, worker, hashes, [0, 2])
+        lines = []
+        monkeypatch.setattr(worker_module.logger, "info", lines.append)
+
+        worker.count_prefix_hit(hashes)
+        assert lines == []
+        worker._hole_stats_last -= worker._hole_stats_interval
+        worker.count_prefix_hit(hashes)
+        assert len(lines) == 1
+        assert "lookups=2" in lines[0] and "holes=2" in lines[0]
+
+        # Shutdown flushes what accumulated since the last line.
+        worker.count_prefix_hit(hashes)
+        worker.shutdown()
+        assert len(lines) == 2
+        assert "lookups=1" in lines[1]
+
+
+def test_worker_hole_stats_off_by_default(store_config, fake_store, monkeypatch):
+    monkeypatch.delenv(worker_module.HOLE_STATS_ENV, raising=False)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        hashes = [bytes([index]) * 16 for index in range(5)]
+        _store_blocks(fake_store, worker, hashes, [0, 1, 3, 4])
+
+        assert worker.count_prefix_hit(hashes) == 2
+        assert worker._hole_stats is None
+        assert worker._maybe_log_hole_stats(force=True) is None
+        assert len(fake_store.exist_calls) == 1
+
+
 def test_worker_load_reports_the_request_when_a_page_is_missing(store_config, fake_store):
     """A single-rank worker hands a request whose page is gone back to the executor."""
     with make_worker(fake_store, layout=make_layout()) as worker:
