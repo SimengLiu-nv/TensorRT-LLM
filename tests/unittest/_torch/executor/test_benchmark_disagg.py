@@ -509,6 +509,7 @@ class MockPadDummyExecutor:
         self.benchmark_req_queues_size = benchmark_req_queues_size
         self.max_total_draft_tokens = 0
         self._adp_dummy_is_gen = True
+        self._adp_ctx_dummy_tokens = 0
         self._pending_adp_dummy_request = None
         self._enable_dsv4_adp_dummy_fixes = True
         self.max_num_tokens = None
@@ -530,6 +531,7 @@ class MockPadDummyExecutor:
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     _pad_attention_dp_dummy_request = PyExecutor._pad_attention_dp_dummy_request
+    _adp_ctx_dummy_token_nums = PyExecutor._adp_ctx_dummy_token_nums
     _count_schedulable_active_requests = PyExecutor._count_schedulable_active_requests
     _has_adp_dummy_kv_capacity = PyExecutor._has_adp_dummy_kv_capacity
     _should_skip_dummy_for_benchmark_disagg = PyExecutor._should_skip_dummy_for_benchmark_disagg

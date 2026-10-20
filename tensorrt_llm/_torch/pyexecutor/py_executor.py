@@ -75,9 +75,9 @@ from .kv_cache_stats import append_kv_cache_iteration_stats
 from .kv_cache_transceiver import (KvCacheTransceiver,
                                    is_disagg_inflight_cancel_enabled)
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
-                          MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
-                          LlmRequest, LlmRequestState, LlmResponse,
-                          get_draft_token_length)
+                          MAX_SPEC_DECODE_POSITIONS, REQUEST_TYPE_MAPPING,
+                          ExecutorRequest, LlmRequest, LlmRequestState,
+                          LlmResponse, get_draft_token_length)
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
@@ -249,6 +249,31 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
     if not mm_data:
         return
     strip_mm_data_for_generation(mm_data)
+
+
+def _get_candidate_request_type(
+        candidate: Union[LlmRequest,
+                         RequestQueueItem]) -> Optional[LlmRequestType]:
+    """Return the request type of a routed attention-DP candidate.
+
+    `_fetch_new_requests` routes `RequestQueueItem`s, which carry the type on
+    the wrapped executor request as an executor `RequestType`. An `LlmRequest`
+    carries it directly.
+
+    Args:
+        candidate: A routed queue item or an `LlmRequest`.
+
+    Returns:
+        The `LlmRequestType`, or None when the candidate carries none.
+    """
+    request_type = getattr(candidate, "llm_request_type", None)
+    if request_type is not None:
+        return request_type
+    executor_request = getattr(candidate, "request", None)
+    executor_request_type = getattr(executor_request, "request_type", None)
+    if executor_request_type is None:
+        return None
+    return REQUEST_TYPE_MAPPING.get(executor_request_type)
 
 
 @dataclasses.dataclass
@@ -715,9 +740,11 @@ class PyExecutor:
         # ADP dummy role for _pad_attention_dp_dummy_request. Default is gen;
         # updated from observed request types.
         self._adp_dummy_is_gen: bool = True
-        # Token count of a context-role ADP pad dummy. Defaults to
-        # max_num_tokens, which keeps MoE all-to-all token counts comparable
-        # across ranks. Under MoE tensor parallelism every rank computes every
+        # Token count of a context-role ADP pad dummy. 0 (the default) keeps
+        # generation dummies on every role. A positive value pads idle ranks of
+        # a context server with a context dummy of that many tokens (capped at
+        # max_num_tokens), which runs the compiled context path instead of the
+        # eager model. Under MoE tensor parallelism every rank computes every
         # gathered token, so a large dummy only adds work; a small one helps.
         self._adp_ctx_dummy_tokens: int = int(
             os.environ.get("TRTLLM_ADP_CTX_DUMMY_TOKENS", "0"))
@@ -5611,10 +5638,14 @@ class PyExecutor:
         starved -- silently, since nothing on that path raises or times out.
 
         Padding is rank-local because `_schedule()` allgathers inside
-        `_balance_adp_requests`. A generation dummy is used rather than the
-        context dummy the pre-schedule path would pick, since this rank is empty
-        precisely because it is short of KV cache. Not reached under pipeline
-        parallelism, which does not call `_prepare_and_schedule_batch`.
+        `_balance_adp_requests`. A generation dummy is used by default, since
+        this rank may be empty because it is short of KV cache. When
+        `_adp_ctx_dummy_token_nums` selects a small context dummy and the cache
+        can hold it, that dummy is used instead: a batch emptied by an
+        asynchronous connector restore is not short of KV cache, and a context
+        dummy keeps this rank on the compiled context path. Not reached under
+        pipeline parallelism, which does not call
+        `_prepare_and_schedule_batch`.
         """
         if not self.enable_attention_dp:
             return
@@ -5637,7 +5668,12 @@ class PyExecutor:
         if any(request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
                for request in self.active_requests):
             return
-        if not self._has_adp_dummy_kv_capacity(None):
+        token_nums = self._adp_ctx_dummy_token_nums()
+        if token_nums is not None and not self._has_adp_dummy_kv_capacity(
+                token_nums):
+            token_nums = None
+        is_gen = token_nums is None
+        if is_gen and not self._has_adp_dummy_kv_capacity(None):
             logger.warning_once(
                 "attention-DP rank scheduled an empty batch and cannot afford "
                 "even a padding dummy; the forward pass is vetoed fleet-wide "
@@ -5652,8 +5688,8 @@ class PyExecutor:
             # peers in the collectives that follow.
             dummy_requests = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
-                token_nums=None,
-                is_gen=True,
+                token_nums=token_nums,
+                is_gen=is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
             )
@@ -5677,10 +5713,17 @@ class PyExecutor:
                 return
 
         dummy_request.is_attention_dp_dummy = True
-        # Never grown by the V2 scheduler, so `_revert_gen_alloc` must skip it.
-        dummy_request.py_skip_gen_alloc_revert = True
         self.active_requests.append(dummy_request)
-        scheduled_batch.generation_requests.append(dummy_request)
+        if is_gen:
+            # Never grown by the V2 scheduler, so `_revert_gen_alloc` must skip
+            # it.
+            dummy_request.py_skip_gen_alloc_revert = True
+            scheduled_batch.generation_requests.append(dummy_request)
+        else:
+            # The whole prompt is one chunk (the chunk size defaults to the
+            # prompt length), the same shape as the piecewise-capture warmup
+            # requests. `_revert_gen_alloc` only walks generation requests.
+            scheduled_batch.append_context_request(dummy_request)
         # Let `_finalize_adp_dummy_allocation` roll this back if the fleet still
         # cannot queue: no forward runs then, so the usual dummy teardown in
         # `_handle_responses` is not reached this iteration.
@@ -6120,8 +6163,10 @@ class PyExecutor:
         has_cp_helix = getattr(mapping, "has_cp_helix", None)
         if callable(has_cp_helix) and has_cp_helix():
             token_num = max(token_num, 2)
+        # Only a generation dummy reserves draft tokens, so follow the dummy
+        # actually requested rather than the role.
         draft_reserve = (self.max_total_draft_tokens
-                         if self._adp_dummy_is_gen else 0)
+                         if token_nums is None else 0)
         available_tokens = self.kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num, max_num_draft_tokens=draft_reserve)
         return available_tokens >= token_num
@@ -6157,24 +6202,46 @@ class PyExecutor:
                     f"num_schedulable_requests={num_schedulable_requests}")
         return True
 
-    def _update_adp_dummy_role(self, candidates: List[LlmRequest]) -> None:
+    def _update_adp_dummy_role(
+            self, candidates: List[Union[LlmRequest,
+                                         RequestQueueItem]]) -> None:
         if not self.enable_attention_dp or self.kv_cache_transceiver is None:
             return
         has_ctx = False
         has_gen = False
         for req in candidates:
-            rt = getattr(req, "llm_request_type", None)
+            rt = _get_candidate_request_type(req)
             if rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
                 has_ctx = True
             elif rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
                 has_gen = True
-        # Prefer the CTX role when both types are present this iteration: a CTX
-        # dummy is padded to max_num_tokens so idle ranks keep MoE all-to-all
-        # token counts comparable with ranks doing real context work.
+        # Prefer the CTX role when both types are present this iteration. The
+        # role only selects a context dummy when TRTLLM_ADP_CTX_DUMMY_TOKENS is
+        # set; see `_adp_ctx_dummy_token_nums`.
         if has_ctx:
             self._adp_dummy_is_gen = False
         elif has_gen:
             self._adp_dummy_is_gen = True
+
+    def _adp_ctx_dummy_token_nums(self) -> Optional[List[int]]:
+        """Return the token count of a context pad dummy, or None.
+
+        None selects the generation dummy, which is the default on every role.
+        A context dummy is used only on a disaggregated context server with
+        TRTLLM_ADP_CTX_DUMMY_TOKENS > 0. It runs the piecewise-compiled context
+        path padded to the peers' capture size, while a generation dummy on a
+        context server runs the eager model over the same padded tokens.
+
+        Returns:
+            A one-element token-count list for a context dummy, or None.
+        """
+        if (self._adp_dummy_is_gen or self.kv_cache_transceiver is None
+                or self._adp_ctx_dummy_tokens <= 0):
+            return None
+        num_tokens = self._adp_ctx_dummy_tokens
+        if self.max_num_tokens is not None:
+            num_tokens = min(num_tokens, self.max_num_tokens)
+        return [num_tokens]
 
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
@@ -6196,10 +6263,8 @@ class PyExecutor:
             return
 
         dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
-        token_nums = None
-        if (not self._adp_dummy_is_gen and self.kv_cache_transceiver is not None
-                and self.max_num_tokens is not None):
-            token_nums = [self._adp_ctx_dummy_tokens or self.max_num_tokens]
+        token_nums = self._adp_ctx_dummy_token_nums()
+        is_gen = token_nums is None
 
         if (not self._enable_dsv4_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
@@ -6207,7 +6272,7 @@ class PyExecutor:
                 dummy_requests = self.kv_cache_manager.add_dummy_requests(
                     request_ids=dummy_request_ids,
                     token_nums=token_nums,
-                    is_gen=self._adp_dummy_is_gen,
+                    is_gen=is_gen,
                     prepare_resource=True,
                     max_num_draft_tokens=self.max_total_draft_tokens,
                 )
@@ -6244,7 +6309,7 @@ class PyExecutor:
             dummy_requests = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
                 token_nums=token_nums,
-                is_gen=self._adp_dummy_is_gen,
+                is_gen=is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
             )

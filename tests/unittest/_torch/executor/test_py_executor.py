@@ -221,9 +221,13 @@ def test_bind_kv_cache_managers_binds_target_and_draft(draft):
     assert executor.draft_kv_cache_manager is draft_manager
 
 
-@pytest.mark.parametrize("override, expected", [(0, 8192), (512, 512)], ids=["default", "override"])
-def test_adp_context_pad_dummy_size(override, expected):
-    """A context-role pad dummy is max_num_tokens unless TRTLLM_ADP_CTX_DUMMY_TOKENS says otherwise."""
+@pytest.mark.parametrize(
+    "override, expected_token_nums, expected_is_gen",
+    [(0, None, True), (512, [512], False), (16384, [8192], False)],
+    ids=["default", "override", "capped"],
+)
+def test_adp_context_pad_dummy_size(override, expected_token_nums, expected_is_gen):
+    """A context-role pad dummy needs TRTLLM_ADP_CTX_DUMMY_TOKENS and is capped at max_num_tokens."""
     executor = PyExecutor.__new__(PyExecutor)
     executor.enable_attention_dp = True
     executor.expected_num_active_requests = 1
@@ -243,7 +247,9 @@ def test_adp_context_pad_dummy_size(override, expected):
 
     executor._pad_attention_dp_dummy_request()
 
-    assert executor.kv_cache_manager.add_dummy_requests.call_args.kwargs["token_nums"] == [expected]
+    call_kwargs = executor.kv_cache_manager.add_dummy_requests.call_args.kwargs
+    assert call_kwargs["token_nums"] == expected_token_nums
+    assert call_kwargs["is_gen"] is expected_is_gen
     assert len(executor.active_requests) == 1
 
 
@@ -1295,6 +1301,8 @@ def _make_adp_request(
     req.is_attention_dp_dummy = False
     req.llm_request_type = llm_request_type
     req.py_seq_slot = None
+    req.py_skip_gen_alloc_revert = False
+    req.is_last_context_chunk = True
     return req
 
 
@@ -1317,6 +1325,7 @@ class _StubADPExecutor:
         self.num_fetch_requests = 0
         self.active_requests = []
         self.expected_num_active_requests = 1
+        self.max_num_active_requests = 64
         self.max_total_draft_tokens = 0
         self.max_num_tokens = max_num_tokens
         self._adp_dummy_is_gen = True
@@ -1336,7 +1345,9 @@ class _StubADPExecutor:
         def _add_dummy(**kwargs):
             self.add_dummy_calls.append(kwargs)
             req = _make_adp_request(
-                _STATE_GENERATION_IN_PROGRESS,
+                _STATE_GENERATION_IN_PROGRESS
+                if kwargs.get("is_gen")
+                else LlmRequestState.CONTEXT_INIT,
                 request_id=kwargs["request_ids"][0],
                 is_dummy_request=True,
             )
@@ -1349,14 +1360,24 @@ class _StubADPExecutor:
         self.resource_manager.get_resource_manager.return_value = None
 
 
-def _run_pad(stub):
+def _bind_pad_helpers(stub):
     for helper in (
+        "_adp_ctx_dummy_token_nums",
         "_count_schedulable_active_requests",
         "_has_adp_dummy_kv_capacity",
         "_should_skip_dummy_for_benchmark_disagg",
     ):
         setattr(stub, helper, types.MethodType(getattr(PyExecutor, helper), stub))
+
+
+def _run_pad(stub):
+    _bind_pad_helpers(stub)
     PyExecutor._pad_attention_dp_dummy_request(stub)
+
+
+def _run_pad_empty_batch(stub, scheduled_batch):
+    _bind_pad_helpers(stub)
+    PyExecutor._pad_empty_attention_dp_batch(stub, scheduled_batch)
 
 
 def _run_update_role(stub, candidates):
@@ -1407,6 +1428,41 @@ def test_adp_dummy_role_flips_when_request_type_changes():
     )
     _run_update_role(stub, [gen_req])
     assert stub._adp_dummy_is_gen is True
+
+
+def _queue_item(request_type, request_id=1):
+    return RequestQueueItem(request_id, request=types.SimpleNamespace(request_type=request_type))
+
+
+@pytest.mark.parametrize("initial_is_gen", [True, False], ids=["from_gen", "from_ctx"])
+@pytest.mark.parametrize(
+    "request_type_name, expected_is_gen",
+    [
+        ("REQUEST_TYPE_CONTEXT_ONLY", False),
+        ("REQUEST_TYPE_GENERATION_ONLY", True),
+        ("REQUEST_TYPE_CONTEXT_AND_GENERATION", None),
+    ],
+    ids=["context_only", "generation_only", "context_and_generation"],
+)
+def test_pad_dummy_role_from_routed_queue_items(request_type_name, expected_is_gen, initial_is_gen):
+    # `_fetch_new_requests` routes RequestQueueItems, whose type lives on the
+    # wrapped executor request; they carry no `llm_request_type`.
+    from tensorrt_llm.bindings.executor import RequestType
+
+    stub = _StubADPExecutor()
+    stub._adp_dummy_is_gen = initial_is_gen
+    _run_update_role(stub, [_queue_item(getattr(RequestType, request_type_name))])
+
+    expected = initial_is_gen if expected_is_gen is None else expected_is_gen
+    assert stub._adp_dummy_is_gen is expected
+
+
+def test_pad_dummy_role_ignores_queue_items_without_request():
+    stub = _StubADPExecutor()
+    stub._adp_dummy_is_gen = False
+    _run_update_role(stub, [RequestQueueItem(1, request=None)])
+
+    assert stub._adp_dummy_is_gen is False
 
 
 def test_adp_dummy_role_unchanged_for_non_disagg_worker():
@@ -1530,6 +1586,7 @@ def test_legacy_pad_dummy_allocation_failure_skips_padding(failure):
 def test_dsv4_pad_dummy_checks_full_context_capacity():
     stub = _StubADPExecutor(max_num_tokens=4096)
     stub._adp_dummy_is_gen = False
+    stub._adp_ctx_dummy_tokens = 4096
     stub.kv_cache_manager.get_num_available_tokens.return_value = 1024
 
     _run_pad(stub)
@@ -1669,17 +1726,57 @@ def test_pad_dummy_skips_when_active_request_present():
     assert len(stub.active_requests) == 1
 
 
-def test_pad_dummy_ctx_pads_to_max_num_tokens():
-    stub = _StubADPExecutor(max_num_tokens=4096)
-    stub._adp_dummy_is_gen = False
-    stub.expected_num_active_requests = 1
+@pytest.mark.parametrize("enable_dsv4_adp_dummy_fixes", [True, False], ids=["dsv4", "legacy"])
+def test_pad_dummy_ctx_role_without_size_keeps_gen_dummy(enable_dsv4_adp_dummy_fixes):
+    # Without TRTLLM_ADP_CTX_DUMMY_TOKENS a context server keeps generation
+    # dummies; a fixed role must not turn them into max_num_tokens prefills.
+    from tensorrt_llm.bindings.executor import RequestType
+
+    stub = _StubADPExecutor(
+        max_num_tokens=4096, enable_dsv4_adp_dummy_fixes=enable_dsv4_adp_dummy_fixes
+    )
+    _run_update_role(stub, [_queue_item(RequestType.REQUEST_TYPE_CONTEXT_ONLY)])
+    assert stub._adp_dummy_is_gen is False
 
     _run_pad(stub)
 
     assert len(stub.add_dummy_calls) == 1
     call = stub.add_dummy_calls[0]
-    assert call["token_nums"] == [4096]
+    assert call["token_nums"] is None
+    assert call["is_gen"] is True
+
+
+@pytest.mark.parametrize("enable_dsv4_adp_dummy_fixes", [True, False], ids=["dsv4", "legacy"])
+def test_pad_dummy_ctx_role_with_size_adds_ctx_dummy(enable_dsv4_adp_dummy_fixes):
+    from tensorrt_llm.bindings.executor import RequestType
+
+    stub = _StubADPExecutor(
+        max_num_tokens=4096, enable_dsv4_adp_dummy_fixes=enable_dsv4_adp_dummy_fixes
+    )
+    stub._adp_ctx_dummy_tokens = 1
+    _run_update_role(stub, [_queue_item(RequestType.REQUEST_TYPE_CONTEXT_ONLY)])
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    call = stub.add_dummy_calls[0]
+    assert call["token_nums"] == [1]
     assert call["is_gen"] is False
+    assert stub.active_requests[-1].is_attention_dp_dummy is True
+    if enable_dsv4_adp_dummy_fixes:
+        stub.kv_cache_manager.get_num_available_tokens.assert_called_once_with(
+            token_num_upper_bound=1, max_num_draft_tokens=0
+        )
+
+
+def test_pad_dummy_gen_role_ignores_ctx_dummy_size():
+    stub = _StubADPExecutor(max_num_tokens=4096)
+    stub._adp_ctx_dummy_tokens = 1
+
+    _run_pad(stub)
+
+    assert stub.add_dummy_calls[0]["token_nums"] is None
+    assert stub.add_dummy_calls[0]["is_gen"] is True
 
 
 def test_pad_dummy_gen_keeps_default_token_nums():
@@ -1708,18 +1805,136 @@ def test_pad_dummy_ctx_skips_padding_when_max_num_tokens_missing():
 
 def test_pad_dummy_ctx_added_for_disagg_rank_only_awaiting_kv_transfer():
     # Disagg ADP: a rank whose only request is awaiting KV transfer counts as
-    # idle (excluded by _count_schedulable), so a CTX dummy padded to
-    # max_num_tokens is added to keep it in the MoE all-to-all.
+    # idle (excluded by _count_schedulable), so a CTX dummy of the configured
+    # size is added to keep it in the MoE all-to-all.
     stub = _StubADPExecutor(max_num_tokens=4096)
     stub._adp_dummy_is_gen = False
+    stub._adp_ctx_dummy_tokens = 128
     stub.active_requests = [_make_adp_request(_STATE_DISAGG_GENERATION_INIT)]
     stub.expected_num_active_requests = 1
 
     _run_pad(stub)
 
     assert len(stub.add_dummy_calls) == 1
-    assert stub.add_dummy_calls[0]["token_nums"] == [4096]
+    assert stub.add_dummy_calls[0]["token_nums"] == [128]
     assert stub.add_dummy_calls[0]["is_gen"] is False
+
+
+def _make_emptied_rank_stub(*, ctx_dummy_tokens=0, is_gen_role=False):
+    # A rank whose only scheduled request was taken for an asynchronous
+    # connector restore: active but parked, scheduled batch empty.
+    stub = _StubADPExecutor(max_num_tokens=8192)
+    stub._adp_dummy_is_gen = is_gen_role
+    stub._adp_ctx_dummy_tokens = ctx_dummy_tokens
+    stub.active_requests = [_make_adp_request(_STATE_DISAGG_GENERATION_TRANS_IN_PROGRESS)]
+    stub.expected_num_active_requests = 1
+    return stub
+
+
+def test_pad_dummy_empty_batch_without_ctx_size_keeps_gen_dummy():
+    stub = _make_emptied_rank_stub()
+    batch = ScheduledRequests()
+
+    _run_pad_empty_batch(stub, batch)
+
+    call = stub.add_dummy_calls[0]
+    assert call["token_nums"] is None
+    assert call["is_gen"] is True
+    assert batch.context_requests == []
+    assert len(batch.generation_requests) == 1
+    dummy = batch.generation_requests[0]
+    assert dummy.is_attention_dp_dummy is True
+    assert dummy.py_skip_gen_alloc_revert is True
+    assert stub._pending_adp_dummy_request is dummy
+
+
+def test_pad_dummy_empty_batch_with_ctx_size_adds_ctx_dummy():
+    stub = _make_emptied_rank_stub(ctx_dummy_tokens=1)
+    batch = ScheduledRequests()
+
+    _run_pad_empty_batch(stub, batch)
+
+    call = stub.add_dummy_calls[0]
+    assert call["token_nums"] == [1]
+    assert call["is_gen"] is False
+    assert batch.generation_requests == []
+    assert len(batch.context_requests_last_chunk) == 1
+    dummy = batch.context_requests_last_chunk[0]
+    assert dummy.is_attention_dp_dummy is True
+    assert dummy.py_skip_gen_alloc_revert is False
+    assert stub.active_requests[-1] is dummy
+    assert stub._pending_adp_dummy_request is dummy
+
+    # A vetoed iteration reverts generation growth only; the context dummy is
+    # left to `_finalize_adp_dummy_allocation`.
+    stub._is_kv_manager_v2 = True
+    PyExecutor._revert_gen_alloc(stub, batch)
+    stub.kv_cache_manager.revert_allocate_generation.assert_not_called()
+
+
+def test_pad_dummy_empty_batch_gen_role_ignores_ctx_size():
+    stub = _make_emptied_rank_stub(ctx_dummy_tokens=1, is_gen_role=True)
+    batch = ScheduledRequests()
+
+    _run_pad_empty_batch(stub, batch)
+
+    assert stub.add_dummy_calls[0]["is_gen"] is True
+    assert len(batch.generation_requests) == 1
+
+
+def test_pad_dummy_empty_batch_falls_back_to_gen_when_short_of_cache():
+    stub = _make_emptied_rank_stub(ctx_dummy_tokens=128)
+    stub.max_total_draft_tokens = 3
+
+    def _available(*, token_num_upper_bound, max_num_draft_tokens):
+        # Room for a 1+3-token generation dummy, not a 128-token prompt.
+        return 64 if max_num_draft_tokens == 0 else 4
+
+    stub.kv_cache_manager.get_num_available_tokens.side_effect = _available
+    batch = ScheduledRequests()
+
+    _run_pad_empty_batch(stub, batch)
+
+    call = stub.add_dummy_calls[0]
+    assert call["token_nums"] is None
+    assert call["is_gen"] is True
+    assert len(batch.generation_requests) == 1
+    assert batch.context_requests == []
+
+
+def test_ctx_pad_dummy_runs_piecewise_context_graph():
+    # A context dummy makes this rank's local context count non-zero, so the
+    # padded forward replays the piecewise context graph at the peers' bucket
+    # (or the 1-token graph when every rank pads) instead of running eager.
+    from tensorrt_llm._torch.pyexecutor.model_engine import (
+        PyTorchModelEngine,
+        _use_captured_context_model,
+    )
+
+    engine = types.SimpleNamespace(
+        enable_attention_dp=True,
+        _torch_compile_backend=types.SimpleNamespace(
+            capture_num_tokens=[1, 512, 1024, 2048, 4096, 8192]
+        ),
+        _torch_compile_piecewise_cuda_graph=True,
+        dist=Mock(),
+    )
+    engine._get_all_rank_ctx_requests = types.MethodType(
+        PyTorchModelEngine._get_all_rank_ctx_requests, engine
+    )
+
+    engine.dist.tp_allgather.side_effect = [[1, 1], [True, True]]
+    assert PyTorchModelEngine._get_padding_params(engine, 1, 1, [1, 1]) == (1, True, [1, 1])
+
+    engine.dist.tp_allgather.side_effect = [[1, 1], [True, True]]
+    assert PyTorchModelEngine._get_padding_params(engine, 1, 1, [1, 3000]) == (
+        4096,
+        True,
+        [4096, 4096],
+    )
+
+    assert _use_captured_context_model(types.SimpleNamespace(num_contexts=1))
+    assert not _use_captured_context_model(types.SimpleNamespace(num_contexts=0))
 
 
 def test_pad_dummy_no_op_when_attention_dp_disabled():
