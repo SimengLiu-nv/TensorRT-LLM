@@ -36,6 +36,11 @@ if TYPE_CHECKING:
 
 HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
 
+#: Set to "1" to bind new requests to attention-DP ranks only once a rank has room.
+LATE_BINDING_ENV = "TRTLLM_ADP_LATE_BINDING"
+#: Pending prefill tokens below which a rank takes new requests under late binding.
+LATE_BINDING_BUDGET_ENV = "TRTLLM_ADP_LATE_BINDING_TOKENS"
+
 
 def _num_input_tokens(request) -> int:
     """Token count via the cheap num_input_tokens accessor (avoids materializing
@@ -222,10 +227,27 @@ class ADPRouter(ABC):
                 account_for_in_transfer=attention_dp_config.kv_cache_routing_account_for_in_transfer,
             )
 
+        if os.environ.get(LATE_BINDING_ENV, "0") == "1":
+            return LateBindingADPRouter(
+                dist=dist,
+                pending_token_budget=int(
+                    os.environ.get(LATE_BINDING_BUDGET_ENV, LateBindingADPRouter.DEFAULT_BUDGET)
+                ),
+            )
+
         if os.environ.get("TRTLLM_ADP_WORK_AWARE_ROUTING", "0") == "1":
             return WorkAwareADPRouter(dist=dist)
 
         return DefaultADPRouter(dist=dist)
+
+    def take_deferred_requests(self) -> List["RequestQueueItem"]:
+        """Requests the last ``route_requests`` call left unassigned, in arrival order.
+
+        The executor puts them back at the front of the waiting queue. Every
+        rank routes the same requests the same way, so the queues stay equal.
+        Routers that always assign every request return an empty list.
+        """
+        return []
 
     @abstractmethod
     def create_rank_state(
@@ -1076,3 +1098,123 @@ class WorkAwareADPRouter(DefaultADPRouter):
             counts[rank] += 1
         # The padding invariant needs the expectation to cover every rank's count.
         return all_ranks_new_requests, max(counts) if counts else 0
+
+
+class LateBindingADPRouter(WorkAwareADPRouter):
+    """Binds a new request to an attention-DP rank only once that rank has room.
+
+    The other routers assign every popped request at once, so a request can sit
+    on a rank behind a long chunked prefill while a peer rank pads lockstep
+    dummies. Here a rank takes new requests only while its pending prefill is
+    below ``pending_token_budget`` tokens; the rest go back to the front of the
+    shared waiting queue (see ``take_deferred_requests``) and are bound later,
+    to whichever rank frees up first. A budget of about two context steps lets
+    a rank start restoring its next prefix while it finishes the current one.
+
+    A rank's pending prefill counts its requests still in the context phase:
+    the exact remainder (prompt minus ``context_current_position``) once a
+    request has been scheduled, and the work-aware estimate (prompt growth
+    since the conversation's previous request) before that.
+
+    Requests leave the queue in arrival order: the first request no rank can
+    take stops routing for this iteration, so later requests never overtake it.
+    """
+
+    DEFAULT_BUDGET = 16384
+
+    def __init__(
+        self,
+        dist: "Distributed",
+        pending_token_budget: int = DEFAULT_BUDGET,
+        max_entries: int = WorkAwareADPRouter.DEFAULT_MAX_ENTRIES,
+    ):
+        super().__init__(dist, max_entries=max_entries)
+        if pending_token_budget <= 0:
+            raise ValueError(f"pending_token_budget must be > 0, got {pending_token_budget}")
+        self._budget = int(pending_token_budget)
+        self._deferred: List["RequestQueueItem"] = []
+        logger.info(
+            f"Attention DP routing: late binding (ranks take requests while pending "
+            f"prefill < {self._budget} tokens)"
+        )
+
+    def _work_of(self, req_item) -> int:
+        """The request's estimate, recorded once even if it is routed again later."""
+        work = self._estimated_work.get(req_item.id)
+        return self.estimate_work(req_item) if work is None else work
+
+    def pending_prefill(self, req) -> int:
+        """Prefill tokens a request on this rank still has to compute.
+
+        A context-only request parked outside the batch while the KV connector
+        restores its prefix sits in ``DISAGG_GENERATION_TRANS_IN_PROGRESS``
+        until the load lands; it still owes its prefill, so it counts too.
+        """
+        in_context = getattr(req, "is_context_init_state", False)
+        parked = getattr(req, "is_context_only_request", False) and getattr(
+            req, "is_disagg_generation_transmission_in_progress", False
+        )
+        if not (in_context or parked):
+            return 0
+        prompt_len = req.py_orig_prompt_len
+        position = getattr(req, "context_current_position", 0) or 0
+        if position > 0:
+            return max(0, prompt_len - position)
+        return self._estimated_work.get(req.py_request_id, prompt_len)
+
+    def create_rank_state(
+        self,
+        active_requests: list[LlmRequest],
+        new_requests: list[RequestQueueItem],
+    ) -> RankState:
+        return RankState(
+            rank=self.dist.tp_rank,
+            num_active_requests=len(active_requests),
+            num_active_tokens=sum(self.pending_prefill(req) for req in active_requests),
+        )
+
+    def route_requests(
+        self,
+        all_rank_states: list[RankState],
+        new_requests: list[RequestQueueItem],
+        max_num_active_requests: int,
+    ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
+        all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
+            s.rank: [] for s in all_rank_states
+        }
+        ranks = [s.rank for s in all_rank_states]
+        counts = {s.rank: s.num_active_requests for s in all_rank_states}
+        loads = {s.rank: s.num_active_tokens for s in all_rank_states}
+        self._deferred = []
+        for index, item in enumerate(new_requests):
+            scheduling_params = getattr(item.request, "py_scheduling_params", None)
+            target = scheduling_params.attention_dp_rank if scheduling_params is not None else None
+            relax = (
+                True
+                if scheduling_params is None or scheduling_params.attention_dp_relax is None
+                else scheduling_params.attention_dp_relax
+            )
+            work = self._work_of(item)
+            open_ranks = [
+                r for r in ranks if loads[r] < self._budget and counts[r] < max_num_active_requests
+            ]
+            if target is None:
+                candidates = open_ranks
+            elif not relax:
+                # A strict placement goes to its rank whatever that rank's load.
+                candidates = [target] if counts[target] < max_num_active_requests else []
+            else:
+                candidates = [target] if target in open_ranks else open_ranks
+            if not candidates:
+                self._deferred = list(new_requests[index:])
+                break
+            rank = min(candidates, key=lambda r: (loads[r], counts[r], r))
+            all_ranks_new_requests[rank].append(item)
+            loads[rank] += work
+            counts[rank] += 1
+        # The padding invariant needs the expectation to cover every rank's count.
+        return all_ranks_new_requests, max(counts.values()) if counts else 0
+
+    def take_deferred_requests(self) -> List["RequestQueueItem"]:
+        deferred, self._deferred = self._deferred, []
+        return deferred

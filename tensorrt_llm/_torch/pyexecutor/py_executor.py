@@ -5402,6 +5402,13 @@ class PyExecutor:
                 self.adp_router.route_requests(
                     all_rank_states, new_requests,
                     self.max_num_active_requests)
+            # A late-binding router leaves requests no rank has room for yet.
+            # They return to the front of the waiting queue, identically on
+            # every rank, and are fetched again in a later iteration.
+            deferred = self.adp_router.take_deferred_requests()
+            if deferred:
+                waiting_queue.prepend_requests(deferred)
+                self.num_fetch_requests -= len(deferred)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
             all_new_flat = [
