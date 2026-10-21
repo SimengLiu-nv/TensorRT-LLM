@@ -138,18 +138,30 @@ def _open_store(config: MooncakeStoreConnectorConfig):
     return store
 
 
-def _soft_pin_put_config(ttl_ms: int):
-    """A `ReplicateConfig` that soft-pins each page it writes for `ttl_ms`."""
+def _put_config(soft_pin_ttl_ms: Optional[int], group_ids: Optional[Sequence[str]] = None):
+    """The `ReplicateConfig` for one put call, or None to keep the store's defaults.
+
+    Args:
+        soft_pin_ttl_ms: Soft-pin every page written for this long, if set.
+        group_ids: One eviction group per key of the call, if set.
+    """
+    if soft_pin_ttl_ms is None and group_ids is None:
+        return None
     try:
-        from mooncake.store import ReplicateConfig, SoftPinAction
-    except ImportError as exc:
+        import mooncake.store as mooncake_store
+
+        config = mooncake_store.ReplicateConfig()
+        if soft_pin_ttl_ms is not None:
+            config.soft_pin_action = mooncake_store.SoftPinAction.ENABLE
+            config.soft_pin_ttl_ms = soft_pin_ttl_ms
+        if group_ids is not None:
+            config.group_ids = list(group_ids)
+    except (ImportError, AttributeError) as exc:
         raise ImportError(
-            "soft_pin_ttl_ms needs Mooncake Python bindings that expose "
-            "ReplicateConfig.soft_pin_action and SoftPinAction (0.3.13 or newer)."
+            "soft_pin_ttl_ms and group_blocks need Mooncake Python bindings whose "
+            "ReplicateConfig exposes soft_pin_action, soft_pin_ttl_ms and group_ids, "
+            "with SoftPinAction alongside it (0.3.13 or newer)."
         ) from exc
-    config = ReplicateConfig()
-    config.soft_pin_action = SoftPinAction.ENABLE
-    config.soft_pin_ttl_ms = ttl_ms
     return config
 
 
@@ -315,11 +327,14 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._peer_namespaces: Dict[int, Tuple[KeyNamespace, ...]] = {}
 
         self._store = _open_store(self._config)
-        # Write options for every put; None keeps the store's defaults.
-        self._put_config = (
-            _soft_pin_put_config(self._config.soft_pin_ttl_ms)
-            if self._config.soft_pin_ttl_ms is not None and self._config.role.saves
-            else None
+        saves = self._config.role.saves
+        self._soft_pin_ttl_ms = self._config.soft_pin_ttl_ms if saves else None
+        self._group_blocks = bool(self._config.group_blocks) and saves
+        # Write options shared by every put, built once; None keeps the store's
+        # defaults. Grouped puts need one group per key, so each call builds its
+        # own (and this one also proves the binding supports them).
+        self._put_config = _put_config(
+            self._soft_pin_ttl_ms, ["probe"] if self._group_blocks else None
         )
 
         self._save_queue: "Queue[Optional[Tuple[torch.cuda.Event, List[RequestTransfers]]]]" = (
@@ -403,7 +418,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             f"mooncake-store worker rank {self._rank}/{self._world_size} ready "
             f"(role={self._config.role.value}, model_key={self._model_key}, "
             f"master={self._config.master_server_address}"
-            f"{f', soft_pin_ttl_ms={self._config.soft_pin_ttl_ms}' if self._put_config is not None else ''})"
+            f"{f', soft_pin_ttl_ms={self._soft_pin_ttl_ms}' if self._soft_pin_ttl_ms is not None else ''}"
+            f"{', group_blocks=1' if self._group_blocks else ''})"
         )
 
     # ---- registration ----
@@ -1116,13 +1132,15 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         staging = self._save_staging
         handle = _stream_handle(self._save_stream) if staging is not None else 0
+        groups = self._block_groups(transfers) if self._group_blocks else [None] * len(keys)
 
         for batch in zip(
             _batched(keys, self._batch_size),
             _batched(addresses, self._batch_size),
             _batched(sizes, self._batch_size),
+            _batched(groups, self._batch_size),
         ):
-            batch_keys, batch_addresses, batch_sizes = batch
+            batch_keys, batch_addresses, batch_sizes, batch_groups = batch
             # Skip pages another rank or another instance already wrote. The
             # scheduler cannot know this: it holds no store handle, and the
             # answer changes between the time it builds metadata and now.
@@ -1145,7 +1163,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 # The store reads the slots on this thread, so fill them first.
                 _sync_stream(handle)
             put_args = ([batch_keys[i] for i in pending], source_addresses, source_sizes)
-            if self._put_config is not None:
+            if self._group_blocks:
+                put_args += (
+                    _put_config(self._soft_pin_ttl_ms, [batch_groups[i] for i in pending]),
+                )
+            elif self._put_config is not None:
                 put_args += (self._put_config,)
             results = self._store.batch_put_from_multi_buffers(*put_args)
             failures = sum(1 for result in results if not isinstance(result, int) or result < 0)
@@ -1156,6 +1178,20 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                     f"mooncake-store rank {self._rank} failed to save {failures} of "
                     f"{len(pending)} pages"
                 )
+
+    def _block_groups(self, transfers: Sequence[RequestTransfers]) -> List[str]:
+        """The eviction group of every page `_resolve` lists, in the same order.
+
+        One group per block covers every layer group and attention shard of it.
+        A block is only reusable while all of those pages survive, so the master
+        should evict them together rather than leave orphans that hold space
+        and still miss.
+        """
+        return [
+            self._namespaces[page.layer_group_id].group(page.block_hash)
+            for entry in transfers
+            for page in entry.pages
+        ]
 
     # ---- shared ----
 

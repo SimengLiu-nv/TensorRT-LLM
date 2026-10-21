@@ -33,6 +33,7 @@ from typing import Any, Optional
 __all__ = [
     "CLIENT_CONFIG_NAME",
     "CONFIG_PATH_ENV",
+    "GROUP_BLOCKS_ENV",
     "MooncakeStoreConnectorConfig",
     "ROLE_ENV",
     "RUN_DIR_ENV",
@@ -54,6 +55,8 @@ MODEL_KEY_ENV = "TRTLLM_MOONCAKE_STORE_MODEL_KEY"
 STAGE_THROUGH_HOST_ENV = "TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST"
 #: Soft-pin every saved page for this many milliseconds; "0" turns it off.
 SOFT_PIN_TTL_ENV = "TRTLLM_MOONCAKE_STORE_SOFT_PIN_TTL_MS"
+#: Put every page of a block into one Mooncake eviction group (boolean).
+GROUP_BLOCKS_ENV = "TRTLLM_MOONCAKE_STORE_GROUP_BLOCKS"
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824
@@ -190,6 +193,12 @@ class MooncakeStoreConnectorConfig:
     #: Must not exceed the master's `--max_kv_soft_pin_ttl` (24 h by default):
     #: the master refuses every put that asks for more.
     soft_pin_ttl_ms: Optional[int] = None
+    #: Write every page of a block (all layer groups and, under tensor
+    #: parallelism, all attention shards) into one Mooncake eviction group. A
+    #: hit needs all of them, and the master evicts a group only as a whole,
+    #: so it never keeps an orphan page that holds space but cannot be used.
+    #: Reading one page of a group also extends the lease of the others.
+    group_blocks: bool = False
 
     def __post_init__(self) -> None:
         """Reject settings that would fail later, inside a transfer."""
@@ -237,6 +246,7 @@ class MooncakeStoreConnectorConfig:
             soft_pin_ttl_ms=(
                 int(raw["soft_pin_ttl_ms"]) if raw.get("soft_pin_ttl_ms") is not None else None
             ),
+            group_blocks=bool(raw.get("group_blocks", False)),
         )
 
     @staticmethod
@@ -273,18 +283,21 @@ class MooncakeStoreConnectorConfig:
         model_key = os.getenv(MODEL_KEY_ENV)
         if model_key:
             updates["model_key"] = model_key
-        staging = os.getenv(STAGE_THROUGH_HOST_ENV)
-        if staging:
-            normalized = staging.strip().lower()
+        for env, field in (
+            (STAGE_THROUGH_HOST_ENV, "stage_through_host"),
+            (GROUP_BLOCKS_ENV, "group_blocks"),
+        ):
+            value = os.getenv(env)
+            if not value:
+                continue
+            normalized = value.strip().lower()
             if normalized in _TRUE:
-                updates["stage_through_host"] = True
+                updates[field] = True
             elif normalized in _FALSE:
-                updates["stage_through_host"] = False
+                updates[field] = False
             else:
                 known = ", ".join(sorted(_TRUE | _FALSE))
-                raise ValueError(
-                    f"{STAGE_THROUGH_HOST_ENV}={staging!r} is not a boolean; use one of: {known}"
-                )
+                raise ValueError(f"{env}={value!r} is not a boolean; use one of: {known}")
         soft_pin_ttl = os.getenv(SOFT_PIN_TTL_ENV)
         if soft_pin_ttl:
             try:
