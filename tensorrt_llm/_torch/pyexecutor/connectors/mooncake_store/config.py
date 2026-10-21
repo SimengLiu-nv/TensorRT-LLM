@@ -36,6 +36,7 @@ __all__ = [
     "MooncakeStoreConnectorConfig",
     "ROLE_ENV",
     "RUN_DIR_ENV",
+    "SOFT_PIN_TTL_ENV",
     "STAGE_THROUGH_HOST_ENV",
     "StoreRole",
     "provisioned_config_path",
@@ -51,6 +52,8 @@ ROLE_ENV = "TRTLLM_MOONCAKE_STORE_ROLE"
 CACHE_PREFIX_ENV = "TRTLLM_MOONCAKE_STORE_PREFIX"
 MODEL_KEY_ENV = "TRTLLM_MOONCAKE_STORE_MODEL_KEY"
 STAGE_THROUGH_HOST_ENV = "TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST"
+#: Soft-pin every saved page for this many milliseconds; "0" turns it off.
+SOFT_PIN_TTL_ENV = "TRTLLM_MOONCAKE_STORE_SOFT_PIN_TTL_MS"
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824
@@ -178,6 +181,15 @@ class MooncakeStoreConnectorConfig:
     async_load: bool = False
     #: Load worker threads (each with its own stream and staging slots).
     async_load_workers: int = 1
+    #: Soft-pin every saved page for this many milliseconds. A master that
+    #: allows evicting soft-pinned objects (Mooncake's default) then evicts the
+    #: pool only through its second pass, which takes the least recently leased
+    #: objects. Its first pass, which unpinned pages go through, can instead
+    #: top up a shortfall in hash order when lookups re-lease part of its oldest
+    #: frontier mid-eviction, punching holes into chains that are still in use.
+    #: Must not exceed the master's `--max_kv_soft_pin_ttl` (24 h by default):
+    #: the master refuses every put that asks for more.
+    soft_pin_ttl_ms: Optional[int] = None
 
     def __post_init__(self) -> None:
         """Reject settings that would fail later, inside a transfer."""
@@ -193,6 +205,8 @@ class MooncakeStoreConnectorConfig:
             raise ValueError("staging_buffer_bytes must be > 0 when staging is on")
         if self.async_load_workers < 1:
             raise ValueError("async_load_workers must be >= 1")
+        if self.soft_pin_ttl_ms is not None and self.soft_pin_ttl_ms <= 0:
+            raise ValueError("soft_pin_ttl_ms must be > 0 when set")
 
     @staticmethod
     def from_file(path: str) -> "MooncakeStoreConnectorConfig":
@@ -220,6 +234,9 @@ class MooncakeStoreConnectorConfig:
             ),
             async_load=bool(raw.get("async_load", False)),
             async_load_workers=int(raw.get("async_load_workers", 1)),
+            soft_pin_ttl_ms=(
+                int(raw["soft_pin_ttl_ms"]) if raw.get("soft_pin_ttl_ms") is not None else None
+            ),
         )
 
     @staticmethod
@@ -268,6 +285,17 @@ class MooncakeStoreConnectorConfig:
                 raise ValueError(
                     f"{STAGE_THROUGH_HOST_ENV}={staging!r} is not a boolean; use one of: {known}"
                 )
+        soft_pin_ttl = os.getenv(SOFT_PIN_TTL_ENV)
+        if soft_pin_ttl:
+            try:
+                ttl_ms = int(soft_pin_ttl.strip())
+            except ValueError as exc:
+                raise ValueError(
+                    f"{SOFT_PIN_TTL_ENV}={soft_pin_ttl!r} is not a whole number of milliseconds"
+                ) from exc
+            if ttl_ms < 0:
+                raise ValueError(f"{SOFT_PIN_TTL_ENV}={soft_pin_ttl!r} must be >= 0")
+            updates["soft_pin_ttl_ms"] = ttl_ms or None
         return dataclasses.replace(self, **updates) if updates else self
 
     def resolve_model_key(self, model: Any) -> str:
