@@ -1571,12 +1571,55 @@ def test_worker_starts_async_loads_from_metadata_under_attention_dp(store_config
                 ]
             )
         )
-        # The destination pages are fenced before any load thread can write them.
-        assert fenced == [{9}]
         wait_async_idle(worker)
+        # The destination pages are fenced before any load thread writes them.
+        assert fenced == [{9}]
         _saving, finished = worker.get_finished([], [9, 10])
         assert sorted(finished) == [9, 10]
         assert worker.take_failed_async_load_requests() == set()
+
+
+def test_worker_async_load_waits_on_the_fence_off_the_executor_thread(store_config, fake_store):
+    """Binding never blocks on the fence; the load thread waits on it before writing."""
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store_m3.metadata import (
+        MooncakeStoreMetadata,
+    )
+
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as worker:
+        block_hash = b"\x0c" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        calls = []
+        original = fake_store.batch_get_into_multi_buffers
+
+        def recording_get(*args, **kwargs):
+            calls.append("get")
+            return original(*args, **kwargs)
+
+        fake_store.batch_get_into_multi_buffers = recording_get
+        released = threading.Event()
+        fence_threads = []
+
+        def blocking_fence(request_ids):
+            fence_threads.append(threading.get_ident())
+            assert released.wait(5.0)
+            calls.append(("fence", set(request_ids)))
+
+        worker.bind_allocation_fence(blocking_fence)
+        worker.bind_connector_meta(
+            MooncakeStoreMetadata(
+                async_loads=[RequestTransfers(12, [PageTransfer(block_hash, 0, 2)])]
+            )
+        )
+        # The fence of the parking iteration travels with the request, so a
+        # later iteration rebinding the fence does not change what it waits on.
+        worker.bind_allocation_fence(None)
+        assert worker.get_finished([], [12]) == ([], [])
+        released.set()
+        wait_async_idle(worker)
+        assert calls == [("fence", {12}), "get"]
+        assert fence_threads and threading.get_ident() not in fence_threads
+        assert worker.get_finished([], []) == ([], [12])
 
 
 def test_worker_sync_load_waits_on_the_allocation_fence(store_config, fake_store):

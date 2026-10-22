@@ -49,7 +49,7 @@ from tensorrt_llm._utils import mpi_rank, mpi_world_size
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
 
-from ..kv_cache_connector import KvCacheConnectorWorker
+from ..kv_cache_connector import AllocationFence, KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
 from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig, local_reuse_backoff
@@ -74,6 +74,11 @@ __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
 #: mutual dependency.
 _LOCAL_WORKER: Optional["MooncakeStoreConnectorWorker"] = None
 _LOCAL_WORKER_READY = threading.Event()
+
+#: A parked request's load as queued for the worker threads: its id, transfers,
+#: enqueue time, and the allocation fence bound for the iteration that parked
+#: it, which the worker thread waits on before writing; see `_drain_loads`.
+_QueuedLoad = Tuple[int, RequestTransfers, float, Optional[AllocationFence]]
 
 
 def resolve_local_worker(timeout: float = 60.0) -> "MooncakeStoreConnectorWorker":
@@ -285,7 +290,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._async_failures_fatal = self._async_load and not self._recover_failed_loads
         # One shared FIFO: an idle worker thread takes the next request, so a
         # request is handled by exactly one worker and starts in arrival order.
-        self._load_queue: "Queue[Optional[Tuple[int, RequestTransfers, float]]]" = Queue()
+        self._load_queue: "Queue[Optional[_QueuedLoad]]" = Queue()
         self._async_workers = (
             max(1, int(self._config.async_load_workers)) if self._async_load else 0
         )
@@ -559,7 +564,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # ordered behind the KV cache manager's allocation work, which can run
         # on a side stream. Retire it before the store can overwrite a
         # recycled destination.
-        self._wait_for_destinations({entry.request_id for entry in metadata.loads}, stream)
+        self._wait_for_destinations(
+            {entry.request_id for entry in metadata.loads}, stream, self.get_allocation_fence()
+        )
         failed_requests, num_failed_pages, first_failure, _ = self._load_pages(
             keys, addresses, sizes, owners, staging, handle
         )
@@ -668,28 +675,25 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 "mooncake-store received asynchronous loads in the metadata, but "
                 "async_load is off on this rank"
             )
-        # The pages were reserved during this iteration's resource preparation,
-        # possibly on the KV cache manager's allocation stream, and its
-        # page-reuse waits and copies must retire before a load thread writes
-        # them. Only the scheduler's rank saw that allocation under tensor
-        # parallelism, which is why the wait happens here, where every rank
-        # binds the same metadata.
-        self._wait_for_destinations(
-            {transfers.request_id for transfers in async_loads if transfers.pages}, None
-        )
+        # Every rank binds the same metadata, so every rank starts its own
+        # shard's loads here, including the TP ranks whose scheduler adapter
+        # never saw the allocation. The wait for the destination pages happens
+        # on the load thread; see `_drain_loads`.
         for transfers in async_loads:
             self.start_async_load(transfers.request_id, transfers)
 
-    def _wait_for_destinations(self, request_ids: Set[int], stream) -> None:
+    def _wait_for_destinations(
+        self, request_ids: Set[int], stream, fence: Optional[AllocationFence]
+    ) -> None:
         """Block until the named requests' pages are free of earlier GPU work.
 
-        Uses the KV cache manager's allocation fence when it bound one for this
-        batch. Without one, a synchronous stream wait is the only ordering left:
-        `stream` when given, else the whole device.
+        Uses `fence`, the KV cache manager's allocation fence bound for the
+        batch that allocated the pages, when there is one. Without one, a
+        synchronous stream wait is the only ordering left: `stream` when given,
+        else the whole device.
         """
         if not request_ids:
             return
-        fence = self.get_allocation_fence()
         if fence is not None:
             fence(request_ids)
         elif stream is not None:
@@ -700,10 +704,12 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     def start_async_load(self, request_id: int, transfers: RequestTransfers) -> None:
         """Queue a parked request's offered pages for the load workers.
 
-        Called from `bind_connector_meta` once the destination pages are free
-        of earlier GPU work. An empty transfer completes at once, so a request
-        the runtime parked for an offer it could not fit is released on the
-        next `get_finished`.
+        Called from `bind_connector_meta`, in the iteration that allocated the
+        destination pages. The allocation fence bound for that iteration
+        travels with the request, and the worker thread waits on it before
+        writing. An empty transfer completes at once, so a request the runtime
+        parked for an offer it could not fit is released on the next
+        `get_finished`.
         """
         if not self._async_load:
             raise RuntimeError("mooncake-store asynchronous loads are not enabled")
@@ -713,7 +719,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 self._async_done[request_id] = False
                 return
             self._async_pending.add(request_id)
-        self._load_queue.put((request_id, transfers, time.monotonic()))
+        self._load_queue.put((request_id, transfers, time.monotonic(), self.get_allocation_fence()))
 
     def take_failed_async_load_requests(self) -> Set[int]:
         """Parked requests reported by `get_finished` whose pages were not all loaded.
@@ -769,7 +775,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             item = self._load_queue.get()
             if item is None:
                 return
-            request_id, transfers, enqueued_at = item
+            request_id, transfers, enqueued_at, fence = item
             started_at = time.monotonic()
             with self._load_lock:
                 self._async_active.add(request_id)
@@ -777,6 +783,16 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             num_failed_pages = 0
             loaded_bytes = 0
             try:
+                # The pages were reserved during the parking iteration's
+                # resource preparation, possibly on the KV cache manager's
+                # allocation stream, and its page-reuse waits and copies must
+                # retire before anything writes them. A recycled page can make
+                # that wait on the forward pass still in flight, so it is
+                # waited for here rather than on the executor thread. The
+                # request cannot be freed while its load is pending, so its
+                # fence stays valid until then. Counted as queue wait.
+                self._wait_for_destinations({request_id}, None, fence)
+                started_at = time.monotonic()
                 keys, addresses, sizes, total_pages = self._resolve([transfers])
                 owners = [request_id] * len(keys)
                 failed_requests, num_failed_pages, first_failure, loaded_bytes = self._load_pages(
