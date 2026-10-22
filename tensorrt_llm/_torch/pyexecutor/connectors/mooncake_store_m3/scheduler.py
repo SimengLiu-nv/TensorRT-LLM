@@ -35,7 +35,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 from ..kv_cache_connector import KvCacheConnectorScheduler, RequestData, SchedulerOutput
-from .config import MooncakeStoreConnectorConfig
+from .config import MooncakeStoreConnectorConfig, local_reuse_backoff
 from .keys import BlockHashChain
 from .metadata import MooncakeStoreMetadata, PageTransfer, RequestTransfers
 from .validation import validate_llm_args
@@ -54,6 +54,7 @@ class _RequestState:
         "saved_upto",
         "load_first_block",
         "load_blocks",
+        "load_async",
         "async_loaded_upto",
         "emitted_saves",
     )
@@ -69,6 +70,9 @@ class _RequestState:
         #: The offer made by `get_num_new_matched_tokens`, in block ordinals.
         self.load_first_block = 0
         self.load_blocks = 0
+        #: Whether that offer was made asynchronously, which decides how
+        #: `update_state_after_alloc_by_layer_group` settles it.
+        self.load_async = False
         #: End of the offer handed to the load thread, in block ordinals. Those
         #: blocks are the store's already, so they are never written back.
         self.async_loaded_upto = 0
@@ -98,6 +102,11 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         # parallelism this adapter exists on rank 0 only and every rank loads
         # its own shard; under attention DP each owner loads its own pages.
         self._async_load = bool(self._config.async_load) and self._config.role.loads
+        # Under the `align` local reuse mode a one-block offer is usually the
+        # block the local match gave up to alignment. Parking a request costs
+        # at least one executor iteration, which one block is not worth, so
+        # that offer is loaded synchronously instead; see `local_reuse_backoff`.
+        self._sync_single_block_offers = self._async_load and local_reuse_backoff() == "align"
         self._pending_async_loads: List[RequestTransfers] = []
 
         logger.info(
@@ -128,12 +137,14 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             Tokens the store can supply, and whether they arrive asynchronously.
             With `async_load` a non-empty offer is asynchronous: the runtime
             parks the request and the worker loads the pages off the executor
-            iteration; otherwise the load is synchronous.
+            iteration; otherwise the load is synchronous. Under the `align`
+            local reuse mode a one-block offer stays synchronous.
         """
         tokens = request.get_tokens(0)
         state = self._state_for(request, tokens)
         state.load_first_block = 0
         state.load_blocks = 0
+        state.load_async = False
         state.async_loaded_upto = 0
 
         if not self._config.role.loads:
@@ -160,12 +171,15 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
 
         state.load_first_block = first_block
         state.load_blocks = hit_blocks
+        state.load_async = self._async_load and not (
+            self._sync_single_block_offers and hit_blocks == 1
+        )
         logger.debug(
             f"mooncake-store matched {hit_blocks} blocks "
             f"({hit_blocks * self._tokens_per_block} tokens) "
             f"for request {request.request_id}"
         )
-        return hit_blocks * self._tokens_per_block, self._async_load
+        return hit_blocks * self._tokens_per_block, state.load_async
 
     def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
         """Settle an offer against a flat page list.
@@ -211,7 +225,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         load_blocks = request.py_num_connector_matched_tokens // self._tokens_per_block
         if not 0 <= load_blocks <= state.load_blocks:
             raise RuntimeError("Mooncake honoured prefix exceeds the outstanding load offer")
-        if not self._async_load:
+        if not state.load_async:
             state.load_blocks = load_blocks
             return
         load_end = state.load_first_block + load_blocks

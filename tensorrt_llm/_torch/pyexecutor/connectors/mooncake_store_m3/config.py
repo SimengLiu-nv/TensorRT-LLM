@@ -136,16 +136,20 @@ def local_reuse_backoff() -> str:
     backs every local reuse match off by that lookahead. The store serves only
     from a block boundary, so the backed-off match has to be handled somehow:
 
-    * ``align`` (default): also align the match down to a block boundary. The
-      store then serves the trimmed block along with anything after it, at the
-      cost of a transfer, which under ``async_load`` parks the request, even
-      when the local cache held that block.
-    * ``off``: drop the backoff while this connector is attached, as the
-      MiniMax-M3 GB300 runs did. A local hit is used whole, and the draft KV at
-      the end of a reused block may have been computed for a different next
-      token, which can lower draft acceptance but not change the output.
+    * ``off`` (default): drop the backoff while this connector is attached,
+      as the MiniMax-M3 GB300 runs did. A local hit is used whole, and the
+      draft KV at the end of a reused block may have been computed for a
+      different next token, which can lower draft acceptance but not change
+      the output.
+    * ``align``: also align the match down to a block boundary. The store then
+      serves the trimmed block along with anything after it, at the cost of a
+      transfer, even when the local cache held that block. When the store
+      cannot serve that block, it is recomputed and nothing after it is
+      offered. An offer of that single block is loaded synchronously rather
+      than parking the request under ``async_load``; see
+      `MooncakeStoreConnectorScheduler.get_num_new_matched_tokens`.
     """
-    value = (os.getenv(LOCAL_REUSE_BACKOFF_ENV) or "align").strip().lower()
+    value = (os.getenv(LOCAL_REUSE_BACKOFF_ENV) or "off").strip().lower()
     if value not in ("align", "off"):
         raise ValueError(f"{LOCAL_REUSE_BACKOFF_ENV}={value!r} is not one of: align, off")
     return value
