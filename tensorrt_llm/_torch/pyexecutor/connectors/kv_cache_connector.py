@@ -68,11 +68,12 @@ def _is_dummy_request(request: LlmRequest) -> bool:
 
     Reads only what the C++ ``LlmRequest`` binds as well, because some callers
     hand over the base class. Attention DP pads idle ranks with these, and they
-    carry nothing a connector could load or save.
+    carry nothing a connector could load or save. Compared against True, since
+    a mock request answers every attribute truthily and is not a dummy.
     """
-    return bool(
-        getattr(request, "is_dummy_request", False)
-        or getattr(request, "is_attention_dp_dummy", False)
+    return (
+        getattr(request, "is_dummy_request", False) is True
+        or getattr(request, "is_attention_dp_dummy", False) is True
     )
 
 
@@ -800,6 +801,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.scheduler = scheduler
         self.enable_attention_dp = enable_attention_dp
         self.speculative_prefill_only = speculative_prefill_only
+        #: Whether the worker may hand failed loads back for a restart instead
+        #: of raising; see `take_failed_load_requests`. Compared against True
+        #: for the same reason as `capacity_only`.
+        self.reports_failed_loads = getattr(worker, "reports_failed_loads", False) is True
         #: Whether the attached connector moves KV at all; see
         #: `KvCacheConnectorWorker.capacity_only`. Compared against True
         #: because this disables most of the per-request path, which is too
