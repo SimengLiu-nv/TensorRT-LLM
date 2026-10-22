@@ -52,7 +52,7 @@ from tensorrt_llm.logger import logger
 from ..kv_cache_connector import KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
-from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig
+from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig, local_reuse_backoff
 from .keys import KeyNamespace
 from .metadata import MooncakeStoreMetadata, RequestTransfers
 from .staging import (
@@ -220,6 +220,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         validate_llm_args(llm_args)
         self._config = MooncakeStoreConnectorConfig.from_env()
+        #: Read by `KVCacheManagerV2`, which is built after the connector; see
+        #: `config.local_reuse_backoff`.
+        self.drops_reuse_match_backoff = local_reuse_backoff() == "off"
         self._rank = mpi_rank()
         self._world_size = mpi_world_size()
         # Each ADP owner holds a complete attention cache. Reusable content is

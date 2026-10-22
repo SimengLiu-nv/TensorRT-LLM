@@ -1446,9 +1446,10 @@ class KVCacheManagerV2(BaseResourceManager):
         # check needs this raw value even where a subclass opts out of reuse-match backoff:
         # a block's reuse key covers no token past its end.
         self._draft_prompt_lookahead = draft_prompt_lookahead(spec_config) or 0
-        # Unsupported adapters keep their main-like reuse endpoint.
+        # Unsupported adapters keep their main-like reuse endpoint, and so does
+        # a manager whose KV connector asks for whole local matches instead.
         self.reuse_match_backoff = self._draft_prompt_lookahead
-        if not self._supports_reuse_match_backoff:
+        if not self._supports_reuse_match_backoff or self._connector_drops_reuse_match_backoff():
             self.reuse_match_backoff = 0
         self.enable_partial_reuse = _effective_partial_reuse(
             kv_cache_config.enable_partial_reuse,
@@ -3089,6 +3090,22 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
         return config
+
+    def _connector_drops_reuse_match_backoff(self) -> bool:
+        """Whether the attached KV connector asks for local matches without backoff.
+
+        A connector that serves from block boundaries can prefer reusing whole
+        local blocks to aligning a backed-off match down and loading the trimmed
+        block itself; see `_connector_reuse_match_alignment`. The draft KV at
+        the end of such a block may then belong to a different next token,
+        which affects draft acceptance only. The draft manager never asks.
+        """
+        if self.is_draft:
+            return False
+        connector = getattr(self, "kv_connector_manager", None)
+        if connector is None:
+            return False
+        return getattr(connector.worker, "drops_reuse_match_backoff", False) is True
 
     def _connector_reuse_match_alignment(self) -> int:
         """Alignment a whole-block KV connector needs of every local prefix match.

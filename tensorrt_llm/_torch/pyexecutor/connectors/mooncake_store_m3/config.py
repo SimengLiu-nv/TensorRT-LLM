@@ -33,6 +33,7 @@ from typing import Any, Optional
 __all__ = [
     "CLIENT_CONFIG_NAME",
     "CONFIG_PATH_ENV",
+    "LOCAL_REUSE_BACKOFF_ENV",
     "MooncakeStoreConnectorConfig",
     "ROLE_ENV",
     "RUN_DIR_ENV",
@@ -51,6 +52,9 @@ ROLE_ENV = "TRTLLM_MOONCAKE_STORE_ROLE"
 CACHE_PREFIX_ENV = "TRTLLM_MOONCAKE_STORE_PREFIX"
 MODEL_KEY_ENV = "TRTLLM_MOONCAKE_STORE_MODEL_KEY"
 STAGE_THROUGH_HOST_ENV = "TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST"
+#: How a local reuse match is trimmed under a one-model draft's lookahead
+#: backoff; see `local_reuse_backoff`.
+LOCAL_REUSE_BACKOFF_ENV = "TRTLLM_MOONCAKE_STORE_LOCAL_REUSE_BACKOFF"
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824
@@ -123,6 +127,28 @@ def parse_size(value: Any) -> int:
     if scale is None:
         raise ValueError(f"unknown size unit {unit!r} in {value!r}")
     return int(float(magnitude) * scale)
+
+
+def local_reuse_backoff() -> str:
+    """How the KV cache manager trims a local match ahead of this connector.
+
+    A one-model draft reads prompt tokens past each position, so the manager
+    backs every local reuse match off by that lookahead. The store serves only
+    from a block boundary, so the backed-off match has to be handled somehow:
+
+    * ``align`` (default): also align the match down to a block boundary. The
+      store then serves the trimmed block along with anything after it, at the
+      cost of a transfer, which under ``async_load`` parks the request, even
+      when the local cache held that block.
+    * ``off``: drop the backoff while this connector is attached, as the
+      MiniMax-M3 GB300 runs did. A local hit is used whole, and the draft KV at
+      the end of a reused block may have been computed for a different next
+      token, which can lower draft acceptance but not change the output.
+    """
+    value = (os.getenv(LOCAL_REUSE_BACKOFF_ENV) or "align").strip().lower()
+    if value not in ("align", "off"):
+        raise ValueError(f"{LOCAL_REUSE_BACKOFF_ENV}={value!r} is not one of: align, off")
+    return value
 
 
 def provisioned_config_path() -> Optional[str]:
