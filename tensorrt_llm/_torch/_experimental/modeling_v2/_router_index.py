@@ -37,7 +37,7 @@ from __future__ import annotations
 import enum
 import os
 from importlib import import_module
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -51,6 +51,7 @@ _PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
 MODELING_V2_ROUTERS = {
     "GptOssForCausalLM": "models.gpt_oss.routing",
     "DeepseekV3ForCausalLM": "models.deepseek_v3.routing",
+    "MiniMaxM3SparseForConditionalGeneration": "models.minimax_m3.routing",
     # Qwen3.8-Flash-Next publishes ``Qwen4ExpForConditionalGeneration``, and the
     # config loader's composite branch writes the same name back.
     "Qwen4ExpForConditionalGeneration": "models.qwen4_exp.routing",
@@ -86,6 +87,8 @@ def step_contract_enabled() -> bool:
 class ModelingV2Mode(str, enum.Enum):
     """What to do when a deployment reaches the modeling_v2 resolver."""
 
+    #: ``auto`` on the deployments the routing module enables by default, ``off`` everywhere else.
+    DEFAULT = "default"
     OFF = "off"
     AUTO = "auto"
     REQUIRE = "require"
@@ -95,13 +98,55 @@ class ModelingV2Mode(str, enum.Enum):
         return cls(llm_args.modeling_v2)
 
 
-class NoTarget(Exception):
-    """Raised by a routing module's ``route`` when no target fits.
+class NoTarget(ValueError):
+    """Raised by a routing module's ``route`` when no target fits, or by a target at construction when the runtime
+    the engine arguments set is not the one it is written for.
 
     The message says, in words, which fact ruled the targets out. Under
-    ``auto`` the resolver logs it and falls back to the built-in implementation;
+    ``auto`` the resolver logs it and falls back to the built-in implementation
+    (for a refusal at construction, ``AutoModelForCausalLM.from_config`` does);
     under ``require`` it becomes the error the user sees.
     """
+
+
+class DeploymentRole(str, enum.Enum):
+    """What this engine serves: both phases, or one side of disaggregated serving."""
+
+    AGGREGATED = "aggregated"
+    CONTEXT = "context"
+    GENERATION = "generation"
+    #: Disaggregated, but the launcher did not say which side.
+    UNKNOWN = "unknown"
+
+
+#: Set by ``trtllm-serve`` on disaggregated workers (``context`` or ``generation``; legacy ``ctx*`` / ``gen*``).
+DISAGG_ROLE_ENV = "TRTLLM_DISAGG_ROLE"
+
+
+def deployment_role(llm_args: "TorchLlmArgs") -> DeploymentRole:
+    """The role of this engine, known before the model is built: no cache transceiver means aggregated serving."""
+    if llm_args.cache_transceiver_config is None:
+        return DeploymentRole.AGGREGATED
+    role = os.environ.get(DISAGG_ROLE_ENV, "").strip().lower()
+    if role == "context" or role.startswith("ctx"):
+        return DeploymentRole.CONTEXT
+    if role == "generation" or role.startswith("gen"):
+        return DeploymentRole.GENERATION
+    return DeploymentRole.UNKNOWN
+
+
+# The mode each target class was last resolved under (the loader builds the class right after resolving it).
+_RESOLVED_MODES: Dict[type, ModelingV2Mode] = {}
+
+
+def resolved_mode(target: type) -> ModelingV2Mode:
+    """The mode ``modeling_v2_resolve`` returned ``target`` under; ``auto`` for a class built without it.
+
+    A target reads it at construction: under ``require`` its in-target dispatch
+    raises where it would otherwise fall back to a built-in path inside the
+    shapes it claims.
+    """
+    return _RESOLVED_MODES.get(target, ModelingV2Mode.AUTO)
 
 
 def tp_reaches_across_nodes(mapping) -> bool:
@@ -172,6 +217,11 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     when ``llm_args.modeling_v2`` is ``off``, when no routing module claims the
     architecture, or when the routing module's ``route`` raises ``NoTarget``.
     In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
+
+    ``default`` resolves as ``auto`` and then keeps the target only where the
+    routing module's ``enabled_by_default(target, role)`` returns None (a reason
+    string declines it). An architecture whose routing module has no
+    ``enabled_by_default`` is not routed at all under ``default``.
     """
     mode = ModelingV2Mode.of(llm_args)
     if mode is ModelingV2Mode.OFF:
@@ -182,6 +232,11 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
         return None
     arch = pretrained_config.architectures[0]
 
+    if mode is ModelingV2Mode.DEFAULT:
+        routing = routing_module(arch)
+        if getattr(routing, "enabled_by_default", None) is None:
+            return None
+
     try:
         routing = routing_module(arch)
         if routing is None:
@@ -189,7 +244,7 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             raise NoTarget(
                 f"no routing module for this architecture; routed architectures: {known}"
             )
-        return routing.route(
+        target = routing.route(
             pretrained_config,
             config.mapping,
             _device_compute_capability(),
@@ -203,3 +258,20 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
         )
         return None
+    if target is not None and mode is ModelingV2Mode.DEFAULT:
+        role = deployment_role(llm_args)
+        why = routing.enabled_by_default(target, role)
+        if why is not None:
+            logger.info(
+                f"modeling_v2: {target.__name__} fits {arch!r} but is not enabled by default for this deployment "
+                f"({why}); using the built-in implementation. Set modeling_v2='auto' to use the target."
+            )
+            return None
+        logger.info(
+            f"modeling_v2: {target.__name__} is enabled by default for {arch!r} ({role.value}); "
+            "set modeling_v2='off' to use the built-in implementation"
+        )
+        mode = ModelingV2Mode.AUTO
+    if target is not None:
+        _RESOLVED_MODES[target] = mode
+    return target
