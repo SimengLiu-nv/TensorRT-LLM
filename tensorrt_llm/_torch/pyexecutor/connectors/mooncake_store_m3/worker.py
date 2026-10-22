@@ -204,6 +204,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     """Moves KV pages between this rank's GPU cache and the Mooncake pool."""
 
     supports_attention_dp = True
+    #: Pages are stored and offered by whole block, so a local prefix match has
+    #: to end on a block boundary for the store to extend it. Read by
+    #: `KVCacheManagerV2`, which aligns its reuse matches when a one-model
+    #: draft's lookahead backoff would otherwise leave them one token short.
+    requires_block_aligned_reuse = True
 
     def __init__(self, llm_args: TorchLlmArgs) -> None:
         super().__init__(llm_args)

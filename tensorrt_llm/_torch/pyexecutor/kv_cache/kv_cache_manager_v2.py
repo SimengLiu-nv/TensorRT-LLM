@@ -3229,6 +3229,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # A paired scheduler caps the claim by retaining D evidence past the
             # common usable depth, so this still trims exactly once.
             reuse_match_backoff=self.reuse_match_backoff,
+            reuse_match_alignment=self._connector_reuse_match_alignment(),
             enable_stats=self.enable_stats,
             swa_scratch_reuse=scratch_reuse_config,
             commit_min_snapshot=(
@@ -3241,6 +3242,29 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
         return config
+
+    def _connector_reuse_match_alignment(self) -> int:
+        """Alignment a whole-block KV connector needs of every local prefix match.
+
+        Such a connector serves only from a block boundary, and the local match
+        is where its offer starts. Disabling partial radix matching is not
+        enough on its own: a one-model draft's lookahead backoff trims a match
+        of whole blocks to one or more tokens short of a boundary, which would
+        leave the connector nothing to offer for any request with a local hit.
+        Aligning trades the trimmed block for the connector serving it and
+        everything after it. Any other configuration keeps token-granular reuse.
+
+        The connector is read through `getattr` because tests build partial
+        managers that never bind one.
+        """
+        if self.reuse_match_backoff <= 0 or self.enable_partial_reuse:
+            return 1
+        connector = getattr(self, "kv_connector_manager", None)
+        if connector is None or not getattr(
+            connector.worker, "requires_block_aligned_reuse", False
+        ):
+            return 1
+        return self._ledger_tokens_per_block
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Exclude empty buffers before creating the runtime storage pools."""

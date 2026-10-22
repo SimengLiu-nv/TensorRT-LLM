@@ -1164,7 +1164,10 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.assertEqual(kv2.num_committed_tokens, len(prompt))
         kv2.close()
 
-    def test_reuse_match_backoff_trims_the_tail_of_every_match(self) -> None:
+    @parameterized.expand([("tokens", 1, True), ("blocks", 8, False)])
+    def test_reuse_match_backoff_trims_the_tail_of_every_match(
+        self, _case: str, alignment: int, partial_reuse: bool
+    ) -> None:
         """A pool holding state that reads D tokens ahead cannot use the last D.
 
         Set for a one-model speculative decoding draft pool, whose KV at position
@@ -1172,6 +1175,9 @@ class TestNoBatching(TestKVCacheManagerV2):
         the first m - D positions. Applied inside match(), so probe_reuse and the
         claim agree and neither needs a second tree walk. Commit is untouched --
         the blocks are stored in full; only what a later match may use shrinks.
+
+        A whole-block KV connector also needs the trimmed match aligned to a
+        block boundary, which reuse_match_alignment applies after the backoff.
         """
         tokens_per_block = 8
         backoff = 3
@@ -1190,6 +1196,8 @@ class TestNoBatching(TestKVCacheManagerV2):
                     )
                 ],
                 reuse_match_backoff=backoff,
+                reuse_match_alignment=alignment,
+                enable_partial_reuse=partial_reuse,
             )
         )
 
@@ -1205,16 +1213,33 @@ class TestNoBatching(TestKVCacheManagerV2):
 
         # Every other test in this file runs with the default backoff of 0 and
         # matches the full prompt, so the delta here is the backoff alone. The
-        # trim crosses a block boundary rather than stopping at one.
-        self.assertEqual(self.manager.probe_reuse(None, prompt), len(prompt) - backoff)
+        # trim crosses a block boundary rather than stopping at one. Alignment
+        # is applied after the backoff, never in its place.
+        expected = (len(prompt) - backoff) // alignment * alignment
+        self.assertEqual(self.manager.probe_reuse(None, prompt), expected)
 
         # A match shorter than the backoff collapses to nothing, not negative.
         self.assertEqual(self.manager.probe_reuse(None, prompt[: backoff - 1]), 0)
 
         # The claim agrees with the probe: same trim, no second tree walk.
         kv2 = self.manager.create_kv_cache(input_tokens=prompt)
-        self.assertEqual(kv2.num_committed_tokens, len(prompt) - backoff)
+        self.assertEqual(kv2.num_committed_tokens, expected)
         kv2.close()
+
+    def test_reuse_match_alignment_must_divide_tokens_per_block(self) -> None:
+        """An alignment the block size is not a multiple of is refused at construction."""
+        with self.assertRaises(AssertionError):
+            KVCacheManagerConfig(
+                tokens_per_block=8,
+                cache_tiers=[GpuCacheTierConfig(quota=16 << 20)],
+                layers=[
+                    AttentionLayerConfig(
+                        layer_id=LayerId(0),
+                        buffers=[BufferConfig(role=Role.KEY, size=1024)],
+                    )
+                ],
+                reuse_match_alignment=3,
+            )
 
     @parameterized.expand([("backoff_0", 0), ("backoff_1", 1)])
     def test_planned_drop_handle(self, _case: str, reuse_match_backoff: int) -> None:

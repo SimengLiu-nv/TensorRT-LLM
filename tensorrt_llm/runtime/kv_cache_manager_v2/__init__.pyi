@@ -293,6 +293,9 @@ class KVCacheManagerConfig:
     enable_stats: bool = True
     text_only: bool = False
     enable_partial_commit: bool = True
+    # Required alignment of the final prefix match, after backoff and coverage
+    # pruning; a positive divisor of tokens_per_block. 1 keeps token-granular reuse.
+    reuse_match_alignment: int = 1
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
