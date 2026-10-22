@@ -63,6 +63,19 @@ if TYPE_CHECKING:
 AllocationFence = Callable[[Iterable[int]], None]
 
 
+def _is_dummy_request(request: LlmRequest) -> bool:
+    """Whether ``request`` is a placeholder with no prompt of its own.
+
+    Reads only what the C++ ``LlmRequest`` binds as well, because some callers
+    hand over the base class. Attention DP pads idle ranks with these, and they
+    carry nothing a connector could load or save.
+    """
+    return bool(
+        getattr(request, "is_dummy_request", False)
+        or getattr(request, "is_attention_dp_dummy", False)
+    )
+
+
 # Used to store data for a single inflight request.
 @dataclass
 class RequestData:
@@ -113,6 +126,10 @@ class SchedulerOutput:
     # Confirmed transfers, including loads whose requests are parked outside
     # the compute batch. A reservation ID identifies one destination allocation.
     prefix_loads: List["PrefixLoad"] = field(default_factory=list)
+
+    # Owner of the local block IDs under attention DP. None denotes the
+    # shared-request tensor-parallel path. This is not a storage namespace.
+    attention_dp_rank: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -172,6 +189,10 @@ def _satisfy_flat_abstracts(cls: type, base: type, pairs: Dict[str, str]) -> Non
 
 
 class KvCacheConnectorWorker(ABC):
+    # Opt in only when transfers, endpoints and completion are owner-local,
+    # and the backend can safely share compatible cache content across owners.
+    supports_attention_dp: bool = False
+
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
         self._metadata = None
@@ -337,7 +358,9 @@ class KvCacheConnectorWorker(ABC):
         ``started_loading_req_ids`` arguments.  Additionally, the runtime
         will only take action based on these returned IDs once they've
         been returned by ALL workers. This allows some workers to take
-        longer than others to complete the operations.
+        longer than others to complete the operations. Under attention DP
+        each request has one local worker, and unrelated ranks do not take
+        part in its completion.
         """
 
     def get_finished_prefix_loads(self) -> List[int]:
@@ -359,6 +382,10 @@ class KvCacheConnectorWorker(ABC):
 
 
 class KvCacheConnectorScheduler(ABC):
+    # Attention DP creates one adapter per rank. Adapters may connect to the
+    # same logical storage pool; their request and allocation state stays local.
+    supports_attention_dp: bool = False
+
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
         super().__init__()
@@ -682,6 +709,8 @@ class KvCacheConnectorSchedulerOutputManager:
         scheduler_output = SchedulerOutput()
 
         for req in scheduled_batch.context_requests:
+            if _is_dummy_request(req):
+                continue
             if req.request_id in new_async_requests.loading_ids:
                 continue
 
@@ -701,6 +730,8 @@ class KvCacheConnectorSchedulerOutputManager:
                 scheduler_output.cached_requests.append(request_data)
 
         for req in scheduled_batch.generation_requests:
+            if _is_dummy_request(req):
+                continue
             request_data = self.requests[req.request_id].update_and_build_data(
                 req, kv_cache_manager
             )
@@ -733,24 +764,50 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     It has the following responsibilities:
     1. Managing the state of async requests (both offload and onboard)
-    2. Handling MPI communication. We only run the leader on one rank,
-       but need the results of the leader API on all ranks.
+    2. Handling MPI communication for tensor parallelism. We only run the
+       leader on one rank, but need the results of the leader API on all
+       ranks. Under attention DP, which a connector must opt into, each rank
+       runs its own scheduler adapter and worker without connector
+       collectives; adapters can share an external storage pool.
 
     Note: This class is solely an implementation detail, and is not part of the connector interface itself.
     When implementing a connector API, you do not need to implement this class.
     """
 
     def __init__(
-        self, worker: KvCacheConnectorWorker, scheduler: Optional[KvCacheConnectorScheduler]
+        self,
+        worker: KvCacheConnectorWorker,
+        scheduler: Optional[KvCacheConnectorScheduler],
+        *,
+        enable_attention_dp: bool = False,
+        speculative_prefill_only: bool = False,
     ):
-        assert (scheduler is not None) == (mpi_rank() == 0), (
-            "The scheduler may only exist on rank 0!"
+        """Bind a connector's two halves to the runtime.
+
+        Args:
+            worker: This rank's worker.
+            scheduler: The scheduler adapter. Present on rank 0 only, or on
+                every rank under attention DP.
+            enable_attention_dp: Run the scheduler adapter and completion
+                bookkeeping per rank, with no connector collectives. The
+                connector has to declare ``supports_attention_dp``.
+            speculative_prefill_only: Allow one-model speculative decoding by
+                refusing every request that is not context-only. Context-only
+                requests never reject draft tokens, so the append-only page
+                deltas the connector is given stay valid.
+        """
+        assert (scheduler is not None) == (enable_attention_dp or mpi_rank() == 0), (
+            "A scheduler is required on every attention-DP rank, or only on rank 0 otherwise."
         )
+        if enable_attention_dp:
+            self.validate_attention_dp(type(worker), type(scheduler))
 
         super().__init__()
 
         self.worker = worker
         self.scheduler = scheduler
+        self.enable_attention_dp = enable_attention_dp
+        self.speculative_prefill_only = speculative_prefill_only
         #: Whether the attached connector moves KV at all; see
         #: `KvCacheConnectorWorker.capacity_only`. Compared against True
         #: because this disables most of the per-request path, which is too
@@ -787,10 +844,31 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._deferred_load_terminations: Dict[int, LlmRequest] = {}
         self._finished_load_terminations: List[LlmRequest] = []
 
+    @staticmethod
+    def validate_attention_dp(
+        worker_cls: type[KvCacheConnectorWorker],
+        scheduler_cls: type[KvCacheConnectorScheduler],
+    ) -> None:
+        """Refuse a connector that has not opted into attention DP."""
+        for connector_cls in (worker_cls, scheduler_cls):
+            if not getattr(connector_cls, "supports_attention_dp", False):
+                raise NotImplementedError(
+                    f"{connector_cls.__name__} does not support attention DP. A "
+                    "connector must declare supports_attention_dp=True on both "
+                    "halves and keep scheduling, transfers and completion local "
+                    "to each rank."
+                )
+
     def _run_on_leader(self, f: Callable[[], Any]) -> Any:
         """
         Run a function on the leader rank, and broadcast the result to all other ranks.
+
+        Under attention DP every rank is its own leader, so the function runs
+        locally: allocation callbacks are request-local, and the ranks can make
+        them in different orders and counts.
         """
+        if self.enable_attention_dp:
+            return f()
         if self.scheduler is not None:
             assert mpi_rank() == 0, "The scheduler may only exist on rank 0!"
             res = f()
@@ -845,8 +923,14 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                     "get_finished_prefix_loads on every worker."
                 )
             self._prefix_capability = all(capabilities)
+        # Completion of a reserved load is decided by the leader and broadcast,
+        # which attention DP has no leader for; such a connector keeps the
+        # legacy query-and-commit path.
         self.prefix_reservations_enabled = (
-            enabled and self._prefix_capability and not self.capacity_only
+            enabled
+            and self._prefix_capability
+            and not self.capacity_only
+            and not self.enable_attention_dp
         )
         if self.prefix_reservations_enabled and self._prefix_completion_tracker is None:
             comm = mpi_comm().Dup() if mpi_world_size() > 1 else None
@@ -1060,6 +1144,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             # into it, and the query would cost the leader broadcast below on
             # every request.
             return 0, False
+        if _is_dummy_request(request):
+            return 0, False
+        self._validate_speculative_prefill_request(request)
 
         num_tokens, load_kv_async = self._run_on_leader(
             lambda: self.scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
@@ -1100,6 +1187,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             # role skips it, so an entry recorded here would be carried until
             # the allocation dies.
             return
+        if _is_dummy_request(request):
+            return
 
         # TODO(jthomson04): This part is a bit ugly.
         # When the connector indicates that a request will be loaded
@@ -1134,6 +1223,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             # trip. The refusal is about a connector having no story for prompt
             # KV that came from the context worker; one that serves nothing has
             # nothing to refuse.
+            return 0
+        if _is_dummy_request(request):
             return 0
 
         if request.is_generation_only_request:
@@ -1234,6 +1325,49 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         req_id = request.request_id
         return req_id not in self.finished_async_loading_requests
 
+    def take_failed_load_requests(self) -> Set[int]:
+        """Requests the worker could not load pages for in this iteration.
+
+        Empty for connectors that raise on a failed load. See
+        `PyExecutor._recover_failed_connector_loads` for what happens to them.
+        """
+        take = getattr(self.worker, "take_failed_load_requests", None)
+        return set(take()) if take is not None else set()
+
+    def take_failed_async_load_requests(self) -> Set[int]:
+        """Parked requests whose asynchronous load lost a page.
+
+        Reported through `get_finished` like a completed load, so the request
+        leaves its parked state; the executor then drops its allocation and lets
+        it restart. See `PyExecutor._recover_failed_async_loads`.
+        """
+        take = getattr(self.worker, "take_failed_async_load_requests", None)
+        return set(take()) if take is not None else set()
+
+    def forget_request(self, request: LlmRequest) -> None:
+        """Drop everything keyed to a request that is about to restart from scratch."""
+        # Saves bound for this pass would publish pages the request never
+        # computed. The worker already drops them when a synchronous load
+        # fails, and a parked request has none bound; this covers any other
+        # caller that restarts a request after the metadata was built.
+        drop_saves = getattr(self.worker, "drop_bound_saves", None)
+        if drop_saves is not None:
+            drop_saves([request.request_id])
+        self.reset_request_state(request)
+
+    def _validate_speculative_prefill_request(self, request: LlmRequest) -> None:
+        """Keep one-model speculation's append-only page lists on context-only work."""
+        if (
+            self.speculative_prefill_only
+            and not _is_dummy_request(request)
+            and not request.is_context_only_request
+        ):
+            raise NotImplementedError(
+                "This KV connector runs with one-model speculative decoding on "
+                "context-only (disaggregated prefill) requests only. Run "
+                "speculative generation on a separate connector-free decode engine."
+            )
+
     def build_scheduler_output(
         self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
     ):
@@ -1243,6 +1377,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             # which on a generation server is inter-token latency.
             # `handle_metadata` returns early when none was built.
             return
+        if self.speculative_prefill_only:
+            for request in (
+                *scheduled_batch.context_requests,
+                *scheduled_batch.generation_requests,
+            ):
+                self._validate_speculative_prefill_request(request)
         async_requests = AsyncRequests(
             {},
             {
@@ -1265,6 +1405,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             for reservation_id, load in self._prefix_loads.items()
             if reservation_id not in self._dispatched_prefix_load_ids
         ]
+        if self.enable_attention_dp:
+            self._scheduler_output.attention_dp_rank = mpi_rank()
 
     def take_scheduled_requests_pending_load(self, scheduled_requests: ScheduledRequests):
         """
@@ -1349,6 +1491,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if self.capacity_only:
             # Nothing is registered for a save to read.
             return False
+        if _is_dummy_request(req):
+            return False
 
         # A caller with no per-group view of the cache leaves this unset, and the
         # flat list is the whole description. Every per-group caller passes one
@@ -1432,7 +1576,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         finished_saving = list(self.local_finished_async_requests.saving_ids)
         finished_loading = list(self.local_finished_async_requests.loading_ids)
 
-        all_results = mpi_allgather((finished_saving, finished_loading))
+        # Under attention DP a request lives on one rank, and no other rank
+        # holds a shard of it to wait for.
+        all_results = (
+            [(finished_saving, finished_loading)]
+            if self.enable_attention_dp
+            else mpi_allgather((finished_saving, finished_loading))
+        )
 
         # Find only the requests that have been reported complete by all workers.
         intersect_finished_saving = set.intersection(*[set(res[0]) for res in all_results])
@@ -1504,7 +1654,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         block_ids: List[int],
         block_ids_by_layer_group: Optional[List[List[int]]] = None,
     ):
-        if self.scheduler is None or self.capacity_only:
+        if self.scheduler is None or self.capacity_only or _is_dummy_request(req):
             return
         # A cache that reports per layer group is reported that way, whatever
         # the group count -- including one empty list per group for a request
