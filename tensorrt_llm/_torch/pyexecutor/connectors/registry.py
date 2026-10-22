@@ -45,6 +45,14 @@ CONNECTOR_REGISTRY: dict[str, dict[str, str]] = {
         "connector_scheduler_class": "MooncakeStoreConnectorScheduler",
         "connector_worker_class": "MooncakeStoreConnectorWorker",
     },
+    # The MiniMax-M3 Mooncake stack: attention-DP owners on one shared pool,
+    # asynchronous prefix loads and prefill-only speculative decoding. A
+    # separate package, so it does not replace the upstream connector above.
+    "mooncake-store-m3": {
+        "connector_module": "tensorrt_llm._torch.pyexecutor.connectors.mooncake_store_m3",
+        "connector_scheduler_class": "MooncakeStoreConnectorScheduler",
+        "connector_worker_class": "MooncakeStoreConnectorWorker",
+    },
 }
 
 
