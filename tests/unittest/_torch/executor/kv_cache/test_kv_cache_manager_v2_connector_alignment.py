@@ -42,7 +42,7 @@ def _manager(*, backoff: int, partial_reuse: bool, connector) -> KVCacheManagerV
     return manager
 
 
-def _connector(whole_blocks: bool) -> SimpleNamespace:
+def _connector(whole_blocks) -> SimpleNamespace:
     return SimpleNamespace(worker=SimpleNamespace(requires_block_aligned_reuse=whole_blocks))
 
 
@@ -57,6 +57,9 @@ def _connector(whole_blocks: bool) -> SimpleNamespace:
         # A connector that serves from any position needs nothing.
         (1, False, _connector(False), 1),
         (1, False, SimpleNamespace(worker=object()), 1),
+        # Only an explicit declaration counts, not any truthy attribute such
+        # as the one a MagicMock worker answers with.
+        (1, False, _connector("yes"), 1),
         (1, False, None, 1),
     ],
     ids=[
@@ -65,6 +68,7 @@ def _connector(whole_blocks: bool) -> SimpleNamespace:
         "partial_reuse",
         "token_granular_connector",
         "connector_without_the_attribute",
+        "truthy_non_bool_declaration",
         "no_connector",
     ],
 )
