@@ -6553,7 +6553,29 @@ class PyExecutor:
         request.py_csa2_remote_tail_start = remote_tail_start
         request.py_csa2_remote_tail_split = split
 
+    def _validate_connector_request(self, request: LlmRequest) -> None:
+        """Refuse work a speculative-prefill-only KV connector cannot serve.
+
+        Such a connector runs next to one-model speculation on context-only
+        requests alone (`KvCacheConnectorManager.speculative_prefill_only`),
+        and the manager raises inside resource preparation for anything
+        else, which would take the whole executor down. Refusing it at
+        admission fails only that request, e.g. a `/health_generate` probe
+        sent straight to a disaggregated context server.
+        """
+        if not self._kv_connector_moves_kv:
+            return
+        if getattr(self.kv_connector_manager, "speculative_prefill_only",
+                   False) is not True:
+            return
+        if getattr(request, "is_context_only_request", False) is not True:
+            raise ValueError(
+                "This server's KV cache connector runs next to one-model "
+                "speculative decoding and accepts context-only "
+                "(disaggregated prefill) requests only.")
+
     def _validate_request(self, request: LlmRequest):
+        self._validate_connector_request(request)
         self._configure_csa2_remote_tail(request)
         if (isinstance(self.kv_cache_manager, KVCacheManagerV2)
                 and request.kv_cache_retention_config is not None):
