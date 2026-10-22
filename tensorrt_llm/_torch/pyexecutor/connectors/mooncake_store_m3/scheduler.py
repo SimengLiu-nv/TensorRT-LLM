@@ -65,7 +65,9 @@ class _RequestState:
         self.tokens: List[int] = []
         #: Page slot index per block ordinal, per layer group.
         self.pages: Dict[int, List[int]] = {}
-        #: First block ordinal not yet considered for saving.
+        #: First block ordinal not yet handed to the store. Blocks a pass bound
+        #: for saving count only once the worker queued them; see
+        #: `MooncakeStoreConnectorScheduler._confirm_submitted_saves`.
         self.saved_upto = 0
         #: The offer made by `get_num_new_matched_tokens`, in block ordinals.
         self.load_first_block = 0
@@ -108,6 +110,9 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         # that offer is loaded synchronously instead; see `local_reuse_backoff`.
         self._sync_single_block_offers = self._async_load and local_reuse_backoff() == "align"
         self._pending_async_loads: List[RequestTransfers] = []
+        # Saves bound in the last metadata, by request: the block ordinal they
+        # end at. Settled by `_confirm_submitted_saves` at the next build.
+        self._unconfirmed_saves: Dict[int, int] = {}
 
         logger.info(
             f"mooncake-store scheduler adapter ready (role={self._config.role.value}, "
@@ -262,6 +267,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> MooncakeStoreMetadata:
         """Turn this iteration's scheduled requests into load and save lists."""
+        self._confirm_submitted_saves()
         metadata = MooncakeStoreMetadata()
         # Offers parked during this scheduling pass; see `update_state_after_alloc_by_layer_group`.
         metadata.async_loads, self._pending_async_loads = self._pending_async_loads, []
@@ -297,10 +303,14 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             state.load_blocks = 0
 
             if self._config.role.saves:
-                saves = self._saves_for(state, request_data, num_loaded_tokens)
+                saves, saves_end = self._saves_for(state, request_data, num_loaded_tokens)
                 if saves.pages:
                     state.emitted_saves = True
                     metadata.saves.append(saves)
+                    self._unconfirmed_saves[request_data.request_id] = saves_end
+                else:
+                    # Nothing publishable in the range, so nothing to confirm.
+                    state.saved_upto = max(state.saved_upto, saves_end)
         return metadata
 
     def request_finished(self, request: LlmRequest, cache_block_ids: List[int]) -> bool:
@@ -337,8 +347,27 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         are saved again rather than treated as already stored.
         """
         self._requests.pop(request_id, None)
+        self._unconfirmed_saves.pop(request_id, None)
 
     # ---- internals ----
+
+    def _confirm_submitted_saves(self) -> None:
+        """Count the last metadata's saves as stored once the worker queued them.
+
+        A pass can be bound and then never run: under attention DP a rank whose
+        batch the connector emptied may fail to pad, and the fleet-wide veto
+        then skips the forward pass and `wait_for_save` on every rank. Its
+        blocks were not computed, so they must be emitted again when the
+        request is next scheduled instead of being recorded as stored.
+        """
+        if not self._unconfirmed_saves:
+            return
+        submitted = self._require_worker().take_submitted_saves()
+        for request_id, saves_end in self._unconfirmed_saves.items():
+            state = self._requests.get(request_id)
+            if state is not None and request_id in submitted:
+                state.saved_upto = max(state.saved_upto, saves_end)
+        self._unconfirmed_saves.clear()
 
     def _require_worker(self) -> MooncakeStoreConnectorWorker:
         if self._worker is None:
@@ -393,7 +422,12 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
 
     def _saves_for(
         self, state: _RequestState, request_data: RequestData, num_loaded_tokens: int
-    ) -> RequestTransfers:
+    ) -> Tuple[RequestTransfers, int]:
+        """This pass's newly computed full blocks, and the block ordinal they end at.
+
+        The save mark is left alone; the caller advances it once the saves are
+        known to have been handed to the store.
+        """
         transfers = RequestTransfers(request_data.request_id)
         # Prompt hashes are known before prefill. Capacity and scratch pages
         # can also run ahead of computation. The worker waits for this forward
@@ -406,8 +440,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         limit = min(self._addressable_blocks(state), computed_end // self._tokens_per_block)
         for block in range(state.saved_upto, limit):
             self._append_pages(state, transfers, block)
-        state.saved_upto = max(state.saved_upto, limit)
-        return transfers
+        return transfers, max(state.saved_upto, limit)
 
     def _append_pages(self, state: _RequestState, transfers: RequestTransfers, block: int) -> None:
         """Add one block's page from every layer group, or none of them."""

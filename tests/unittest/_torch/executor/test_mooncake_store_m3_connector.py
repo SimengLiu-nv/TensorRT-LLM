@@ -696,6 +696,37 @@ def test_worker_failed_load_drops_that_requests_saves_from_the_pass(store_config
         assert [transfers.request_id for transfers in metadata.saves] == [7]
 
 
+def test_worker_reports_the_saves_it_queued(store_config, fake_store, monkeypatch):
+    """Only saves `wait_for_save` handed to the save thread are reported, once."""
+
+    class FakeEvent:
+        def record(self, stream):
+            pass
+
+        def synchronize(self):
+            pass
+
+    monkeypatch.setattr(worker_module.torch.cuda, "Event", FakeEvent)
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as worker:
+        # Bound but never run: nothing is reported.
+        worker.bind_connector_meta(
+            SimpleNamespace(
+                loads=[], saves=[RequestTransfers(5, [PageTransfer(b"\x05" * 16, 0, 1)])]
+            )
+        )
+        assert worker.take_submitted_saves() == set()
+
+        saves = [
+            RequestTransfers(7, [PageTransfer(b"\x07" * 16, 0, 2)]),
+            RequestTransfers(8, [PageTransfer(b"\x08" * 16, 0, 3)]),
+        ]
+        worker.bind_connector_meta(SimpleNamespace(loads=[], saves=saves))
+        assert worker.drop_bound_saves([8]) == 1
+        worker.wait_for_save(None)
+        assert worker.take_submitted_saves() == {7}
+        assert worker.take_submitted_saves() == set()
+
+
 def test_worker_drops_bound_saves_of_a_restarted_request_even_when_it_was_the_whole_batch(
     store_config, fake_store
 ):
@@ -1039,15 +1070,25 @@ def test_staging_narrows_the_batch_to_the_budget(store_config, fake_store, stage
 
 
 class FakeWorker:
-    """Stands in for the process-local worker's lookup service."""
+    """Stands in for the process-local worker's lookup and save handoff."""
 
     def __init__(self, hit_blocks=0):
         self.hit_blocks = hit_blocks
         self.queries = []
+        self.submitted = set()
 
     def count_prefix_hit(self, block_hashes):
         self.queries.append(list(block_hashes))
         return min(self.hit_blocks, len(block_hashes))
+
+    def take_submitted_saves(self):
+        submitted, self.submitted = self.submitted, set()
+        return submitted
+
+
+def submit_saves(scheduler: MooncakeStoreConnectorScheduler, metadata) -> None:
+    """What `wait_for_save` reports once the pass's forward has been enqueued."""
+    scheduler._worker.submitted = {transfers.request_id for transfers in metadata.saves}
 
 
 def make_scheduler(
@@ -1149,6 +1190,7 @@ def test_scheduler_does_not_resave_blocks_across_iterations(store_config: Path) 
         SchedulerOutput(new_requests=[request_data(1, tokens, [4, 5])])
     )
     assert [page.page_index for page in first.saves[0].pages] == [4, 5]
+    submit_saves(scheduler, first)
 
     # A generation step completes one more block; only that block is saved.
     more_tokens = list(range(2 * TOKENS_PER_BLOCK, 3 * TOKENS_PER_BLOCK))
@@ -1160,6 +1202,66 @@ def test_scheduler_does_not_resave_blocks_across_iterations(store_config: Path) 
         )
     )
     assert [page.page_index for page in second.saves[0].pages] == [6]
+
+
+def test_scheduler_resaves_blocks_of_a_pass_that_never_ran(store_config: Path) -> None:
+    """Saves bound for a vetoed forward pass are emitted again, not recorded as stored."""
+    scheduler = make_scheduler(store_config, hit_blocks=0)
+    tokens = list(range(2 * TOKENS_PER_BLOCK))
+    scheduler.get_num_new_matched_tokens(make_request(1, tokens), 0)
+    first = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, [4, 5])])
+    )
+    assert [page.page_index for page in first.saves[0].pages] == [4, 5]
+
+    # The pass was vetoed after binding, so `wait_for_save` never queued it.
+    # The request is scheduled again from the same position.
+    retry = request_data(1, [], [], num_scheduled_tokens=2 * TOKENS_PER_BLOCK)
+    again = scheduler.build_connector_meta(SchedulerOutput(cached_requests=[retry]))
+    assert [page.page_index for page in again.saves[0].pages] == [4, 5]
+    submit_saves(scheduler, again)
+
+    more_tokens = list(range(2 * TOKENS_PER_BLOCK, 3 * TOKENS_PER_BLOCK))
+    after = scheduler.build_connector_meta(
+        SchedulerOutput(
+            cached_requests=[
+                request_data(1, more_tokens, [6], computed_position=2 * TOKENS_PER_BLOCK)
+            ]
+        )
+    )
+    assert [page.page_index for page in after.saves[0].pages] == [6]
+
+
+def test_scheduler_confirms_only_the_saves_the_worker_queued(store_config: Path) -> None:
+    """A request dropped from the bound saves keeps its blocks unsaved."""
+    scheduler = make_scheduler(store_config, hit_blocks=0)
+    tokens = list(range(TOKENS_PER_BLOCK))
+    for request_id in (1, 2):
+        scheduler.get_num_new_matched_tokens(make_request(request_id, tokens), 0)
+    first = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, [4]), request_data(2, tokens, [8])])
+    )
+    assert [transfers.request_id for transfers in first.saves] == [1, 2]
+    scheduler._worker.submitted = {1}
+
+    retry = [
+        request_data(request_id, [], [], num_scheduled_tokens=TOKENS_PER_BLOCK)
+        for request_id in (1, 2)
+    ]
+    again = scheduler.build_connector_meta(SchedulerOutput(cached_requests=retry))
+    assert [transfers.request_id for transfers in again.saves] == [2]
+    assert [page.page_index for page in again.saves[0].pages] == [8]
+
+
+def test_scheduler_forgets_unconfirmed_saves_of_a_reset_request(store_config: Path) -> None:
+    scheduler = make_scheduler(store_config, hit_blocks=0)
+    tokens = list(range(TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+    scheduler.build_connector_meta(SchedulerOutput(new_requests=[request_data(1, tokens, [4])]))
+    assert scheduler._unconfirmed_saves == {1: 1}
+    scheduler.request_reset(request)
+    assert scheduler._unconfirmed_saves == {}
 
 
 def test_scheduler_waits_for_a_block_to_fill_before_saving(store_config):
@@ -1191,6 +1293,7 @@ def test_scheduler_publishes_only_computed_full_blocks(store_config: Path) -> No
         data = request_data(1, [], [], computed_position=computed, num_scheduled_tokens=scheduled)
         metadata = scheduler.build_connector_meta(SchedulerOutput(cached_requests=[data]))
         assert [page.page_index for page in metadata.saves[0].pages] == [4 + ordinal]
+        submit_saves(scheduler, metadata)
 
 
 @pytest.mark.parametrize("local_blocks", [0, 1])
@@ -1218,6 +1321,7 @@ def test_scheduler_saves_computed_tail_after_restore(
         11 + local_blocks,
     ]
     assert [page.page_index for page in metadata.saves[0].pages] == [10 + tail_block]
+    submit_saves(scheduler, metadata)
 
     # A later chunk includes the restored prefix in its position. Count the
     # restore only once, and wait for this partial page to become complete.

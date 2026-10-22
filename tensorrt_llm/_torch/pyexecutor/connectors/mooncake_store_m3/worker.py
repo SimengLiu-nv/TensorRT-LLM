@@ -264,6 +264,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # Requests the runtime has told us are done producing KV. Their pages
         # stay pinned until we report them back through `get_finished`.
         self._closed_requests: Set[int] = set()
+        # Requests whose saves the last `wait_for_save` queued. The scheduler
+        # adapter takes them at its next `build_connector_meta` and only then
+        # counts those blocks as saved; see `take_submitted_saves`. Executor
+        # thread only.
+        self._submitted_saves: Set[int] = set()
         self._save_error: Optional[BaseException] = None
         # A page offered at lookup can be gone by the time it is loaded (evicted
         # from a full pool, or its put never completed). Every attention-DP
@@ -903,6 +908,20 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             for transfers in metadata.saves:
                 self._outstanding_saves[transfers.request_id] += 1
         self._save_queue.put((event, list(metadata.saves)))
+        # Replaced rather than accumulated: only the TP leader's adapter ever
+        # takes these, so the other ranks must not grow the set every pass.
+        self._submitted_saves = {transfers.request_id for transfers in metadata.saves}
+
+    def take_submitted_saves(self) -> Set[int]:
+        """Requests whose saves the last `wait_for_save` handed to the save thread.
+
+        A pass whose forward never ran (the executor vetoed it after binding
+        the metadata) never reaches `wait_for_save`, and a request dropped from
+        the bound saves is not queued either. The scheduler adapter re-emits
+        such saves instead of treating them as stored. Cleared on return.
+        """
+        submitted, self._submitted_saves = self._submitted_saves, set()
+        return submitted
 
     def get_finished(
         self, finished_gen_req_ids: List[int], started_loading_req_ids: List[int]
