@@ -3119,14 +3119,15 @@ class KVCacheManagerV2(BaseResourceManager):
         everything after it. Any other configuration keeps token-granular reuse.
 
         The connector is read through `getattr` because tests build partial
-        managers that never bind one.
+        managers that never bind one, and only an explicit True declaration
+        counts, so a test double's truthy attribute leaves reuse unchanged.
         """
         if self.reuse_match_backoff <= 0 or self.enable_partial_reuse:
             return 1
         connector = getattr(self, "kv_connector_manager", None)
-        if connector is None or not getattr(
-            connector.worker, "requires_block_aligned_reuse", False
-        ):
+        if connector is None:
+            return 1
+        if getattr(connector.worker, "requires_block_aligned_reuse", False) is not True:
             return 1
         return self._ledger_tokens_per_block
 
