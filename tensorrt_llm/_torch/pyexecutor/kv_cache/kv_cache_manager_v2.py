@@ -3707,6 +3707,19 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         self._after_shrink(request_id, kv_cache)
 
+    def drop_context_allocation(self, req: LlmRequest) -> None:
+        """Give up a context request's allocation and progress; it restarts from scratch.
+
+        For a request that was skipped past a connector prefix whose pages then
+        could not be filled: those positions already count as computed, so the
+        request cannot run this iteration and the only correct outcome is to
+        recompute them. Same rewind as the drop branch of
+        ``revert_allocate_context``; the scheduler re-admits the request from
+        whatever the radix tree still holds, and the connector is asked again.
+        """
+        self.free_resources(req)
+        rewind_context_after_cache_drop(req, self.tokens_per_block)
+
     def revert_allocate_context(self, req: LlmRequest) -> bool:
         """Undo this iteration's context resize. False means the cache was dropped,
         not shrunk (history outran pre-resize capacity); the caller drops any draft pool.

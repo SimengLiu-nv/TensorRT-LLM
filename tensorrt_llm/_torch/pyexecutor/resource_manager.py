@@ -3202,7 +3202,19 @@ class ResourceManager:
             kv_cache_manager.maybe_fit_token_budget(scheduled_batch)
 
     @nvtx_range("prepare_resources")
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(self,
+                          scheduled_batch: ScheduledRequests,
+                          *,
+                          publish_connector_output: bool = True) -> None:
+        """Prepare every manager's resources for the scheduled batch.
+
+        Args:
+            scheduled_batch: The batch about to run.
+            publish_connector_output: Report the batch to the KV cache
+                connector. Off only for a batch that was already reported this
+                iteration and has since gained a padding request, since a second
+                report would replace the connector metadata about to be bound.
+        """
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
                 resource_manager.prepare_resources(scheduled_batch)
@@ -3214,7 +3226,8 @@ class ResourceManager:
         # run. See `report_batch_to_connector`.
         kv_cache_manager = self.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if hasattr(kv_cache_manager, "report_batch_to_connector"):
+        if publish_connector_output and hasattr(kv_cache_manager,
+                                                "report_batch_to_connector"):
             kv_cache_manager.report_batch_to_connector(scheduled_batch)
 
     @nvtx_range("update_resources")

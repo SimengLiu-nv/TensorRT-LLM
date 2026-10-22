@@ -24,7 +24,8 @@ from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
                                           GuidedDecodingConfig, KvCacheConfig,
-                                          SpeculativeConfig, TorchLlmArgs)
+                                          MTPDecodingConfig, SpeculativeConfig,
+                                          TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
                                            _xgrammar_tokenizer_info)
@@ -430,6 +431,32 @@ def log_memory_usage(stage: str):
     logger.info(
         f"Memory used at {stage} (outside torch) in memory usage profiling: {((total_used_bytes - model_bytes) if total_used_bytes > model_bytes else 0) / (GB):.2f} GiB"
     )
+
+
+#: The connector preset that runs under attention DP and next to one-model
+#: speculative decoding on a disaggregated prefill server. Every other
+#: connector keeps the rejections below.
+_ADP_SPEC_PREFILL_CONNECTOR = "mooncake-store-m3"
+
+
+def _connector_runs_speculative_prefill_only(spec_config, kv_connector_config,
+                                             cache_transceiver_config) -> bool:
+    """Whether a connector may run alongside speculative decoding.
+
+    Context-only requests on a disaggregated prefill server never reject draft
+    tokens, so the append-only page deltas the connector relies on stay valid
+    there. That holds for one-model drafting, MTP and EAGLE3 alike: the draft
+    KV lives in the target pool, which is registered with the connector.
+    Generation work is refused at the connector boundary
+    (`KvCacheConnectorManager.speculative_prefill_only`).
+    """
+    if spec_config is None:
+        return False
+    one_model_draft = (isinstance(spec_config, MTPDecodingConfig)
+                       or spec_config.spec_dec_mode.is_eagle3_one_model())
+    return (one_model_draft
+            and uses_connector(kv_connector_config, _ADP_SPEC_PREFILL_CONNECTOR)
+            and is_disagg_enabled(cache_transceiver_config))
 
 
 def _move_model_engine_metrics(py_executor: PyExecutor,
@@ -980,12 +1007,19 @@ def _create_py_executor(
         # manager that was actually built.
         v2_selection = kv_cache_config.use_kv_cache_manager_v2
 
+        speculative_prefill_only = _connector_runs_speculative_prefill_only(
+            spec_config, kv_connector_config, cache_transceiver_config)
+        connector_attention_dp = (mapping.enable_attention_dp
+                                  and uses_connector(
+                                      kv_connector_config,
+                                      _ADP_SPEC_PREFILL_CONNECTOR))
+
         # Rejected draft tokens shrink a request's page list, and the freed slot
         # goes to whichever request allocates next. The connector is only told
         # about pages appended since the last report, so it would keep
         # addressing a slot another request now owns.
         if (spec_config is not None and spec_config.max_draft_len > 0
-                and v2_selection is True):
+                and v2_selection is True and not speculative_prefill_only):
             raise NotImplementedError(
                 "KV connector is not supported with speculative decoding. "
                 "Disable speculative decoding to run a connector.")
@@ -1001,7 +1035,7 @@ def _create_py_executor(
                 "that implements the per-layer-group APIs, or use a single attention window."
             )
 
-        if mapping.enable_attention_dp:
+        if mapping.enable_attention_dp and not connector_attention_dp:
             raise NotImplementedError(
                 "KV connector is not supported with attention data parallelism (enable_attention_dp=True)."
             )
@@ -1014,6 +1048,14 @@ def _create_py_executor(
             scheduler_cls = getattr(
                 module, kv_connector_config.connector_scheduler_class)
 
+            if connector_attention_dp:
+                if mapping.pp_size != 1 or mapping.cp_size != 1:
+                    raise NotImplementedError(
+                        "A KV connector under attention DP requires PP=1 and CP=1."
+                    )
+                KvCacheConnectorManager.validate_attention_dp(
+                    worker_cls, scheduler_cls)
+
             rank = tensorrt_llm.mpi_rank()
             # Some connector API implementations may need to establish out-of-band communication between the scheduler and workers.
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
@@ -1021,7 +1063,9 @@ def _create_py_executor(
             with ThreadPoolExecutor(max_workers=2) as executor:
                 connector_worker_task = executor.submit(worker_cls, llm_args)
 
-                if scheduler_cls is not None and rank == 0:
+                # Under attention DP every rank schedules its own requests.
+                if scheduler_cls is not None and (rank == 0
+                                                  or connector_attention_dp):
                     connector_scheduler_task = executor.submit(
                         scheduler_cls, llm_args)
                     connector_scheduler = connector_scheduler_task.result()
@@ -1037,7 +1081,10 @@ def _create_py_executor(
                     forward_pass_callable)
 
             kv_connector_manager = KvCacheConnectorManager(
-                connector_worker, connector_scheduler)
+                connector_worker,
+                connector_scheduler,
+                enable_attention_dp=connector_attention_dp,
+                speculative_prefill_only=speculative_prefill_only)
 
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")
@@ -1065,6 +1112,19 @@ def _create_py_executor(
             if not kv_connector_manager.capacity_only:
                 mooncake_settings.apply_transferring_role_overrides(
                     kv_cache_config)
+
+        if (kv_cache_config.enable_partial_reuse and uses_connector(
+                kv_connector_config, _ADP_SPEC_PREFILL_CONNECTOR)):
+            # The KV cache manager is built after this and reads the flag.
+            logger.warning(
+                "Disabling partial reuse: it is not usable with the "
+                f"{_ADP_SPEC_PREFILL_CONNECTOR} connector. The store is "
+                "addressed by whole blocks, so a partial device match leaves "
+                "the matched length off a block boundary and the connector "
+                "declines the lookup rather than resume a block from the "
+                "middle. Partial reuse therefore trades part of one block for "
+                "every stored block of the remaining prefix.")
+            kv_cache_config.enable_partial_reuse = False
     else:
         kv_connector_manager = None
 
