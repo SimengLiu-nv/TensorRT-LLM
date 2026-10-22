@@ -350,6 +350,28 @@ def test_speculative_prefill_rejects_generation_before_transfer_scheduling() -> 
     assert manager.scheduler_output_manager.requests == {}
 
 
+@pytest.mark.parametrize("prefill_only", [False, True])
+@pytest.mark.parametrize("context_only", [False, True])
+def test_speculative_prefill_refuses_other_requests_at_admission(
+    prefill_only: bool, context_only: bool
+) -> None:
+    """Only the refused request fails; the executor never reaches resource preparation."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    manager = _manager()
+    manager.speculative_prefill_only = prefill_only
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = manager
+    request = _request(7)
+    request.is_context_only_request = context_only
+
+    if prefill_only and not context_only:
+        with pytest.raises(ValueError, match="context-only"):
+            executor._validate_request(request)
+    else:
+        executor._validate_connector_request(request)
+
+
 def test_reset_drops_scheduler_output_state(forbid_connector_collectives: None) -> None:
     """A released allocation is reported to the adapter as a new request when it reruns."""
     manager = _manager()
