@@ -859,7 +859,8 @@
         "lmcache",
         "lmcache-mp",
         "kvbm",
-        "mooncake-store"
+        "mooncake-store",
+        "mooncake-store-m3"
       ],
       "capture_policy": "allowlist|none",
       "kind": "categorical",
