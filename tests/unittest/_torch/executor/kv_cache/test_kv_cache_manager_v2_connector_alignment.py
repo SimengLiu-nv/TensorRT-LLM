@@ -1,0 +1,81 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""When KVCacheManagerV2 aligns its reuse matches for a whole-block connector.
+
+A one-model draft's lookahead backoff trims a local match of whole blocks to a
+few tokens short of a boundary, and a connector that serves only from a block
+boundary could then offer nothing. The manager asks the core to align the
+match only when that combination is actually present.
+"""
+
+from types import SimpleNamespace
+
+import pytest
+
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+pytestmark = pytest.mark.cpu_only
+
+TOKENS_PER_BLOCK = 128
+
+
+def _manager(*, backoff: int, partial_reuse: bool, connector) -> KVCacheManagerV2:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.reuse_match_backoff = backoff
+    manager.enable_partial_reuse = partial_reuse
+    manager._ledger_tokens_per_block = TOKENS_PER_BLOCK
+    if connector is not None:
+        manager.kv_connector_manager = connector
+    return manager
+
+
+def _connector(whole_blocks: bool) -> SimpleNamespace:
+    return SimpleNamespace(worker=SimpleNamespace(requires_block_aligned_reuse=whole_blocks))
+
+
+@pytest.mark.parametrize(
+    "backoff, partial_reuse, connector, expected",
+    [
+        (1, False, _connector(True), TOKENS_PER_BLOCK),
+        # No backoff: matches of whole blocks already end on a boundary.
+        (0, False, _connector(True), 1),
+        # Partial reuse wants token-granular matches by definition.
+        (1, True, _connector(True), 1),
+        # A connector that serves from any position needs nothing.
+        (1, False, _connector(False), 1),
+        (1, False, SimpleNamespace(worker=object()), 1),
+        (1, False, None, 1),
+    ],
+    ids=[
+        "whole_block_connector_with_backoff",
+        "no_backoff",
+        "partial_reuse",
+        "token_granular_connector",
+        "connector_without_the_attribute",
+        "no_connector",
+    ],
+)
+def test_reuse_match_alignment(backoff, partial_reuse, connector, expected):
+    manager = _manager(backoff=backoff, partial_reuse=partial_reuse, connector=connector)
+    assert manager._connector_reuse_match_alignment() == expected
+
+
+def test_a_manager_without_a_bound_connector_attribute_keeps_token_granularity():
+    """Tests and specialized managers build partial instances that never bind one."""
+    manager = object.__new__(KVCacheManagerV2)
+    manager.reuse_match_backoff = 1
+    manager.enable_partial_reuse = False
+    manager._ledger_tokens_per_block = TOKENS_PER_BLOCK
+    assert manager._connector_reuse_match_alignment() == 1
