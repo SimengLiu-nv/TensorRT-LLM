@@ -368,9 +368,18 @@ class LaunchedMaster:
             self.process.wait()
 
 
-def _launch_master(pool: Any, run_dir: str) -> LaunchedMaster:
-    """Start a master on this host and wait for it to answer."""
-    binary = os.getenv(MASTER_BINARY_ENV) or DEFAULT_MASTER_BINARY
+def _launch_master(pool: Any, run_dir: str, binary: Optional[str] = None) -> LaunchedMaster:
+    """Start a master on this host and wait for it to answer.
+
+    Args:
+        pool: A `MooncakeStoreM3Config` naming the master's ports.
+        run_dir: Where the master's log goes.
+        binary: The executable to run. Defaults to `TRTLLM_MOONCAKE_MASTER_BINARY`,
+            else `mooncake_master` on PATH. A wrapper that appends master flags
+            this command does not expose, such as the eviction high watermark,
+            goes here.
+    """
+    binary = binary or os.getenv(MASTER_BINARY_ENV) or DEFAULT_MASTER_BINARY
     resolved = shutil.which(binary)
     if resolved is None:
         raise FileNotFoundError(
@@ -466,7 +475,7 @@ def _address_files(run_dir: str, extra: Optional[str] = None) -> List[str]:
 
 @contextlib.contextmanager
 def running_master(
-    pool: Any, run_dir: str, address_file: Optional[str] = None
+    pool: Any, run_dir: str, address_file: Optional[str] = None, binary: Optional[str] = None
 ) -> Iterator[LaunchedMaster]:
     """Run a master whose lifetime is this process's rather than an engine's.
 
@@ -476,10 +485,11 @@ def running_master(
 
     `address_file` receives `host:port` once the master answers, so workers can
     name the file instead of an address nobody knows until the scheduler has
-    placed this process. One is written to `run_dir` either way.
+    placed this process. One is written to `run_dir` either way. `binary`
+    overrides the master executable; see `_launch_master`.
     """
     os.makedirs(run_dir, exist_ok=True)
-    master = _launch_master(pool, run_dir)
+    master = _launch_master(pool, run_dir, binary)
     try:
         with _published_address(master.address, _address_files(run_dir, address_file)):
             yield master

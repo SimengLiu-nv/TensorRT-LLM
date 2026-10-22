@@ -51,6 +51,7 @@ from tensorrt_llm.commands._config_overrides import (ConfigOverride,
                                                      parse_config_overrides)
 from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.mooncake import mooncake_master, mooncake_pool_report
+from tensorrt_llm.commands.mooncake_m3 import mooncake_donor, mooncake_master_m3
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
@@ -497,6 +498,9 @@ def _provision_kv_cache_pool(llm_args: dict,
     Only the process that owns the engine does this. An attached frontend
     re-execs this command line but shares the launcher's executor, so it would
     otherwise render a second client config over the first.
+
+    Each Mooncake connector package provisions only its own pool and is a
+    no-op for every other connector, so both are entered unconditionally.
     """
     if not owns_engine:
         yield
@@ -504,6 +508,8 @@ def _provision_kv_cache_pool(llm_args: dict,
 
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import \
         maybe_provision_pool
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store_m3 import \
+        maybe_provision_pool as maybe_provision_m3_pool
 
     connector_config = llm_args.get("kv_connector_config")
     if isinstance(connector_config, dict):
@@ -513,7 +519,8 @@ def _provision_kv_cache_pool(llm_args: dict,
         connector_config = KvCacheConnectorConfig(**connector_config)
         llm_args["kv_connector_config"] = connector_config
 
-    with maybe_provision_pool(connector_config):
+    with maybe_provision_pool(connector_config), \
+            maybe_provision_m3_pool(connector_config):
         yield
 
 
@@ -2804,6 +2811,10 @@ main = DefaultGroup(
         # server, and the report of what they collectively contributed to it.
         "mooncake_master": mooncake_master,
         "mooncake_pool_report": mooncake_pool_report,
+        # The same for the mooncake-store-m3 connector: its master, and the
+        # capacity a node with no connector lends to that pool.
+        "mooncake_master_m3": mooncake_master_m3,
+        "mooncake_donor": mooncake_donor,
     })
 
 if __name__ == "__main__":
