@@ -4564,9 +4564,11 @@ class PyExecutor:
             setattr(scheduled_batch, key, kept)
         for req in dropped:
             self._restart_failed_connector_load(req)
-        logger.warning(
-            f"kv connector: {len(dropped)} context request(s) restarted after a "
-            f"failed prefix load: {[req.request_id for req in dropped]}")
+        if dropped:
+            logger.warning(
+                f"kv connector: {len(dropped)} context request(s) restarted "
+                f"after a failed prefix load: "
+                f"{[req.request_id for req in dropped]}")
         self._pad_attention_dp_batch_emptied_by_connector(scheduled_batch)
 
     def _restart_failed_connector_load(self, req: LlmRequest) -> None:
@@ -4604,9 +4606,11 @@ class PyExecutor:
             self._restart_failed_connector_load(req)
             req.state = LlmRequestState.CONTEXT_INIT
             restarted.append(request_id)
-        logger.warning(
-            f"kv connector: {len(restarted)} parked context request(s) "
-            f"restarted after a failed asynchronous prefix load: {restarted}")
+        if restarted:
+            logger.warning(
+                f"kv connector: {len(restarted)} parked context request(s) "
+                f"restarted after a failed asynchronous prefix load: "
+                f"{restarted}")
 
     def _defer_connector_load_cancellations(self) -> None:
         # A cancelled load must drain without becoming schedulable again.

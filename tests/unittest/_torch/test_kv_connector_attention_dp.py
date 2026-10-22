@@ -455,6 +455,23 @@ def test_failed_async_load_restarts_the_parked_request() -> None:
     assert manager.should_add_sequence(req)
 
 
+def test_failed_async_load_of_a_finished_request_restarts_nothing_silently() -> None:
+    """A failure reported for a request that already left is not a restart."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm.logger import logger
+
+    manager = _manager()
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = manager
+    executor.kv_cache_manager = MagicMock()
+
+    with patch.object(logger, "warning") as warning:
+        executor._recover_failed_async_loads({9})
+
+    executor.kv_cache_manager.drop_context_allocation.assert_not_called()
+    warning.assert_not_called()
+
+
 def test_cancel_waits_for_connector_load(forbid_connector_collectives: None) -> None:
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
