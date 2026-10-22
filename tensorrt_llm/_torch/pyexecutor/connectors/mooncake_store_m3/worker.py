@@ -204,6 +204,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     """Moves KV pages between this rank's GPU cache and the Mooncake pool."""
 
     supports_attention_dp = True
+    #: A page offered at lookup can be gone by load time. Under attention DP or
+    #: on a single rank the affected requests are handed back to the executor
+    #: to restart (`take_failed_load_requests`); under tensor parallelism the
+    #: load raises instead, since the ranks cannot agree on a restart.
+    reports_failed_loads = True
     #: Pages are stored and offered by whole block, so a local prefix match has
     #: to end on a block boundary for the store to extend it. Read by
     #: `KVCacheManagerV2`, which aligns its reuse matches when a one-model

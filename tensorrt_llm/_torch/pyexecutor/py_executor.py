@@ -1252,7 +1252,11 @@ class PyExecutor:
                     "list has no notion of beams, so non-leading beams would "
                     "save and restore the wrong KV state.")
 
-            connector_attention_dp = self.kv_connector_manager.enable_attention_dp
+            # Compared against True, like `capacity_only`: these lift guards,
+            # which is too much to infer from a merely truthy value.
+            connector_attention_dp = getattr(self.kv_connector_manager,
+                                             "enable_attention_dp",
+                                             False) is True
             if self.enable_attention_dp and not connector_attention_dp:
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with attention data "
@@ -1272,8 +1276,9 @@ class PyExecutor:
             is_kv_cache_manager_v2 = isinstance(self.kv_cache_manager,
                                                 KVCacheManagerV2)
 
-            speculative_prefill_only = (
-                self.kv_connector_manager.speculative_prefill_only)
+            speculative_prefill_only = getattr(self.kv_connector_manager,
+                                               "speculative_prefill_only",
+                                               False) is True
             if (is_kv_cache_manager_v2 and self.max_draft_len > 0
                     and not speculative_prefill_only):
                 raise NotImplementedError(
@@ -1327,7 +1332,8 @@ class PyExecutor:
                     "is registered with a single primary pool, but VSWA "
                     "models allocate one pool per window size.")
 
-            if speculative_prefill_only and self.draft_kv_cache_manager is not None:
+            if (speculative_prefill_only and getattr(
+                    self, "draft_kv_cache_manager", None) is not None):
                 raise NotImplementedError(
                     "KV Cache Connector with one-model speculative prefill "
                     "requires the draft layers to share the target KV cache. "
@@ -4553,9 +4559,21 @@ class PyExecutor:
             self.kv_connector_manager.mark_prefix_loads_dispatched()
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
-            failed = self.kv_connector_manager.take_failed_load_requests()
-            if failed:
-                self._recover_failed_connector_loads(scheduled_batch, failed)
+            if self._kv_connector_reports_failed_loads:
+                failed = self.kv_connector_manager.take_failed_load_requests()
+                if failed:
+                    self._recover_failed_connector_loads(
+                        scheduled_batch, failed)
+
+    @property
+    def _kv_connector_reports_failed_loads(self) -> bool:
+        """Whether the connector hands failed prefix loads back for a restart.
+
+        Read through `getattr` because some callers also run on the minimal
+        executors unit tests assemble.
+        """
+        return getattr(self.kv_connector_manager, "reports_failed_loads",
+                       False) is True
 
     def _pad_attention_dp_batch_emptied_by_connector(
             self, scheduled_batch: ScheduledRequests) -> None:
@@ -4569,7 +4587,8 @@ class PyExecutor:
         the connector was given this iteration's batch already, and a second
         report would replace the metadata it is about to bind.
         """
-        if not self.enable_attention_dp or scheduled_batch.batch_size != 0:
+        if getattr(self.kv_connector_manager, "enable_attention_dp",
+                   False) is not True or scheduled_batch.batch_size != 0:
             return
         self._pad_empty_attention_dp_batch(scheduled_batch)
         if scheduled_batch.batch_size:
@@ -4662,9 +4681,11 @@ class PyExecutor:
             for req in self.kv_connector_manager.take_finished_load_terminations(
             ):
                 self._finish_connector_load_termination(req)
-            failed = self.kv_connector_manager.take_failed_async_load_requests()
-            if failed:
-                self._recover_failed_async_loads(failed)
+            if self._kv_connector_reports_failed_loads:
+                failed = self.kv_connector_manager.take_failed_async_load_requests(
+                )
+                if failed:
+                    self._recover_failed_async_loads(failed)
 
     def _finish_connector_load_termination(self, request: LlmRequest) -> None:
         """Finish a cancelled load or reclaim a load whose error was reported."""
