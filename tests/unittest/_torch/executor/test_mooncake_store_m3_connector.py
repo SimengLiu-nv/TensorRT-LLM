@@ -47,8 +47,10 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store_m3.addressing impo
     merge_intervals,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store_m3.config import (
+    LOCAL_REUSE_BACKOFF_ENV,
     MooncakeStoreConnectorConfig,
     StoreRole,
+    local_reuse_backoff,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store_m3.keys import (
     BlockHashChain,
@@ -1425,6 +1427,24 @@ def test_tp_lookup_still_requires_all_attention_shards(
 def test_mooncake_declares_adp_support() -> None:
     assert MooncakeStoreConnectorScheduler.supports_attention_dp
     assert MooncakeStoreConnectorWorker.supports_attention_dp
+
+
+@pytest.mark.parametrize("value, drops", [(None, False), ("align", False), (" OFF ", True)])
+def test_worker_local_reuse_backoff_comes_from_the_environment(
+    store_config, fake_store, monkeypatch, value, drops
+):
+    if value is None:
+        monkeypatch.delenv(LOCAL_REUSE_BACKOFF_ENV, raising=False)
+    else:
+        monkeypatch.setenv(LOCAL_REUSE_BACKOFF_ENV, value)
+    with make_worker(fake_store) as worker:
+        assert worker.drops_reuse_match_backoff is drops
+
+
+def test_local_reuse_backoff_rejects_an_unknown_mode(monkeypatch):
+    monkeypatch.setenv(LOCAL_REUSE_BACKOFF_ENV, "partial")
+    with pytest.raises(ValueError, match=LOCAL_REUSE_BACKOFF_ENV):
+        local_reuse_backoff()
 
 
 def test_mooncake_asks_for_block_aligned_local_reuse() -> None:
