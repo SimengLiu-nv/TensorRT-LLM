@@ -1429,7 +1429,7 @@ def test_mooncake_declares_adp_support() -> None:
     assert MooncakeStoreConnectorWorker.supports_attention_dp
 
 
-@pytest.mark.parametrize("value, drops", [(None, False), ("align", False), (" OFF ", True)])
+@pytest.mark.parametrize("value, drops", [(None, True), ("align", False), (" OFF ", True)])
 def test_worker_local_reuse_backoff_comes_from_the_environment(
     store_config, fake_store, monkeypatch, value, drops
 ):
@@ -1820,6 +1820,56 @@ def test_scheduler_async_flat_alloc_is_a_single_group(store_config: Path) -> Non
     scheduler.update_state_after_alloc(request, [30, 31, 32, 33])
     (transfers,) = take_async_loads(scheduler)
     assert [(page.layer_group_id, page.page_index) for page in transfers.pages] == [(0, 30)]
+
+
+@pytest.mark.parametrize("mode", [None, "off"])
+def test_scheduler_single_block_offer_parks_without_alignment(
+    store_config: Path, monkeypatch, mode: str | None
+) -> None:
+    """The default local reuse mode keeps every store offer asynchronous, as on GB300."""
+    if mode is None:
+        monkeypatch.delenv(LOCAL_REUSE_BACKOFF_ENV, raising=False)
+    else:
+        monkeypatch.setenv(LOCAL_REUSE_BACKOFF_ENV, mode)
+    scheduler = make_async_scheduler(store_config, hit_blocks=1)
+    request = make_request(1, list(range(4 * TOKENS_PER_BLOCK)))
+    assert scheduler.get_num_new_matched_tokens(request, TOKENS_PER_BLOCK) == (
+        TOKENS_PER_BLOCK,
+        True,
+    )
+
+
+def test_scheduler_aligned_single_block_offer_loads_synchronously(
+    store_config: Path, monkeypatch
+) -> None:
+    """Under `align` the block a local match gave up is topped up without parking."""
+    monkeypatch.setenv(LOCAL_REUSE_BACKOFF_ENV, "align")
+    scheduler = make_async_scheduler(store_config, hit_blocks=1)
+    tokens = list(range(4 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    assert scheduler.get_num_new_matched_tokens(request, TOKENS_PER_BLOCK) == (
+        TOKENS_PER_BLOCK,
+        False,
+    )
+    request.py_num_connector_matched_tokens = TOKENS_PER_BLOCK
+    scheduler.update_state_after_alloc_by_layer_group(request, [[10, 11, 12, 13]])
+
+    data = request_data(
+        1,
+        tokens,
+        [10, 11, 12, 13],
+        computed_position=TOKENS_PER_BLOCK,
+        num_scheduled_tokens=2 * TOKENS_PER_BLOCK,
+    )
+    metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    assert metadata.async_loads == []
+    assert [page.page_index for page in metadata.loads[0].pages] == [11]
+    assert [page.page_index for page in metadata.saves[0].pages] == [12, 13]
+
+    # Longer offers still park the request.
+    request = make_request(2, tokens)
+    scheduler._worker.hit_blocks = 2
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (2 * TOKENS_PER_BLOCK, True)
 
 
 def test_scheduler_alloc_hooks_queue_nothing_for_synchronous_loads(store_config):
