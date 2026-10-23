@@ -3255,10 +3255,8 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if self.is_draft:
             return False
-        connector = getattr(self, "kv_connector_manager", None)
-        if connector is None:
-            return False
-        return getattr(connector.worker, "drops_reuse_match_backoff", False) is True
+        worker = getattr(getattr(self, "kv_connector_manager", None), "worker", None)
+        return getattr(worker, "drops_reuse_match_backoff", False) is True
 
     def _connector_reuse_match_alignment(self) -> int:
         """Alignment a whole-block KV connector needs of every local prefix match.
@@ -3271,16 +3269,15 @@ class KVCacheManagerV2(BaseResourceManager):
         Aligning trades the trimmed block for the connector serving it and
         everything after it. Any other configuration keeps token-granular reuse.
 
-        The connector is read through `getattr` because tests build partial
-        managers that never bind one, and only an explicit True declaration
-        counts, so a test double's truthy attribute leaves reuse unchanged.
+        The connector and its worker are read through `getattr` because tests
+        build partial managers that never bind one, or bind a connector double
+        without a worker, and only an explicit True declaration counts, so a
+        test double's truthy attribute leaves reuse unchanged.
         """
         if self.reuse_match_backoff <= 0 or self.enable_partial_reuse:
             return 1
-        connector = getattr(self, "kv_connector_manager", None)
-        if connector is None:
-            return 1
-        if getattr(connector.worker, "requires_block_aligned_reuse", False) is not True:
+        worker = getattr(getattr(self, "kv_connector_manager", None), "worker", None)
+        if getattr(worker, "requires_block_aligned_reuse", False) is not True:
             return 1
         return self._ledger_tokens_per_block
 
