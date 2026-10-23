@@ -37,15 +37,15 @@ MOONCAKE = KvCacheConnectorConfig(connector="mooncake-store-m3")
 DISAGG = CacheTransceiverConfig(backend="DEFAULT")
 
 
-def eagle3(one_model: bool) -> Eagle3DecodingConfig:
-    return Eagle3DecodingConfig(
-        max_draft_len=3, speculative_model="draft", eagle3_one_model=one_model
-    )
+def eagle3() -> Eagle3DecodingConfig:
+    # One-model is the only EAGLE3 mode on this branch (two-model speculation was retired), so the config has no
+    # eagle3_one_model field.
+    return Eagle3DecodingConfig(max_draft_len=3, speculative_model="draft")
 
 
 @pytest.mark.parametrize(
     "spec_config",
-    [MTPDecodingConfig(num_nextn_predict_layers=1), eagle3(one_model=True)],
+    [MTPDecodingConfig(num_nextn_predict_layers=1), eagle3()],
     ids=["mtp", "eagle3_one_model"],
 )
 def test_one_model_drafter_runs_prefill_only_on_disagg_mooncake(spec_config):
@@ -56,18 +56,16 @@ def test_one_model_drafter_runs_prefill_only_on_disagg_mooncake(spec_config):
     "spec_config, connector, transceiver",
     [
         (None, MOONCAKE, DISAGG),
-        (eagle3(one_model=False), MOONCAKE, DISAGG),
         (NGramDecodingConfig(max_draft_len=3, max_matching_ngram_size=2), MOONCAKE, DISAGG),
-        (eagle3(one_model=True), KvCacheConnectorConfig(connector="kvbm"), DISAGG),
-        (eagle3(one_model=True), KvCacheConnectorConfig(connector="mooncake-store"), DISAGG),
-        (eagle3(one_model=True), None, DISAGG),
-        (eagle3(one_model=True), MOONCAKE, None),
-        (eagle3(one_model=True), MOONCAKE, CacheTransceiverConfig()),
+        (eagle3(), KvCacheConnectorConfig(connector="kvbm"), DISAGG),
+        (eagle3(), KvCacheConnectorConfig(connector="mooncake-store"), DISAGG),
+        (eagle3(), None, DISAGG),
+        (eagle3(), MOONCAKE, None),
+        (eagle3(), MOONCAKE, CacheTransceiverConfig()),
         (MTPDecodingConfig(num_nextn_predict_layers=1), MOONCAKE, None),
     ],
     ids=[
         "no_spec",
-        "eagle3_two_model",
         "ngram",
         "another_connector",
         "upstream_mooncake_connector",
