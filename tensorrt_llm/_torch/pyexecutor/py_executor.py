@@ -5933,6 +5933,8 @@ class PyExecutor:
         if self._is_disagg_inflight_cancel_active():
             self._cancel_timed_out_gen_transfers()
             self._check_gen_cache_transfer_errors_consensus()
+        else:
+            self._fail_timed_out_gen_transfers()
 
         return
 
@@ -6044,6 +6046,49 @@ class PyExecutor:
                     f"Cancelled timed-out generation KV transfer for request "
                     f"{request.py_request_id}; waiting for C++ transfer "
                     "status to report final cleanup")
+
+    @nvtx_range("_fail_timed_out_gen_transfers")
+    def _fail_timed_out_gen_transfers(self) -> None:
+        """Cancel generation transfers that exceeded kv_transfer_timeout_ms.
+
+        Without in-flight cancellation, _handle_responses does this as well, but
+        only after a forward step, so a generation server with nothing else to
+        run would keep such a request (e.g. one whose KV never arrives) forever.
+        A cancellation the transceiver cannot finish yet (the Python
+        transceiver with a receive in flight) is reported as a cancelled
+        transfer by the next transfer-status check, which fails the request
+        through the transfer-error path.
+        """
+        user_canceled_ids = set(self.canceled_req_ids)
+        timed_out_requests = [
+            request for request in self.active_requests
+            if request.py_kv_transfer_timed_out
+            and request.is_disagg_generation_transmission_in_progress
+            and self._request_vote_id(request) not in user_canceled_ids
+            and self._request_kv_transfer_cancellation(request)
+        ]
+        if not timed_out_requests:
+            return
+        self.active_requests = [
+            request for request in self.active_requests
+            if request not in timed_out_requests
+        ]
+        self._fail_timed_out_requests(timed_out_requests)
+
+    def _fail_timed_out_requests(self,
+                                 timed_out_requests: List[LlmRequest]) -> None:
+        """Fail KV-transfer timeouts already removed from active_requests."""
+        if (self.kv_cache_transceiver is not None and self.enable_attention_dp
+                and self.dist.world_size != 1):
+            # Buffer for _handle_kv_transfer_timeouts_synced; in-place
+            # tp_allgather would desync (reached from per-rank-divergent gates).
+            self._pending_timed_out_requests.extend(timed_out_requests)
+        else:
+            for req in timed_out_requests:
+                self._handle_errors(
+                    error_msg=f"Request {req.py_request_id} timed out",
+                    requests=[req],
+                    charge_budget=False)
 
     @nvtx_range("_check_gen_cache_transfer_errors_consensus")
     def _check_gen_cache_transfer_errors_consensus(self) -> None:
@@ -7452,17 +7497,7 @@ class PyExecutor:
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
-        if (self.kv_cache_transceiver is not None and self.enable_attention_dp
-                and self.dist.world_size != 1):
-            # Buffer for _handle_kv_transfer_timeouts_synced; in-place
-            # tp_allgather would desync (reached from per-rank-divergent gates).
-            self._pending_timed_out_requests.extend(timed_out_requests)
-        else:
-            for req in timed_out_requests:
-                self._handle_errors(
-                    error_msg=f"Request {req.py_request_id} timed out",
-                    requests=[req],
-                    charge_budget=False)
+        self._fail_timed_out_requests(timed_out_requests)
         return requests_to_terminate + requests_finished_by_transfer
 
     def _await_any_response(self,

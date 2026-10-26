@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import sys
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -329,12 +330,147 @@ def test_flag_unset_generation_driver_skips_cancel_pipeline():
     executor._check_disagg_gen_cache_transfer_status = Mock()
     executor._cancel_timed_out_gen_transfers = Mock()
     executor._check_gen_cache_transfer_errors_consensus = Mock()
+    executor._fail_timed_out_gen_transfers = Mock()
 
     PyExecutor._check_disagg_gen_transfer_status(executor)
 
     executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
     executor._cancel_timed_out_gen_transfers.assert_not_called()
     executor._check_gen_cache_transfer_errors_consensus.assert_not_called()
+    executor._fail_timed_out_gen_transfers.assert_called_once_with()
+
+
+class _GenTransferRequest:
+    """Generation request whose transfer state follows ``state`` as in LlmRequest."""
+
+    def __init__(self, request_id=7, timed_out=True):
+        self.py_request_id = request_id
+        self.is_child = False
+        self.is_context_only_request = False
+        self.py_kv_transfer_timed_out = timed_out
+        self.py_kv_transfer_start_time = None
+        self.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+
+    @property
+    def is_disagg_generation_transmission_in_progress(self):
+        return self.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+
+
+class _NeverArrivingReceive:
+    """Python-transceiver semantics for a generation receive whose KV never arrives.
+
+    While the receive task is in flight, cancel_request() can only mark the session
+    cancelled and returns False. The next check_gen_transfer_status() reports the session
+    as cancelled and closes it; after that cancel_request() has nothing left and returns True.
+    """
+
+    kv_transfer_timeout_ms = 1000
+
+    def __init__(self, request):
+        self.request = request
+        self.cancel_calls = 0
+        self.session_cancelled = False
+        self.session_closed = False
+
+    def cancel_request(self, request):
+        self.cancel_calls += 1
+        self.session_cancelled = True
+        return self.session_closed
+
+    def check_gen_transfer_status(self, at_least_request_num):
+        if self.session_cancelled and not self.session_closed:
+            self.session_closed = True
+            return [], [], [self.request]
+        return [], [], []
+
+
+def _make_idle_generation_stub(active_requests, transceiver, attention_dp=False):
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = list(active_requests)
+    executor.kv_cache_transceiver = transceiver
+    executor.canceled_req_ids = []
+    executor._pending_timed_out_requests = []
+    executor._disagg_inflight_cancel_unsupported_logged = False
+    executor.enable_attention_dp = attention_dp
+    executor.dist = SimpleNamespace(
+        rank=0, world_size=2, tp_size=2, tp_allgather=Mock(return_value=[True, False])
+    )
+    executor.async_transfer_manager = SimpleNamespace(requests_in_transfer=dict)
+    executor._handle_errors = Mock()
+    return executor
+
+
+def test_flag_unset_idle_generation_server_fails_receive_that_never_arrives():
+    """With nothing to schedule, _handle_responses never runs; the timeout must still fail it."""
+    request = _GenTransferRequest(timed_out=False)
+    request.py_kv_transfer_start_time = time.monotonic() - 2.0
+    transceiver = _NeverArrivingReceive(request)
+    executor = _make_idle_generation_stub([request], transceiver)
+
+    # Three idle iterations of the loop head: transfer status, then the timeout check.
+    for _ in range(3):
+        PyExecutor._check_disagg_gen_transfer_status(executor)
+        PyExecutor._check_kv_transfer_timeout(executor)
+
+    assert transceiver.cancel_calls == 1
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    executor._handle_errors.assert_called_once_with(
+        "Error in kv cache transfer for generation requests",
+        requests=[request],
+        charge_budget=False,
+    )
+
+
+def test_flag_unset_idle_generation_timeout_fails_request_cancelled_at_once():
+    request = _GenTransferRequest()
+    transceiver = Mock()
+    transceiver.cancel_request.return_value = True
+    executor = _make_idle_generation_stub([request], transceiver)
+
+    PyExecutor._fail_timed_out_gen_transfers(executor)
+
+    transceiver.cancel_request.assert_called_once_with(request)
+    assert executor.active_requests == []
+    executor._handle_errors.assert_called_once_with(
+        error_msg="Request 7 timed out", requests=[request], charge_budget=False
+    )
+
+
+def test_flag_unset_idle_generation_timeout_uses_rank_uniform_cleanup_under_adp():
+    request = _GenTransferRequest()
+    transceiver = Mock()
+    transceiver.cancel_request.return_value = True
+    executor = _make_idle_generation_stub([request], transceiver, attention_dp=True)
+
+    PyExecutor._fail_timed_out_gen_transfers(executor)
+
+    assert executor.active_requests == []
+    executor._handle_errors.assert_not_called()
+
+    PyExecutor._handle_kv_transfer_timeouts_synced(executor)
+
+    executor.dist.tp_allgather.assert_called_once_with(True)
+    executor._handle_errors.assert_called_once_with(
+        error_msg="Request timed out (KV transfer)", requests=[request], charge_budget=False
+    )
+
+
+def test_flag_unset_idle_generation_timeout_skips_other_requests():
+    not_timed_out = _GenTransferRequest(request_id=1, timed_out=False)
+    not_in_transfer = _GenTransferRequest(request_id=2)
+    not_in_transfer.state = LlmRequestState.GENERATION_IN_PROGRESS
+    user_canceled = _GenTransferRequest(request_id=3)
+    transceiver = Mock()
+    executor = _make_idle_generation_stub(
+        [not_timed_out, not_in_transfer, user_canceled], transceiver
+    )
+    executor.canceled_req_ids = [3]
+
+    PyExecutor._fail_timed_out_gen_transfers(executor)
+
+    transceiver.cancel_request.assert_not_called()
+    assert executor.active_requests == [not_timed_out, not_in_transfer, user_canceled]
+    executor._handle_errors.assert_not_called()
 
 
 def test_peer_buffer_poison_triggers_world_consistent_fatal_cleanup(monkeypatch):

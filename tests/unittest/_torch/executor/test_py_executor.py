@@ -660,19 +660,23 @@ class TestDisaggTransferIdleProgress:
         executor = object.__new__(PyExecutor)
         executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
         executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._fail_timed_out_gen_transfers = Mock()
 
         PyExecutor._check_disagg_gen_transfer_status(executor)
 
         executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
+        executor._fail_timed_out_gen_transfers.assert_called_once_with()
 
     def test_gen_transfer_status_enters_without_local_active_transfers(self):
         executor = object.__new__(PyExecutor)
         executor.active_requests = []
         executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._fail_timed_out_gen_transfers = Mock()
 
         PyExecutor._check_disagg_gen_transfer_status(executor)
 
         executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
+        executor._fail_timed_out_gen_transfers.assert_called_once_with()
 
     def test_gen_transfer_status_skips_sync_mode(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
