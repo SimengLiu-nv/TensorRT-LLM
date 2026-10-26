@@ -20,8 +20,8 @@ import signal
 import socket
 import traceback
 import uuid
-from contextlib import asynccontextmanager
-from typing import Callable, Optional
+from contextlib import aclosing, asynccontextmanager
+from typing import AsyncGenerator, Callable, Optional
 
 import aiohttp
 import uvicorn
@@ -437,8 +437,9 @@ class OpenAIDisaggServer:
                 response_or_generator = await entry_point(req, hooks)
                 self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
+                    content = await self._start_stream(response_or_generator)
                     return StreamingResponse(
-                        content=response_or_generator,
+                        content=content,
                         media_type="text/event-stream")
                 return JSONResponse(content=response_or_generator.model_dump())
             except Exception as e:
@@ -446,6 +447,27 @@ class OpenAIDisaggServer:
                 # carry a machine-readable code (context_length_exceeded).
                 return self._handle_exception(e)
         return wrapper
+
+    @staticmethod
+    async def _start_stream(generator: AsyncGenerator) -> AsyncGenerator:
+        """Pull the first chunk before the response headers are sent.
+
+        A worker that fails before its first token (e.g. a KV-cache transfer error on the
+        generation server) then raises here and becomes an HTTP error response, instead of a
+        200 whose body is cut off.
+        """
+        try:
+            first_chunk = await anext(generator)
+        except StopAsyncIteration:
+            return generator
+
+        async def stream():
+            async with aclosing(generator):
+                yield first_chunk
+                async for chunk in generator:
+                    yield chunk
+
+        return stream()
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:

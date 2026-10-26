@@ -14,6 +14,7 @@
 
 import asyncio
 import json
+import re
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
@@ -1559,3 +1560,172 @@ class TestRemoteTailHandoffRetry:
         mock_router.finish_request.assert_awaited_once_with(
             completion_request, mock_session, success=True, req_id=42
         )
+
+
+class TestGenerationNoReplayAfterAccept:
+    """A generation request is never replayed once the generation server has answered.
+
+    The context server's KV-cache handoff is one-shot. When the transfer fails, the
+    generation server raises in its stream generator and drops the connection after the
+    response headers; a replay (sent under a fresh disagg_request_id) then waits forever
+    for KV that no context server holds, hanging the client.
+    """
+
+    def _make_client(self, role, session, max_retries=1, disagg_id_generator=None):
+        from prometheus_client.registry import REGISTRY
+
+        REGISTRY._names_to_collectors = {}
+        REGISTRY._collector_to_names = {}
+        router = AsyncMock(spec=Router)
+        router.servers = ["localhost:8000"]
+        router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
+        router.finish_request = AsyncMock()
+        return OpenAIHttpClient(
+            router=router,
+            role=role,
+            timeout_secs=30,
+            max_retries=max_retries,
+            retry_interval_sec=0,
+            session=session,
+            disagg_id_generator=disagg_id_generator,
+        )
+
+    def _gen_request(self, stream):
+        return CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=stream,
+            disaggregated_params=DisaggregatedParams(
+                request_type="generation_only",
+                first_gen_tokens=[7],
+                ctx_request_id=42,
+                disagg_request_id=42,
+            ),
+        )
+
+    def _mock_http_response(self, status, body):
+        r = AsyncMock()
+        r.status = status
+        r.reason = "OK" if status == 200 else "Internal Server Error"
+        r.headers = {"Content-Type": "application/json"}
+        r.json = AsyncMock(return_value=body)
+        r.text = AsyncMock(return_value=json.dumps(body))
+        r.request_info = MagicMock()
+        r.history = ()
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock(return_value=False)
+        return r
+
+    def _ok_body(self):
+        return CompletionResponse(
+            model="m",
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1),
+            choices=[CompletionResponseChoice(index=0, text="ok")],
+        ).model_dump()
+
+    @pytest.mark.asyncio
+    async def test_gen_kv_transfer_failure_fails_request_without_replay(self):
+        attempts = []
+        replay_blocker = asyncio.Event()
+
+        async def generation_server(reader, writer):
+            head = await reader.readuntil(b"\r\n\r\n")
+            length = int(re.search(rb"(?i)content-length: *(\d+)", head).group(1))
+            raw_body = await reader.readexactly(length)
+            if re.search(rb"(?i)x-trtllm-msgpack: *1", head):
+                body = msgspec.msgpack.decode(raw_body)
+            else:
+                body = json.loads(raw_body)
+            attempts.append(body["disaggregated_params"]["disagg_request_id"])
+            if len(attempts) > 1:
+                # No context server holds KV for a replayed request.
+                await replay_blocker.wait()
+            # What uvicorn does when the stream generator raises
+            # "Error in kv cache transfer for generation requests" after the headers.
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n"
+            )
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(generation_server, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        ids = iter(range(1000, 2000))
+
+        async def next_id():
+            return next(ids)
+
+        session = aiohttp.ClientSession()
+        try:
+            client = self._make_client(ServerRole.GENERATION, session, disagg_id_generator=next_id)
+            request = self._gen_request(stream=True)
+            response_generator = await client.send_request(request, server=f"127.0.0.1:{port}")
+
+            async def consume():
+                return [chunk async for chunk in response_generator]
+
+            with pytest.raises(aiohttp.ClientPayloadError):
+                await asyncio.wait_for(consume(), timeout=10)
+        finally:
+            replay_blocker.set()
+            await session.close()
+            server.close()
+            await server.wait_closed()
+
+        assert attempts == [42]
+        assert request.disaggregated_params.disagg_request_id == 42
+        client._router.finish_request.assert_awaited_once_with(request, session, success=False)
+
+    @pytest.mark.asyncio
+    async def test_gen_error_status_is_not_replayed(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = self._make_client(ServerRole.GENERATION, session)
+        session.post.side_effect = [
+            self._mock_http_response(500, {"error": "Error in kv cache transfer"}),
+            self._mock_http_response(200, self._ok_body()),
+        ]
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(aiohttp.ClientResponseError):
+                await client.send_request(self._gen_request(stream=False))
+
+        assert session.post.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_gen_connection_error_before_response_is_retried(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = self._make_client(ServerRole.GENERATION, session)
+        session.post.side_effect = [
+            aiohttp.ClientConnectionError("connection refused"),
+            self._mock_http_response(200, self._ok_body()),
+        ]
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            response = await client.send_request(self._gen_request(stream=False))
+
+        assert isinstance(response, CompletionResponse)
+        assert session.post.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_ctx_error_status_is_still_retried(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = self._make_client(ServerRole.CONTEXT, session)
+        session.post.side_effect = [
+            self._mock_http_response(500, {"error": "transient"}),
+            self._mock_http_response(200, self._ok_body()),
+        ]
+        request = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", disagg_request_id=1
+            ),
+        )
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            response = await client.send_request(request)
+
+        assert isinstance(response, CompletionResponse)
+        assert session.post.call_count == 2
