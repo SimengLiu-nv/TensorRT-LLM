@@ -21,11 +21,13 @@ plain integers, which is all the addressing arithmetic needs.
 
 import contextlib
 import json
+import sys
 import threading
 import time
 from collections.abc import Iterator, Sequence
+from enum import Enum
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -48,6 +50,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store_m3.addressing impo
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store_m3.config import (
     LOCAL_REUSE_BACKOFF_ENV,
+    SOFT_PIN_TTL_ENV,
     MooncakeStoreConnectorConfig,
     StoreRole,
     local_reuse_backoff,
@@ -88,6 +91,8 @@ class FakeStore:
         self.objects = set()
         self.registered = []
         self.put_calls = []
+        #: Extra positional and keyword arguments of each put, e.g. a config.
+        self.put_options = []
         self.get_calls = []
         self.exist_calls = []
         self.closed = False
@@ -104,8 +109,9 @@ class FakeStore:
         self.exist_calls.append(list(keys))
         return [1 if key in self.objects else 0 for key in keys]
 
-    def batch_put_from_multi_buffers(self, keys, addresses, sizes, *_args, **_kwargs):
+    def batch_put_from_multi_buffers(self, keys, addresses, sizes, *args, **kwargs):
         self.put_calls.append((list(keys), [list(a) for a in addresses], [list(s) for s in sizes]))
+        self.put_options.append((args, kwargs))
         self.objects.update(keys)
         return [sum(size) for size in sizes]
 
@@ -170,6 +176,7 @@ def store_config(tmp_path, monkeypatch):
     monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_ROLE", raising=False)
     monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_PREFIX", raising=False)
     monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_MODEL_KEY", raising=False)
+    monkeypatch.delenv(SOFT_PIN_TTL_ENV, raising=False)
     return path
 
 
@@ -881,6 +888,123 @@ def test_worker_save_skips_pages_already_in_the_store(store_config, fake_store):
         )
         assert len(fake_store.put_calls) == 1
         assert fake_store.put_calls[0][0] == [worker._namespaces[0].key(hashes[1])]
+
+
+def test_config_soft_pin_defaults_off_and_reads_the_json(store_config):
+    assert MooncakeStoreConnectorConfig.from_env().soft_pin_ttl_ms is None
+
+    raw = json.loads(store_config.read_text())
+    raw["soft_pin_ttl_ms"] = 86400000
+    store_config.write_text(json.dumps(raw))
+    assert MooncakeStoreConnectorConfig.from_env().soft_pin_ttl_ms == 86400000
+
+    raw["soft_pin_ttl_ms"] = 0
+    store_config.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="soft_pin_ttl_ms"):
+        MooncakeStoreConnectorConfig.from_env()
+
+
+@pytest.mark.parametrize("value,expected", [("86400000", 86400000), (" 5000 ", 5000), ("0", None)])
+def test_config_soft_pin_env_override(store_config, monkeypatch, value, expected):
+    raw = json.loads(store_config.read_text())
+    raw["soft_pin_ttl_ms"] = 1000
+    store_config.write_text(json.dumps(raw))
+    monkeypatch.setenv(SOFT_PIN_TTL_ENV, value)
+    assert MooncakeStoreConnectorConfig.from_env().soft_pin_ttl_ms == expected
+
+
+@pytest.mark.parametrize("value", ["24h", "-1", "1.5"])
+def test_config_rejects_a_bad_soft_pin_env(store_config, monkeypatch, value):
+    monkeypatch.setenv(SOFT_PIN_TTL_ENV, value)
+    with pytest.raises(ValueError, match=SOFT_PIN_TTL_ENV):
+        MooncakeStoreConnectorConfig.from_env()
+
+
+def _save_two_pages(worker):
+    hashes = [bytes([index]) * 16 for index in range(2)]
+    worker._put(
+        [RequestTransfers(1, [PageTransfer(hashes[0], 0, 0), PageTransfer(hashes[1], 0, 1)])]
+    )
+
+
+def test_worker_save_passes_no_config_by_default(store_config, fake_store, monkeypatch):
+    monkeypatch.delenv(SOFT_PIN_TTL_ENV, raising=False)
+    monkeypatch.setattr(
+        worker_module,
+        "_soft_pin_put_config",
+        lambda _ttl_ms: pytest.fail("soft pin is off, so no config may be built"),
+    )
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        _save_two_pages(worker)
+    assert fake_store.put_options == [((), {})]
+
+
+def test_worker_save_soft_pins_every_page_when_configured(store_config, fake_store, monkeypatch):
+    """The one config is built once and handed to every put of every batch."""
+    built = []
+
+    def fake_config(ttl_ms):
+        config = SimpleNamespace(soft_pin_ttl_ms=ttl_ms)
+        built.append(config)
+        return config
+
+    monkeypatch.setattr(worker_module, "_soft_pin_put_config", fake_config)
+    monkeypatch.setenv(SOFT_PIN_TTL_ENV, "86400000")
+    raw = json.loads(store_config.read_text())
+    raw["transfer_batch_size"] = 1
+    store_config.write_text(json.dumps(raw))
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        _save_two_pages(worker)
+    assert len(built) == 1
+    assert built[0].soft_pin_ttl_ms == 86400000
+    assert len(fake_store.put_calls) == 2
+    assert fake_store.put_options == [((built[0],), {}), ((built[0],), {})]
+
+
+def test_worker_builds_no_put_config_for_a_consumer(store_config, fake_store, monkeypatch):
+    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_ROLE", "consumer")
+    monkeypatch.setenv(SOFT_PIN_TTL_ENV, "86400000")
+    monkeypatch.setattr(
+        worker_module,
+        "_soft_pin_put_config",
+        lambda _ttl_ms: pytest.fail("a consumer never writes, so it needs no put config"),
+    )
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        assert worker._put_config is None
+
+
+def _fake_mooncake_store(monkeypatch, **attributes):
+    package = ModuleType("mooncake")
+    store = ModuleType("mooncake.store")
+    for name, value in attributes.items():
+        setattr(store, name, value)
+    package.store = store
+    monkeypatch.setitem(sys.modules, "mooncake", package)
+    monkeypatch.setitem(sys.modules, "mooncake.store", store)
+
+
+def test_soft_pin_put_config_enables_soft_pin_with_the_ttl(monkeypatch):
+    class SoftPinAction(Enum):
+        PRESERVE = 0
+        ENABLE = 1
+        DISABLE = 2
+
+    class ReplicateConfig:
+        def __init__(self):
+            self.soft_pin_action = SoftPinAction.PRESERVE
+            self.soft_pin_ttl_ms = None
+
+    _fake_mooncake_store(monkeypatch, ReplicateConfig=ReplicateConfig, SoftPinAction=SoftPinAction)
+    config = worker_module._soft_pin_put_config(86400000)
+    assert isinstance(config, ReplicateConfig)
+    assert config.soft_pin_action is SoftPinAction.ENABLE
+    assert config.soft_pin_ttl_ms == 86400000
+
+
+def test_soft_pin_put_config_names_the_binding_it_needs(monkeypatch):
+    _fake_mooncake_store(monkeypatch, ReplicateConfig=object)
+    with pytest.raises(ImportError, match="SoftPinAction"):
+        worker_module._soft_pin_put_config(1000)
 
 
 def test_worker_reports_a_request_finished_once_its_saves_drain(store_config, fake_store):
