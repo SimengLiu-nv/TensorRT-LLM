@@ -145,3 +145,12 @@ class KeyNamespace:
     def key(self, block_hash: bytes) -> str:
         """The store key holding one page of this namespace."""
         return f"{self.prefix}/{block_hash.hex()}"
+
+    def group(self, block_hash: bytes) -> str:
+        """The eviction group shared by every page of one block.
+
+        Leaves out the shard rank and the layer group, so all the pages a hit on
+        this block needs fall into one group, and keeps the shard count, so
+        deployments sharded differently never share a group.
+        """
+        return f"{self.cache_prefix}/{self.model_key}/w{self.world_size}/{block_hash.hex()}"
