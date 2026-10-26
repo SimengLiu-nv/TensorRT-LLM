@@ -397,12 +397,14 @@ class OpenAIHttpClient(OpenAIClient):
             headers.update(self._get_request_headers(request))
             try:
                 lines_yielded = 0
+                response_started = False
                 start_time = get_steady_clock_now_in_seconds()
                 async with self._session.post(
                     url,
                     data=body,
                     headers=headers,
                 ) as http_response:
+                    response_started = True
                     response_clock = AdjustedSteadyClock()
                     if self._request_perf_metrics:
                         destination_time = get_steady_clock_now_in_seconds()
@@ -474,6 +476,17 @@ class OpenAIHttpClient(OpenAIClient):
                 if lines_yielded > 0:
                     logger.error(
                         f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",
+                        traceback.format_exc(),
+                    )
+                    raise
+                # A generation server that answered has already consumed (or failed) the
+                # one-shot KV-cache handoff from the context server. A replay, sent under a
+                # fresh disagg_request_id, would wait forever for KV that no context server
+                # holds, so fail the request instead.
+                if response_started and self._role == ServerRole.GENERATION:
+                    logger.error(
+                        f"{self._role} client error to {url}: {e} - cannot retry since the "
+                        "generation server already accepted the request",
                         traceback.format_exc(),
                     )
                     raise
