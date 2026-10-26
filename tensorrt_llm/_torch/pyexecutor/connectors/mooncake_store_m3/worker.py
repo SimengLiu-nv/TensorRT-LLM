@@ -142,6 +142,21 @@ def _open_store(config: MooncakeStoreConnectorConfig):
     return store
 
 
+def _soft_pin_put_config(ttl_ms: int):
+    """A `ReplicateConfig` that soft-pins each page it writes for `ttl_ms`."""
+    try:
+        from mooncake.store import ReplicateConfig, SoftPinAction
+    except ImportError as exc:
+        raise ImportError(
+            "soft_pin_ttl_ms needs Mooncake Python bindings that expose "
+            "ReplicateConfig.soft_pin_action and SoftPinAction (0.3.13 or newer)."
+        ) from exc
+    config = ReplicateConfig()
+    config.soft_pin_action = SoftPinAction.ENABLE
+    config.soft_pin_ttl_ms = ttl_ms
+    return config
+
+
 def _default_hostname() -> str:
     import socket
 
@@ -317,6 +332,12 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._peer_namespaces: Dict[int, Tuple[KeyNamespace, ...]] = {}
 
         self._store = _open_store(self._config)
+        # Write options for every put; None keeps the store's defaults.
+        self._put_config = (
+            _soft_pin_put_config(self._config.soft_pin_ttl_ms)
+            if self._config.soft_pin_ttl_ms is not None and self._config.role.saves
+            else None
+        )
 
         self._save_queue: "Queue[Optional[Tuple[torch.cuda.Event, List[RequestTransfers]]]]" = (
             Queue()
@@ -404,7 +425,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         logger.info(
             f"mooncake-store worker rank {self._rank}/{self._world_size} ready "
             f"(role={self._config.role.value}, model_key={self._model_key}, "
-            f"master={self._config.master_server_address})"
+            f"master={self._config.master_server_address}"
+            f"{f', soft_pin_ttl_ms={self._config.soft_pin_ttl_ms}' if self._put_config is not None else ''})"
         )
 
     # ---- registration ----
@@ -1179,11 +1201,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 )
                 # The store reads the slots on this thread, so fill them first.
                 _sync_stream(handle)
-            results = self._store.batch_put_from_multi_buffers(
-                [batch_keys[i] for i in pending],
-                source_addresses,
-                source_sizes,
-            )
+            put_args = ([batch_keys[i] for i in pending], source_addresses, source_sizes)
+            if self._put_config is not None:
+                put_args += (self._put_config,)
+            results = self._store.batch_put_from_multi_buffers(*put_args)
             failures = sum(1 for result in results if not isinstance(result, int) or result < 0)
             if failures:
                 # A dropped write only costs a future cache miss, so it is worth
