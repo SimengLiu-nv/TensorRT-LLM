@@ -426,6 +426,8 @@ def test_context_model_capacity_profile_uses_real_dummy_requests(
     )
     executor._validate_token_id_range = Mock()
     executor._validate_request_budget = Mock()
+    # No KV connector here: the admission check would return at once.
+    executor._validate_connector_request = Mock()
 
     if is_warmup:
         PyExecutor._validate_request(executor, request)
