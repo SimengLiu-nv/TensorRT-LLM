@@ -21,6 +21,7 @@ not context-only work. Both modes are off unless the executor creator asks.
 """
 
 from collections.abc import Iterator
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -507,3 +508,34 @@ def test_cancel_waits_for_connector_load(forbid_connector_collectives: None) -> 
     manager.worker.get_finished.return_value = ([], [8])
     manager.get_finished()
     assert executor._try_cancel_request(req)
+
+
+def test_allocation_fence_prefers_the_managers_own() -> None:
+    from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import _allocation_fence_for
+
+    manager = SimpleNamespace(wait_allocation_fences=lambda ids: None, _stream=None)
+    assert _allocation_fence_for(manager) is manager.wait_allocation_fences
+
+
+def test_allocation_fence_falls_back_to_both_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without wait_allocation_fences, the bound fence retires the KV stream and the loop stream."""
+    from tensorrt_llm._torch.pyexecutor.connectors import kv_cache_connector
+
+    calls = []
+    kv_stream = SimpleNamespace(device="cuda:0", synchronize=lambda: calls.append("kv"))
+    loop_stream = SimpleNamespace(synchronize=lambda: calls.append("loop"))
+    monkeypatch.setattr(kv_cache_connector.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        kv_cache_connector.torch.cuda, "current_stream", lambda device=None: loop_stream
+    )
+    fence = kv_cache_connector._allocation_fence_for(SimpleNamespace(_stream=kv_stream))
+    assert calls == []
+    fence([7])
+    assert calls == ["kv", "loop"]
+
+
+def test_allocation_fence_is_none_without_a_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.pyexecutor.connectors import kv_cache_connector
+
+    monkeypatch.setattr(kv_cache_connector.torch.cuda, "is_available", lambda: True)
+    assert kv_cache_connector._allocation_fence_for(SimpleNamespace()) is None

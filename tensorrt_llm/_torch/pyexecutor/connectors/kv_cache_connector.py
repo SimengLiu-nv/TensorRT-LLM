@@ -63,6 +63,31 @@ if TYPE_CHECKING:
 AllocationFence = Callable[[Iterable[int]], None]
 
 
+def _allocation_fence_for(kv_cache_manager) -> Optional[AllocationFence]:
+    """The allocation fence to bind for a batch the KV cache manager just prepared.
+
+    A manager with an allocation stream offers ``wait_allocation_fences``. One
+    without it allocates on its own stream, where page-reuse waits and copies
+    run, while the forward-retire wait and the fresh-page fill run on the
+    loop's current stream; a fence that retires both orders a writer no CUDA
+    stream orders behind them. Both streams are captured here, on the executor
+    thread, so the fence can be called from a load thread.
+    """
+    fence = getattr(kv_cache_manager, "wait_allocation_fences", None)
+    if fence is not None:
+        return fence
+    kv_stream = getattr(kv_cache_manager, "_stream", None)
+    if kv_stream is None or not torch.cuda.is_available():
+        return None
+    loop_stream = torch.cuda.current_stream(kv_stream.device)
+
+    def stream_fence(_request_ids: Iterable[int]) -> None:
+        kv_stream.synchronize()
+        loop_stream.synchronize()
+
+    return stream_fence
+
+
 def _is_dummy_request(request: LlmRequest) -> bool:
     """Whether ``request`` is a placeholder with no prompt of its own.
 
@@ -1396,7 +1421,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         )
         # Every page of this batch is allocated by now; see
         # `KvCacheConnectorWorker.get_allocation_fence`.
-        self._allocation_fence = getattr(kv_cache_manager, "wait_allocation_fences", None)
+        self._allocation_fence = _allocation_fence_for(kv_cache_manager)
         self._scheduler_output.prefix_loads = [
             load
             for reservation_id, load in self._prefix_loads.items()
