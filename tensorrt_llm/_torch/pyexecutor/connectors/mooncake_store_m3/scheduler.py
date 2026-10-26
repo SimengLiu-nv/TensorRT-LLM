@@ -85,6 +85,12 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     """Chooses which pages the Mooncake pool serves and which it receives."""
 
     supports_attention_dp = True
+    # A query only resets and refills this request's offer state
+    # (`get_num_new_matched_tokens`), the pool lookup is a read-only
+    # `count_prefix_hit`, and transfers are queued only in
+    # `update_state_after_alloc*`, so an admission-time answer has no other
+    # effect and a repeated query replaces it.
+    supports_admission_query = True
 
     def __init__(self, llm_args: TorchLlmArgs) -> None:
         super().__init__(llm_args)

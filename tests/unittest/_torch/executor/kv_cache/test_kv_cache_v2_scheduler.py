@@ -5196,3 +5196,181 @@ def test_rewind_context_after_cache_drop_handles_empty_rank_local_prompt(
     assert request.context_chunk_size == prompt_len
     assert request.estimated_reusable_tokens == 0
     assert request.py_ctx_pre_resize_cap is None
+
+
+class TestUnchargedAsyncParks:
+    """TLLM_CTX_UNCHARGED_ASYNC_PARKS: a first chunk the connector will park is admitted with no token charge."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        for name in (
+            "TLLM_CTX_APPEND_RESERVE",
+            "TLLM_CTX_APPEND_RESERVE_ADAPTIVE",
+            "TLLM_CTX_APPEND_RESERVE_SJF",
+            "TLLM_CTX_UNCHARGED_ASYNC_PARKS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+    @staticmethod
+    def _parking_manager(parked_ids, calls=None):
+        """A manager whose connector parks exactly ``parked_ids`` when allowed to ask."""
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+
+        def query(req, allow_query):
+            if calls is not None:
+                calls.append((req.py_request_id, allow_query))
+            return allow_query and req.py_request_id in parked_ids
+
+        mgr.query_connector_at_admission.side_effect = query
+        return mgr
+
+    @staticmethod
+    def _scheduler(mgr, max_batch_size=100):
+        return make_scheduler(
+            mgr, max_batch_size=max_batch_size, max_num_tokens=8192, ctx_chunk_config=(None, 64)
+        )
+
+    def test_off_by_default(self):
+        mgr = self._parking_manager({0})
+        sched = self._scheduler(mgr)
+        assert sched._uncharged_async_parks == 0
+        head = make_ctx_request(0, context_remaining_length=20000)
+        out = sched.schedule_request([head, make_ctx_request(1, 1000)], set())
+        assert ids(out.context_requests) == [0]
+        assert head.context_chunk_size == 8192
+        mgr.query_connector_at_admission.assert_not_called()
+        mgr.begin_connector_admission_pass.assert_not_called()
+        assert sched.uncharged_park_ids == frozenset()
+
+    def test_parked_head_is_uncharged_and_the_budget_goes_to_the_rest(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE", "2048")
+        monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "2")
+        sched = self._scheduler(self._parking_manager({0}))
+        head = make_ctx_request(0, context_remaining_length=20000)
+        long_second = make_ctx_request(1, context_remaining_length=6000)
+        short = make_ctx_request(2, context_remaining_length=1000)
+        out = sched.schedule_request([head, long_second, short], set())
+        assert sorted(ids(out.context_requests)) == [0, 1, 2]
+        # The parked head keeps its sized chunk and pages; only the charge is waived.
+        assert head.context_chunk_size == 8192 - 2048
+        assert sched.uncharged_park_ids == frozenset({0})
+        # The next request inherits the head's place in the reserve and the rest of the budget is unspent by the
+        # park: without the knob the second long request would only get 8192 - 6144 - 1000 -> 1024 tokens.
+        assert short.context_chunk_size == 1000
+        assert long_second.context_chunk_size == 6000
+        assert short.context_chunk_size + long_second.context_chunk_size <= 8192
+
+    def test_without_the_knob_the_park_burns_its_chunk(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE", "2048")
+        sched = self._scheduler(self._parking_manager({0}))
+        head = make_ctx_request(0, context_remaining_length=20000)
+        long_second = make_ctx_request(1, context_remaining_length=6000)
+        short = make_ctx_request(2, context_remaining_length=1000)
+        sched.schedule_request([head, long_second, short], set())
+        assert long_second.context_chunk_size == 1024
+
+    def test_adaptive_reserve_is_released_for_a_lone_follower(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE", "2048")
+        monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "1")
+        sched = self._scheduler(self._parking_manager({0}))
+        head = make_ctx_request(0, context_remaining_length=20000)
+        follower = make_ctx_request(1, context_remaining_length=20000)
+        out = sched.schedule_request([head, follower], set())
+        assert sorted(ids(out.context_requests)) == [0, 1]
+        assert head.context_chunk_size == 8192 - 2048
+        # Nobody is left to use the reserve, so the follower gets the whole budget.
+        assert follower.context_chunk_size == 8192
+
+    def test_cap_limits_the_uncharged_parks_per_pass(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE", "2048")
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE_SJF", "0")
+        monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "1")
+        calls = []
+        sched = self._scheduler(self._parking_manager({0, 1, 2}, calls))
+        reqs = [make_ctx_request(i, context_remaining_length=20000) for i in range(3)]
+        sched.schedule_request(reqs, set())
+        assert calls == [(0, True), (1, False), (2, False)]
+        assert sched.uncharged_park_ids == frozenset({0})
+        # Past the cap a request is charged as before: 6144 for the next head-of-reserve chunk, 2048 after it.
+        assert [r.context_chunk_size for r in reqs] == [6144, 6144, 2048]
+        # The cap is per pass.
+        calls.clear()
+        sched.schedule_request(reqs, set())
+        assert calls[0][1] is True
+
+    def test_a_miss_does_not_use_up_the_cap(self, monkeypatch):
+        """The cap counts parks, not questions: a request the connector cannot serve leaves the next one askable."""
+        monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "1")
+        calls = []
+        sched = self._scheduler(self._parking_manager({1}, calls))
+        sched.schedule_request(
+            [make_ctx_request(0, context_remaining_length=4000), make_ctx_request(1, 20000)], set()
+        )
+        assert calls == [(0, True), (1, True)]
+        assert sched.uncharged_park_ids == frozenset({1})
+
+    def test_parked_request_still_takes_a_request_slot(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "2")
+        sched = self._scheduler(self._parking_manager({0}), max_batch_size=1)
+        out = sched.schedule_request(
+            [make_ctx_request(0, context_remaining_length=20000), make_ctx_request(1, 1000)], set()
+        )
+        assert ids(out.context_requests) == [0]
+        assert sched.uncharged_park_ids == frozenset({0})
+
+    def test_a_request_that_fails_allocation_is_never_asked(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "2")
+        calls = []
+        mgr = self._parking_manager({0, 1}, calls)
+        mgr.resize_context.side_effect = lambda req, n: req.py_request_id != 0
+        sched = self._scheduler(mgr)
+        sched.schedule_request(
+            [make_ctx_request(0, context_remaining_length=20000), make_ctx_request(1, 1000)], set()
+        )
+        assert [req_id for req_id, _ in calls] == [1]
+
+    def test_unchunked_scheduling_never_asks(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "2")
+        mgr = self._parking_manager({0})
+        sched = make_scheduler(mgr, max_num_tokens=8192)
+        sched.schedule_request([make_ctx_request(0, context_remaining_length=4000)], set())
+        mgr.query_connector_at_admission.assert_not_called()
+
+    def test_a_small_chunk_keeps_its_charge(self, monkeypatch):
+        """Under two blocks a park frees too little budget to spend a query slot on."""
+        monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "2")
+        calls = []
+        sched = self._scheduler(self._parking_manager({0}, calls))
+        out = sched.schedule_request([make_ctx_request(0, context_remaining_length=100)], set())
+        assert ids(out.context_requests) == [0]
+        assert calls == [(0, False)]
+        assert sched.uncharged_park_ids == frozenset()
+
+    def test_uncharged_ids_are_per_pass(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "2")
+        parked = {0}
+        mgr = self._parking_manager(parked)
+        sched = self._scheduler(mgr)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        sched.schedule_request([head], set())
+        assert sched.uncharged_park_ids == frozenset({0})
+        mgr.begin_connector_admission_pass.assert_called_once()
+        parked.clear()
+        sched.schedule_request([head], set())
+        assert sched.uncharged_park_ids == frozenset()
+        assert mgr.begin_connector_admission_pass.call_count == 2
+
+    def test_budget_skips_are_reported(self):
+        sched = self._scheduler(make_kv_cache_manager(tokens_per_block=64))
+        sched.schedule_request(
+            [make_ctx_request(0, context_remaining_length=20000), make_ctx_request(1, 1000)], set()
+        )
+        assert sched.last_pass_ctx_budget_skips == 1
+
+    def test_budget_skips_count_only_first_chunks(self):
+        """A continuation passed over for budget is not a new request starved of it."""
+        sched = self._scheduler(make_kv_cache_manager(tokens_per_block=64))
+        head = make_ctx_request(0, context_remaining_length=20000)
+        continuation = make_ctx_request(1, 12000, is_first_context_chunk=False)
+        sched.schedule_request([head, continuation, make_ctx_request(2, 1000)], set())
+        assert sched.last_pass_ctx_budget_skips == 1

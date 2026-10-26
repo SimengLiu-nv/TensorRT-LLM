@@ -386,6 +386,15 @@ class KvCacheConnectorScheduler(ABC):
     # Attention DP creates one adapter per rank. Adapters may connect to the
     # same logical storage pool; their request and allocation state stays local.
     supports_attention_dp: bool = False
+    #: Whether ``get_num_new_matched_tokens`` may be asked while the scheduler
+    #: is still admitting the request, before its batch is final. The answer
+    #: must have no effect beyond itself until ``update_state_after_alloc``,
+    #: and asking again for the same allocation must replace the earlier
+    #: answer: a request asked at admission can still be dropped before
+    #: ``prepare_resources`` (the benchmark gate, ``_waiting_requests``, the
+    #: multimodal runnable filter, ``can_queue`` false, the total-KV cap) and is
+    #: then asked again on a later pass.
+    supports_admission_query: bool = False
 
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
@@ -782,6 +791,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         *,
         enable_attention_dp: bool = False,
         speculative_prefill_only: bool = False,
+        admission_query: bool = False,
     ):
         """Bind a connector's two halves to the runtime.
 
@@ -796,6 +806,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                 refusing every request that is not context-only. Context-only
                 requests never reject draft tokens, so the append-only page
                 deltas the connector is given stay valid.
+            admission_query: The connector's scheduler declares
+                ``supports_admission_query``, decided from its class so every
+                rank agrees. Off under attention DP, where each rank schedules
+                alone.
         """
         assert (scheduler is not None) == (enable_attention_dp or mpi_rank() == 0), (
             "A scheduler is required on every attention-DP rank, or only on rank 0 otherwise."
@@ -809,6 +823,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.scheduler = scheduler
         self.enable_attention_dp = enable_attention_dp
         self.speculative_prefill_only = speculative_prefill_only
+        #: Whether the KV cache manager may ask the connector while the
+        #: scheduler admits a request; see
+        #: `KvCacheConnectorScheduler.supports_admission_query`.
+        self.admission_query_capable = bool(admission_query) and not enable_attention_dp
         #: Whether the worker may hand failed loads back for a restart instead
         #: of raising; see `take_failed_load_requests`. Compared against True
         #: for the same reason as `capacity_only`.

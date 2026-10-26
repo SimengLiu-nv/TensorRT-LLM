@@ -768,3 +768,111 @@ def test_shutdown_drains_the_connector_before_the_pools_it_reads_are_freed() -> 
     # The worker thread first: it is the one still handing the connector work.
     executor.worker_thread.join.assert_called_once_with()
     assert order == ["connector", "kv pools"]
+
+
+def _start_batch_executor(monkeypatch, parked_ids):
+    """An executor whose connector parks ``parked_ids``, as take_scheduled_requests_pending_load does."""
+    executor = _executor()
+    connector = executor.kv_connector_manager
+
+    def park(batch):
+        batch.context_requests = [
+            r for r in batch.context_requests if r.py_request_id not in parked_ids
+        ]
+
+    connector.take_scheduled_requests_pending_load.side_effect = park
+    connector.worker = Mock()
+    executor._pad_attention_dp_batch_emptied_by_connector = Mock()
+    monkeypatch.setattr("torch.cuda.current_stream", lambda: None)
+    return executor
+
+
+def _ctx_request(request_id: int, chunk: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        py_request_id=request_id, request_id=request_id, context_chunk_size=chunk
+    )
+
+
+def test_an_uncharged_request_that_did_not_park_is_refused(monkeypatch) -> None:
+    """A 0-charged chunk left in the batch would push the forward past max_num_tokens."""
+    executor = _start_batch_executor(monkeypatch, parked_ids=set())
+    executor._uncharged_park_scheduler = SimpleNamespace(uncharged_park_ids=frozenset({1}))
+    batch = SimpleNamespace(context_requests=[_ctx_request(1, 8192)])
+    with pytest.raises(RuntimeError, match="did not park"):
+        executor._kv_connector_start_batch(batch)
+
+
+def test_an_uncharged_request_that_parked_passes(monkeypatch) -> None:
+    executor = _start_batch_executor(monkeypatch, parked_ids={1})
+    executor._uncharged_park_scheduler = SimpleNamespace(uncharged_park_ids=frozenset({1}))
+    batch = SimpleNamespace(context_requests=[_ctx_request(1, 8192), _ctx_request(2, 4096)])
+    executor._kv_connector_start_batch(batch)
+    assert [r.py_request_id for r in batch.context_requests] == [2]
+
+
+def test_park_stats_count_the_parked_chunks(monkeypatch) -> None:
+    from tensorrt_llm._torch.pyexecutor.profiling import ParkStats
+
+    executor = _start_batch_executor(monkeypatch, parked_ids={1})
+    # Request 9 was admitted uncharged but dropped before the connector saw the batch.
+    executor._uncharged_park_scheduler = SimpleNamespace(uncharged_park_ids=frozenset({1, 9}))
+    executor._park_stats = ParkStats()
+    batch = SimpleNamespace(context_requests=[_ctx_request(1, 8192), _ctx_request(2, 4096)])
+    executor._kv_connector_start_batch(batch)
+    stats = executor._park_stats
+    assert (stats.parked_reqs, stats.parked_tokens, stats.fwd_ctx_tokens, stats.uncharged) == (
+        1,
+        8192,
+        4096,
+        1,
+    )
+
+
+def test_uncharged_parks_resolve_the_v2_scheduler_through_a_wrapper(monkeypatch) -> None:
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
+    executor = _executor()
+    inner = object.__new__(KVCacheV2Scheduler)
+    executor.scheduler = SimpleNamespace(scheduler=inner)
+    executor.disable_overlap_scheduler = True
+    monkeypatch.delenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", raising=False)
+    assert executor._resolve_uncharged_park_scheduler() is None
+    monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "2")
+    assert executor._resolve_uncharged_park_scheduler() is inner
+
+
+@pytest.mark.parametrize("problem", ["no_v2_scheduler", "overlap_scheduler"])
+def test_uncharged_parks_are_refused_where_unchecked(monkeypatch, problem) -> None:
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
+    executor = _executor()
+    executor.scheduler = (
+        SimpleNamespace() if problem == "no_v2_scheduler" else object.__new__(KVCacheV2Scheduler)
+    )
+    executor.disable_overlap_scheduler = problem != "overlap_scheduler"
+    monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "2")
+    with pytest.raises(RuntimeError, match="TLLM_CTX_UNCHARGED_ASYNC_PARKS"):
+        executor._resolve_uncharged_park_scheduler()
+
+
+def test_park_stats_suffix_is_empty_when_off_and_parseable_when_on() -> None:
+    from tensorrt_llm._torch.pyexecutor.profiling import ParkStats
+
+    executor = _executor()
+    assert executor._format_park_stats() == ""
+    executor._park_stats = ParkStats()
+    executor.scheduler = None
+    executor.kv_cache_manager = Mock()
+    executor.kv_cache_manager.take_connector_offer_stats.return_value = {
+        "queries": 2,
+        "query_ms": 1.234,
+    }
+    with executor._park_phase("fwd"):
+        pass
+    suffix = executor._format_park_stats()
+    assert suffix.startswith(", ctx_park = parked=0 parked_tok=0 unc=0 fwd_tok=0 bskip=0 sched_ms=")
+    assert "offer_queries=2 offer_query_ms=1.2" in suffix
+    # No braces: parsers of the `states = {...}` field just before it keep matching.
+    assert "{" not in suffix and "}" not in suffix
+    executor._reset_park_stats()
+    assert executor._park_stats.wall_ms["fwd"] == 0.0

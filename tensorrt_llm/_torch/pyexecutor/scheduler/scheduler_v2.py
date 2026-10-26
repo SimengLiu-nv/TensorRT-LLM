@@ -76,6 +76,12 @@ class BudgetTracker:
         self.max_num_requests = max_num_requests
         self.num_tokens = 0
         self.num_requests = 0
+        # Requests admitted with a 0-token charge because the connector will
+        # park them (TLLM_CTX_UNCHARGED_ASYNC_PARKS); they still count as requests.
+        self.num_uncharged_parks = 0
+        # First-chunk context requests passed over because the token budget was
+        # spent: the pass was limited by budget, not by queued work.
+        self.num_ctx_budget_skips = 0
 
         # PEFT accounting
         self._peft_cache_manager = peft_cache_manager
@@ -155,6 +161,13 @@ class KVCacheV2Scheduler(RequestScheduler):
     Merges capacity checking (KV cache allocation via resize()) and token budget
     assignment into one unified loop.
     """
+
+    # Uncharged async parks are off unless __init__ reads the knob; declared on
+    # the class so an instance built without __init__ schedules as before.
+    _uncharged_async_parks: int = 0
+    uncharged_park_ids: frozenset = frozenset()
+    last_pass_ctx_budget_skips: int = 0
+    _ctx_pending_init: int = 0
 
     def __init__(
         self,
@@ -311,6 +324,34 @@ class KVCacheV2Scheduler(RequestScheduler):
         if self._ctx_append_reserve_sjf:
             logger.info("KVCacheV2Scheduler: context append reserve is shortest-first")
 
+        # Uncharged async parks (opt-in: TLLM_CTX_UNCHARGED_ASYNC_PARKS=N; unset or 0 disables). A first context
+        # chunk whose prefix the KV connector will load asynchronously is parked by the executor before the
+        # forward pass, so its chunk would only burn token budget. With N > 0 the connector is asked at admission
+        # (`KVCacheManagerV2.query_connector_at_admission`, which the connector must declare
+        # `supports_admission_query` for), and up to N such requests per pass are admitted with a 0-token charge;
+        # they still take a request slot. Chunks under 2 blocks keep the normal charge: they free little budget.
+        self._uncharged_async_parks = max(
+            0, int(os.environ.get("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "0") or 0)
+        )
+        self._uncharged_park_min_tokens = 2 * self.tokens_per_block
+        self._uncharged_park_ids_pass: set[int] = set()
+        #: Request ids admitted with a 0-token charge in the last pass. The executor checks that each one parked.
+        self.uncharged_park_ids: frozenset[int] = frozenset()
+        self._uncharged_parks_logged = 0
+        self._ctx_pending_init = 0
+        #: Budget-limited signal of the last pass (`BudgetTracker.num_ctx_budget_skips`).
+        self.last_pass_ctx_budget_skips = 0
+        if self._uncharged_async_parks:
+            logger.info(
+                f"KVCacheV2Scheduler: uncharged async parks N={self._uncharged_async_parks} "
+                f"(chunks >= {self._uncharged_park_min_tokens} tokens)"
+            )
+            if ctx_chunk_config is None:
+                logger.warning(
+                    "KVCacheV2Scheduler: TLLM_CTX_UNCHARGED_ASYNC_PARKS has no effect without "
+                    "context chunking"
+                )
+
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
 
@@ -334,6 +375,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
+        if self._uncharged_async_parks:
+            self.kv_cache_manager.begin_connector_admission_pass()
+            self._uncharged_park_ids_pass = set()
         # Main scheduling loop
         (
             scheduled_encoder,
@@ -344,6 +388,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             disagg_candidates,
             has_chunking,
         ) = self._schedule_loop(active_requests, inflight_request_ids)
+
+        if self._uncharged_async_parks:
+            self.uncharged_park_ids = frozenset(self._uncharged_park_ids_pass)
 
         # Sort by LoRA task ID
         scheduled_encoder.sort(key=_get_lora_task_id)
@@ -616,11 +663,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         # is itself the progress in that case.
         deferred_behind_contributor = False
 
-        if self._ctx_append_reserve_adaptive:
-            self._ctx_append_reserve_active = (
-                sum(1 for req in pending_ctx if req.state_value == self._context_init_state_value)
-                > 1
+        if self._ctx_append_reserve_adaptive or self._uncharged_async_parks:
+            self._ctx_pending_init = sum(
+                1 for req in pending_ctx if req.state_value == self._context_init_state_value
             )
+        if self._ctx_append_reserve_adaptive:
+            self._ctx_append_reserve_active = self._ctx_pending_init > 1
         if (
             self._ctx_append_reserve_sjf
             and self._ctx_append_reserve_active
@@ -638,6 +686,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 and req.state_value == self._context_init_state_value
                 and not self._has_context_chunk_budget(budget)
             ):
+                if req.is_first_context_chunk:
+                    budget.num_ctx_budget_skips += 1
                 continue
             if req.py_request_id in preempted_ids:
                 continue
@@ -732,6 +782,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             return self._schedule_loop(
                 requests_list, inflight_request_ids, defer_remote_tail_context=True
             )
+
+        self.last_pass_ctx_budget_skips = budget.num_ctx_budget_skips
 
         # Phase and frozen-membership deferrals are not KV capacity stalls.
         self._detect_deadlock(
@@ -1084,6 +1136,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         See ``_ctx_append_reserve`` in ``__init__``.
         """
         reserve = self._ctx_append_reserve if self._ctx_append_reserve_active else 0
+        if (
+            reserve
+            and self._ctx_append_reserve_adaptive
+            and budget.num_uncharged_parks
+            and self._ctx_pending_init - budget.num_uncharged_parks <= 1
+        ):
+            # The adaptive reserve was kept for the requests behind this one,
+            # but those were all admitted uncharged and park: nothing would use it.
+            reserve = 0
         if not reserve or budget.num_tokens != 0 or budget.max_num_tokens is None:
             return self._try_schedule_context_chunked_impl(req, budget, preempt_for_pages)
         full = budget.max_num_tokens
@@ -1092,7 +1153,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             result = self._try_schedule_context_chunked_impl(req, budget, preempt_for_pages)
         finally:
             budget.max_num_tokens = full
-        if self._ctx_append_reserve_logged < 3 and result[0] is ScheduleAction.SCHEDULED:
+        # An uncharged park reports 0 here; log the chunk that actually takes the budget.
+        if (
+            self._ctx_append_reserve_logged < 3
+            and result[0] is ScheduleAction.SCHEDULED
+            and result[1] > 0
+        ):
             self._ctx_append_reserve_logged += 1
             logger.info(
                 f"[ctx-reserve] taken: first ctx chunk {result[1]} tokens "
@@ -1225,7 +1291,41 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         chunking_flag = req.context_chunk_size < req.context_remaining_length
 
+        if self._uncharged_async_parks and self._parks_for_async_load(req, budget, chunk_tokens):
+            return ScheduleAction.SCHEDULED, 0, chunking_flag
         return ScheduleAction.SCHEDULED, chunk_tokens, chunking_flag
+
+    def _parks_for_async_load(
+        self, req: LlmRequest, budget: BudgetTracker, chunk_tokens: int
+    ) -> bool:
+        """Whether ``req`` is admitted uncharged because the connector will park it.
+
+        Its chunk is sized and its pages allocated as usual; only the token
+        charge is waived, since the executor removes a parked request from the
+        batch before the forward pass. At most N requests per pass are admitted
+        uncharged; every scheduled first chunk of at least two blocks is asked
+        until N have parked, since a sync or miss answer does not count. A
+        request dropped before ``prepare_resources`` is asked again on its next
+        pass, as ``supports_admission_query`` allows. Past the cap, or for a
+        chunk too small to matter, the request keeps the normal charge and is
+        asked in ``prepare_resources``; asking with ``allow_query=False`` still
+        drops an answer left from an earlier pass.
+        """
+        allow_query = (
+            budget.num_uncharged_parks < self._uncharged_async_parks
+            and chunk_tokens >= self._uncharged_park_min_tokens
+        )
+        if not self.kv_cache_manager.query_connector_at_admission(req, allow_query=allow_query):
+            return False
+        budget.num_uncharged_parks += 1
+        self._uncharged_park_ids_pass.add(req.py_request_id)
+        if self._uncharged_parks_logged < 3:
+            self._uncharged_parks_logged += 1
+            logger.info(
+                f"[ctx-park] request {req.py_request_id} admitted uncharged: its "
+                f"{chunk_tokens}-token chunk waits for an asynchronous load"
+            )
+        return True
 
     def _reuse_claim_limit(self, req: LlmRequest) -> int | None:
         """Pair the two pools on one depth before either claims.

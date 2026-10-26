@@ -1883,6 +1883,33 @@ def test_scheduler_sends_async_loads_through_metadata_under_tensor_parallelism(s
     assert scheduler.build_connector_meta(SchedulerOutput()).async_loads == []
 
 
+def test_scheduler_declares_admission_queries(store_config: Path) -> None:
+    """A query has no effect beyond its answer until the pages are reported, so the
+    runtime may ask while the scheduler admits the request (TLLM_CTX_UNCHARGED_ASYNC_PARKS)."""
+    assert MooncakeStoreConnectorScheduler.supports_admission_query is True
+
+
+def test_scheduler_repeated_query_replaces_the_answer_and_queues_one_load(
+    store_config: Path,
+) -> None:
+    """A request asked at admission and dropped before its batch ran is asked again next
+    pass; only the last answer counts and exactly one asynchronous load is queued."""
+    scheduler = make_async_scheduler(store_config, hit_blocks=2)
+    tokens = list(range(5 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (2 * TOKENS_PER_BLOCK, True)
+    assert take_async_loads(scheduler) == []
+    scheduler._worker.hit_blocks = 3
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (3 * TOKENS_PER_BLOCK, True)
+    request.py_num_connector_matched_tokens = 3 * TOKENS_PER_BLOCK
+
+    scheduler.update_state_after_alloc_by_layer_group(request, [[10, 11, 12, 13, 14]])
+
+    (transfers,) = take_async_loads(scheduler)
+    assert [page.page_index for page in transfers.pages] == [10, 11, 12]
+    assert take_async_loads(scheduler) == []
+
+
 def test_scheduler_queues_the_async_load_when_the_pages_are_reported(store_config: Path) -> None:
     """The offer reaches the workers, with the pages the runtime reserved, in the next metadata."""
     scheduler = make_async_scheduler(store_config, hit_blocks=2)

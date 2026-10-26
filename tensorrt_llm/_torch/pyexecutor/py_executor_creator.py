@@ -1084,7 +1084,12 @@ def _create_py_executor(
                 connector_worker,
                 connector_scheduler,
                 enable_attention_dp=connector_attention_dp,
-                speculative_prefill_only=speculative_prefill_only)
+                speculative_prefill_only=speculative_prefill_only,
+                # From the class, which every rank resolved above; only rank 0
+                # holds a scheduler instance.
+                admission_query=bool(
+                    getattr(scheduler_cls, "supports_admission_query", False))
+                and mapping.pp_size == 1)
 
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")

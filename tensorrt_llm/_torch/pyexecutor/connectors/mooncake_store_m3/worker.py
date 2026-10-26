@@ -36,10 +36,12 @@ scheduler reports such a request as saving asynchronously, which keeps its pages
 pinned until `get_finished` says the writes landed.
 """
 
+import os
 import threading
 import time
 import traceback
 from collections import defaultdict
+from contextlib import contextmanager
 from queue import Queue
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -149,6 +151,28 @@ def _batched(items: Sequence, size: int):
         yield items[start : start + size]
 
 
+#: Opt-in per-phase loader timing (wall and loader-thread CPU time) on the
+#: periodic async-load stats line; see `_AsyncLoadStats.record_phases`.
+LOAD_PHASE_TIMING_ENV = "TLLM_M3_LOAD_PHASE_TIMING"
+
+_LOAD_PHASES = ("fence", "resolve", "describe", "get", "unstage", "sync")
+
+
+@contextmanager
+def _timed_phase(phases: Optional[Dict[str, List[float]]], name: str):
+    """Add the wall and thread CPU time of the block to ``phases[name]``; no-op for None."""
+    if phases is None:
+        yield
+        return
+    wall, cpu = time.perf_counter(), time.thread_time()
+    try:
+        yield
+    finally:
+        acc = phases.setdefault(name, [0.0, 0.0])
+        acc[0] += time.perf_counter() - wall
+        acc[1] += time.thread_time() - cpu
+
+
 class _AsyncLoadStats:
     """Counters for the asynchronous loader, summarised once per interval."""
 
@@ -160,9 +184,15 @@ class _AsyncLoadStats:
         "xfer_max",
         "failed_pages",
         "loaded_bytes",
+        "phase_timing",
+        "phase_wall",
+        "phase_cpu",
+        "pages",
+        "batches",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, phase_timing: bool = False) -> None:
+        self.phase_timing = phase_timing
         self.reset()
 
     def reset(self) -> None:
@@ -173,6 +203,18 @@ class _AsyncLoadStats:
         self.xfer_max = 0.0
         self.failed_pages = 0
         self.loaded_bytes = 0
+        self.phase_wall = dict.fromkeys(_LOAD_PHASES, 0.0)
+        self.phase_cpu = dict.fromkeys(_LOAD_PHASES, 0.0)
+        self.pages = 0
+        self.batches = 0
+
+    def record_phases(self, phases: Dict[str, List[float]], pages: int, batches: int) -> None:
+        """Fold one load's phase times (seconds) into the interval totals."""
+        for name, (wall, cpu) in phases.items():
+            self.phase_wall[name] = self.phase_wall.get(name, 0.0) + wall
+            self.phase_cpu[name] = self.phase_cpu.get(name, 0.0) + cpu
+        self.pages += pages
+        self.batches += batches
 
     def record(self, wait: float, xfer: float, failed_pages: int, loaded_bytes: int) -> None:
         self.completed += 1
@@ -191,6 +233,21 @@ class _AsyncLoadStats:
             f"transfer_ms mean={1000 * self.xfer_sum / n:.1f} max={1000 * self.xfer_max:.1f} "
             f"queue={queued} active={active} failed_pages={self.failed_pages} "
             f"loaded_gib={self.loaded_bytes / 1024**3:.2f}"
+            + (self._phase_summary(n) if self.phase_timing else "")
+        )
+
+    def _phase_summary(self, n: int) -> str:
+        """Per-load mean wall/CPU ms of each loader phase, and pages and batches per load.
+
+        Wait time minus the fence phase is the time a load sat in the queue.
+        """
+        phases = " ".join(
+            f"{name}={1000 * self.phase_wall[name] / n:.1f}/{1000 * self.phase_cpu[name] / n:.1f}"
+            for name in _LOAD_PHASES
+        )
+        return (
+            f" phase_ms(wall/cpu per load) {phases} "
+            f"pages_per_load={self.pages / n:.0f} batches_per_load={self.batches / n:.1f}"
         )
 
 
@@ -309,7 +366,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._async_pending: Set[int] = set()
         # Dequeued by a worker and transferring right now.
         self._async_active: Set[int] = set()
-        self._async_stats = _AsyncLoadStats()
+        self._async_stats = _AsyncLoadStats(os.environ.get(LOAD_PHASE_TIMING_ENV, "0") == "1")
         self._async_stats_last = time.monotonic()
         self._async_stats_interval = 30.0
         # Landed but not yet reported: request -> whether a page was missing.
@@ -601,6 +658,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         staging: Optional[HostStagingPool],
         handle: int,
         batch_size: Optional[int] = None,
+        phases: Optional[Dict[str, List[float]]] = None,
     ) -> Tuple[Set[int], int, Optional[str], int]:
         """Fetch pages batch by batch, scattering staged ones onto the device.
 
@@ -631,13 +689,15 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             batch_keys = [keys[i] for i in indices]
             batch_addresses = [addresses[i] for i in indices]
             batch_sizes = [sizes[i] for i in indices]
-            if staging is None:
-                target_addresses, target_sizes = list(batch_addresses), list(batch_sizes)
-            else:
-                target_addresses, target_sizes = describe_batch_for_get(staging, batch_sizes)
-            results = self._store.batch_get_into_multi_buffers(
-                batch_keys, target_addresses, target_sizes
-            )
+            with _timed_phase(phases, "describe"):
+                if staging is None:
+                    target_addresses, target_sizes = list(batch_addresses), list(batch_sizes)
+                else:
+                    target_addresses, target_sizes = describe_batch_for_get(staging, batch_sizes)
+            with _timed_phase(phases, "get"):
+                results = self._store.batch_get_into_multi_buffers(
+                    batch_keys, target_addresses, target_sizes
+                )
             if len(results) != len(batch_keys):
                 results = [-1] * len(batch_keys)
             ok = [j for j, result in enumerate(results) if isinstance(result, int) and result >= 0]
@@ -661,10 +721,12 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             if staging is not None and ok:
                 # Only slots that were filled are scattered, so a failed read is
                 # never copied over a device page.
-                unstage_batch_after_get(staging, batch_addresses, batch_sizes, handle, only=ok)
+                with _timed_phase(phases, "unstage"):
+                    unstage_batch_after_get(staging, batch_addresses, batch_sizes, handle, only=ok)
                 # The next batch reuses the slots and the forward pass reads
                 # these pages, so the scatter has to complete before either.
-                _sync_stream(handle)
+                with _timed_phase(phases, "sync"):
+                    _sync_stream(handle)
         return failed_requests, num_failed_pages, first_failure, loaded_bytes
 
     # ---- asynchronous load path ----
@@ -787,6 +849,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             failed = False
             num_failed_pages = 0
             loaded_bytes = 0
+            phases = {} if self._async_stats.phase_timing else None
+            load_pages = load_batches = 0
             try:
                 # The pages were reserved during the parking iteration's
                 # resource preparation, possibly on the KV cache manager's
@@ -796,13 +860,24 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 # waited for here rather than on the executor thread. The
                 # request cannot be freed while its load is pending, so its
                 # fence stays valid until then. Counted as queue wait.
-                self._wait_for_destinations({request_id}, None, fence)
+                with _timed_phase(phases, "fence"):
+                    self._wait_for_destinations({request_id}, None, fence)
                 started_at = time.monotonic()
-                keys, addresses, sizes, total_pages = self._resolve([transfers])
+                with _timed_phase(phases, "resolve"):
+                    keys, addresses, sizes, total_pages = self._resolve([transfers])
                 owners = [request_id] * len(keys)
                 failed_requests, num_failed_pages, first_failure, loaded_bytes = self._load_pages(
-                    keys, addresses, sizes, owners, staging, handle, self._async_batch_size
+                    keys,
+                    addresses,
+                    sizes,
+                    owners,
+                    staging,
+                    handle,
+                    self._async_batch_size,
+                    phases=phases,
                 )
+                load_pages = total_pages
+                load_batches = -(-len(keys) // (self._async_batch_size or len(keys) or 1))
                 failed = bool(failed_requests)
                 if failed:
                     logger.warning(
@@ -838,6 +913,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                         num_failed_pages,
                         loaded_bytes,
                     )
+                    if phases is not None:
+                        # With its completion, so a stats line sees both or neither.
+                        self._async_stats.record_phases(phases, load_pages, load_batches)
 
     def take_failed_load_requests(self) -> Set[int]:
         """Requests whose pages could not all be loaded in the last `start_load_kv`.

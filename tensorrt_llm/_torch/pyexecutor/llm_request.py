@@ -1008,6 +1008,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # allocation clears this flag so replay can report its new pages.
         self.py_connector_allocation_reported = False
 
+        # The connector's answer for this allocation when the scheduler asked
+        # at admission (TLLM_CTX_UNCHARGED_ASYNC_PARKS), so prepare_resources
+        # uses it instead of asking again. Cleared when read and when the
+        # allocation is released.
+        self.py_connector_admission_offer = None
+
         # End of the prefix served from outside the manager (a KV cache
         # connector's load, or a staging fetch the request resumes from) retained
         # by this allocation, or 0. This depth survives async parking; local reuse

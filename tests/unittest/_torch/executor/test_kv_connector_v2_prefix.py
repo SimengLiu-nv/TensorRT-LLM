@@ -100,6 +100,7 @@ class FakeRequest:
         self.is_disagg_generation_init_state = False
         self.py_num_connector_matched_tokens = 0
         self.py_connector_allocation_reported = False
+        self.py_connector_admission_offer = None
         self.py_served_prefix_end = 0
         self.py_ctx_pre_resize_cap = None
         self.py_draft_tokens = []
@@ -155,6 +156,7 @@ class FakeConnectorManager:
         # Read by the manager to decide whether the prefix path runs at all.
         self.capacity_only = False
         self.prefix_reservations_enabled = False
+        self.admission_query_capable = False
         self.reservations = {}
         self.reservation_requests = {}
         self.next_reservation_id = 1
@@ -1093,6 +1095,125 @@ class TestPrefixReservations:
         assert not cache.closed
         assert other_cache.closed
         assert other.context_current_position == 0
+
+
+class TestAdmissionQuery:
+    """TLLM_CTX_UNCHARGED_ASYNC_PARKS: the scheduler asks at admission, and prepare reuses that answer."""
+
+    @staticmethod
+    def _admitted(num_matched=64, load_async=True, capable=True, committed=0):
+        connector = FakeConnectorManager(num_matched=num_matched, load_async=load_async)
+        connector.admission_query_capable = capable
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=committed, capacity=PROMPT_LEN)
+        manager.kv_cache_map[req.py_request_id] = kv_cache
+        req.context_current_position = committed
+        req.set_prepopulated_prompt_len(committed, TOKENS_PER_BLOCK)
+        manager.begin_connector_admission_pass()
+        return connector, manager, req, kv_cache
+
+    def test_an_async_answer_parks_and_is_not_asked_again(self):
+        connector, manager, req, _ = self._admitted()
+        assert manager.query_connector_at_admission(req, allow_query=True)
+        assert connector.queries == [(0, 0)]
+
+        manager._run_kv_connector_hooks(scheduled(req))
+
+        assert connector.queries == [(0, 0)]
+        assert connector.commits == [(0, 64, True)]
+        assert len(connector.allocs) == 1
+        assert req.py_connector_admission_offer is None
+
+    @pytest.mark.parametrize("num_matched, load_async", [(64, False), (0, False)])
+    def test_sync_and_miss_answers_do_not_park_and_are_used_once(self, num_matched, load_async):
+        connector, manager, req, _ = self._admitted(num_matched, load_async)
+        assert not manager.query_connector_at_admission(req, allow_query=True)
+
+        manager._run_kv_connector_hooks(scheduled(req))
+
+        assert connector.queries == [(0, 0)]
+        assert connector.commits == [(0, num_matched, False)]
+
+    def test_no_capability_means_no_admission_query(self):
+        connector, manager, req, _ = self._admitted(capable=False)
+        assert not manager.query_connector_at_admission(req, allow_query=True)
+        assert connector.queries == []
+        assert req.py_connector_admission_offer is None
+
+    @pytest.mark.parametrize(
+        "guard",
+        ["reservations", "draft", "reported", "no_add_sequence", "capacity_only", "not_allowed"],
+    )
+    def test_every_guard_blocks_the_query(self, guard):
+        connector, manager, req, _ = self._admitted()
+        allow_query = True
+        if guard == "reservations":
+            connector.prefix_reservations_enabled = True
+        elif guard == "draft":
+            manager.is_draft = True
+        elif guard == "reported":
+            req.py_connector_allocation_reported = True
+        elif guard == "no_add_sequence":
+            connector.add_sequence = False
+        elif guard == "capacity_only":
+            connector.capacity_only = True
+        else:
+            allow_query = False
+        assert not manager.query_connector_at_admission(req, allow_query=allow_query)
+        assert connector.queries == []
+
+    def test_disallowed_ask_drops_an_old_answer(self):
+        _, manager, req, _ = self._admitted()
+        assert manager.query_connector_at_admission(req, allow_query=True)
+        assert not manager.query_connector_at_admission(req, allow_query=False)
+        assert req.py_connector_admission_offer is None
+
+    def test_an_answer_from_an_earlier_pass_is_asked_again(self):
+        """A request dropped before prepare (e.g. by the total-KV cap) is asked afresh next pass, and its pages are
+        still reported once."""
+        connector, manager, req, _ = self._admitted()
+        assert manager.query_connector_at_admission(req, allow_query=True)
+        manager.begin_connector_admission_pass()
+
+        manager._run_kv_connector_hooks(scheduled(req))
+
+        assert connector.queries == [(0, 0), (0, 0)]
+        assert len(connector.allocs) == 1
+        assert req.py_connector_admission_offer is None
+
+    def test_a_moved_cache_is_refused(self):
+        _, manager, req, kv_cache = self._admitted()
+        assert manager.query_connector_at_admission(req, allow_query=True)
+        kv_cache.num_committed_tokens = TOKENS_PER_BLOCK
+        with pytest.raises(RuntimeError, match="admission-time connector answer"):
+            manager._run_kv_connector_hooks(scheduled(req))
+
+    def test_releasing_the_allocation_drops_the_answer(self):
+        _, manager, req, _ = self._admitted()
+        assert manager.query_connector_at_admission(req, allow_query=True)
+        manager.kv_cache_map.pop(req.py_request_id)
+        manager.free_resources(req)
+        assert req.py_connector_admission_offer is None
+
+    def test_offer_stats_classify_the_served_prefix(self):
+        connector, manager, req, _ = self._admitted()
+        manager._connector_offer_stats_enabled = True
+        manager._connector_offer_stats = manager._new_connector_offer_stats()
+        assert manager.query_connector_at_admission(req, allow_query=True)
+
+        manager._run_kv_connector_hooks(scheduled(req))
+        stats = manager.take_connector_offer_stats()
+
+        assert stats["queries"] == 1 and stats["admission_used"] == 1
+        assert stats["offers"] == 1 and stats["async_offers"] == 1
+        assert stats["offered_tokens"] == 64 and stats["honoured_tokens"] == 64
+        assert stats["in_chunk"] == 1
+        assert manager.take_connector_offer_stats()["queries"] == 0
+
+    def test_offer_stats_are_off_by_default(self):
+        _, manager, _, _ = self._admitted()
+        assert manager.take_connector_offer_stats() is None
 
 
 def test_disagg_metadata_build_keeps_pending_context_reservation() -> None:

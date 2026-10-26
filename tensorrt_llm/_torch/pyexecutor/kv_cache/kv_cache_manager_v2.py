@@ -15,6 +15,7 @@
 import math
 import os
 import sys
+import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -784,6 +785,24 @@ def _get_static_cache_size_layer_components(
     return layer_sizes, attention_windows
 
 
+class ConnectorAdmissionOffer(NamedTuple):
+    """A connector's answer taken while the scheduler admitted the request.
+
+    ``epoch`` is the scheduling pass it was taken in; ``prepare_resources``
+    uses it only within that pass, against the same ``local_end``.
+    """
+
+    epoch: int
+    local_end: int
+    num_tokens: int
+    load_async: bool
+
+    @property
+    def parks(self) -> bool:
+        """Whether the runtime will park the request for an asynchronous load."""
+        return self.load_async and self.num_tokens > 0
+
+
 class _MmRunMetadata(NamedTuple):
     """CPU tensors for exact multimodal run lookup.
 
@@ -1259,6 +1278,11 @@ class KVCacheManagerV2(BaseResourceManager):
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
+    # Admission-time connector answers and their counters, on the class for the
+    # same reason: the connector prefix path reads them on instances tests
+    # build without running __init__.
+    _connector_admission_epoch: int = 0
+    _connector_offer_stats_enabled: bool = False
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -1320,6 +1344,13 @@ class KVCacheManagerV2(BaseResourceManager):
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
         self.kv_connector_manager = kv_connector_manager
+        # Scheduling pass of admission-time connector answers; see
+        # `query_connector_at_admission`.
+        self._connector_admission_epoch = 0
+        # Per-iteration connector offer accounting for TLLM_CTX_PARK_STATS;
+        # read and reset by the executor (`take_connector_offer_stats`).
+        self._connector_offer_stats_enabled = os.environ.get("TLLM_CTX_PARK_STATS", "0") == "1"
+        self._connector_offer_stats = self._new_connector_offer_stats()
         codec_config = getattr(cold_page_codec_provider, "config", None)
         self._has_lossy_cold_page_codec = (
             getattr(codec_config, "algorithm", None) == "quantization_for_cold_page"
@@ -4499,9 +4530,12 @@ class KVCacheManagerV2(BaseResourceManager):
             # Both forms are offered; the manager picks the one this connector
             # implements. With several layer groups the flat list is empty,
             # because a page index is scoped to a group.
+            started = time.perf_counter()
             by_group = self.get_page_indices_by_layer_group(request)
             flat = by_group[0] if len(by_group) == 1 else []
             self.kv_connector_manager.update_state_after_alloc(request, flat, by_group)
+            if self._connector_offer_stats_enabled:
+                self._connector_offer_stats["report_ms"] += (time.perf_counter() - started) * 1e3
 
         if served_any:
             # A served prefix can carry a request past its last chunk boundary,
@@ -4620,6 +4654,84 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_connector_manager.update_state_after_alloc(req, flat, by_group)
             req.py_connector_allocation_reported = True
 
+    def begin_connector_admission_pass(self) -> None:
+        """Start a scheduling pass: answers from earlier passes go stale."""
+        self._connector_admission_epoch += 1
+
+    def _connector_admission_query_enabled(self) -> bool:
+        return (
+            self.kv_connector_manager is not None
+            and not self.is_draft
+            and getattr(self.kv_connector_manager, "admission_query_capable", False) is True
+            and not self.kv_connector_manager.capacity_only
+            and not self._connector_reservations_enabled()
+        )
+
+    def query_connector_at_admission(self, req: LlmRequest, *, allow_query: bool) -> bool:
+        """Ask the connector now, while the scheduler admits ``req``, and keep the answer.
+
+        Returns whether the runtime will park ``req`` for an asynchronous load,
+        so the scheduler need not charge its chunk to the token budget. The
+        answer is the allocation's one query: ``_apply_connector_matched_prefix``
+        uses it in this pass's ``prepare_resources`` instead of asking again.
+        Called after the scheduler has allocated the chunk, with the same
+        guards as ``_run_kv_connector_hooks``; ``allow_query=False`` only drops
+        an answer left from an earlier pass.
+        """
+        req.py_connector_admission_offer = None
+        if not allow_query or not self._connector_admission_query_enabled():
+            return False
+        if (
+            not self._connector_may_serve(req)
+            or not req.is_first_context_chunk
+            or req.py_connector_allocation_reported
+            or not self.kv_connector_manager.should_add_sequence(req)
+        ):
+            return False
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return False
+        local_end = kv_cache.num_committed_tokens
+        started = time.perf_counter()
+        num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
+            req, local_end
+        )
+        if self._connector_offer_stats_enabled:
+            self._connector_offer_stats["query_ms"] += (time.perf_counter() - started) * 1e3
+        offer = ConnectorAdmissionOffer(
+            self._connector_admission_epoch, local_end, num_tokens, load_async
+        )
+        req.py_connector_admission_offer = offer
+        return offer.parks
+
+    @staticmethod
+    def _new_connector_offer_stats() -> Dict[str, int]:
+        return {
+            "queries": 0,
+            "admission_used": 0,
+            "offers": 0,
+            "async_offers": 0,
+            "offered_tokens": 0,
+            "honoured_tokens": 0,
+            "in_chunk": 0,
+            "shifted": 0,
+            "capped": 0,
+            "not_honoured": 0,
+            # Host time (ms) in the leader query and its broadcast, in fitting the
+            # served prefix into the allocation, and in reporting the pages.
+            "query_ms": 0.0,
+            "reserve_ms": 0.0,
+            "report_ms": 0.0,
+        }
+
+    def take_connector_offer_stats(self) -> Optional[Dict[str, int]]:
+        """This iteration's connector offer counters (TLLM_CTX_PARK_STATS), reset on read."""
+        if not self._connector_offer_stats_enabled:
+            return None
+        stats = self._connector_offer_stats
+        self._connector_offer_stats = self._new_connector_offer_stats()
+        return stats
+
     def _connector_may_serve(self, req: LlmRequest) -> bool:
         """Whether the connector is allowed to serve a prefix for ``req``."""
         if self.kv_connector_manager is None or self.is_draft:
@@ -4655,17 +4767,41 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
 
         local_end = kv_cache.num_committed_tokens
-        num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
-            req, local_end
-        )
+        offer = getattr(req, "py_connector_admission_offer", None)
+        req.py_connector_admission_offer = None
+        if offer is not None and offer.epoch == self._connector_admission_epoch:
+            # Asked while the scheduler admitted it, this same pass; asking
+            # again would break the one-query-per-allocation contract.
+            if offer.local_end != local_end:
+                raise RuntimeError(
+                    f"req {req.py_request_id}: admission-time connector answer was "
+                    f"taken at {offer.local_end} but the cache is now at {local_end}"
+                )
+            num_tokens, load_async = offer.num_tokens, offer.load_async
+            used_admission = True
+        else:
+            started = time.perf_counter()
+            num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
+                req, local_end
+            )
+            if self._connector_offer_stats_enabled:
+                self._connector_offer_stats["query_ms"] += (time.perf_counter() - started) * 1e3
+            used_admission = False
         offered_end = min(local_end + num_tokens, req.prompt_len - 1)
+        chunk_end = min(local_end + req.context_chunk_size, req.prompt_len)
 
         position = local_end
+        started = time.perf_counter()
         if offered_end > local_end:
             fitted = self._reserve_connector_prefix(req, kv_cache, local_end, offered_end)
             if fitted is not None:
                 position, chunk_size = fitted
                 self._mark_connector_prefix_populated(req, position, chunk_size)
+        if self._connector_offer_stats_enabled:
+            self._connector_offer_stats["reserve_ms"] += (time.perf_counter() - started) * 1e3
+            self._count_connector_offer(
+                used_admission, num_tokens, load_async, local_end, offered_end, chunk_end, position
+            )
 
         # The honoured amount, not `num_tokens`: `build_scheduler_output`
         # reports `context_current_position - recorded` as the range computed
@@ -4681,6 +4817,39 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_connector_manager.commit_new_matched_tokens(req, position - local_end, load_async)
         self._record_connector_reuse(kv_cache, local_end, position)
         return position > local_end
+
+    def _count_connector_offer(
+        self,
+        used_admission: bool,
+        num_tokens: int,
+        load_async: bool,
+        local_end: int,
+        offered_end: int,
+        chunk_end: int,
+        position: int,
+    ) -> None:
+        """Book one answered query into the TLLM_CTX_PARK_STATS counters.
+
+        The candidate names follow ``_reserve_connector_prefix``: an offer inside
+        the scheduled chunk, the shifted window, or the capped fallback.
+        """
+        stats = self._connector_offer_stats
+        stats["queries"] += 1
+        stats["admission_used"] += int(used_admission)
+        if offered_end <= local_end:
+            return
+        stats["offers"] += 1
+        stats["async_offers"] += int(load_async)
+        stats["offered_tokens"] += offered_end - local_end
+        stats["honoured_tokens"] += position - local_end
+        if position == local_end:
+            stats["not_honoured"] += 1
+        elif offered_end < chunk_end:
+            stats["in_chunk"] += 1
+        elif position == offered_end:
+            stats["shifted"] += 1
+        else:
+            stats["capped"] += 1
 
     def _record_connector_reuse(self, kv_cache, start: int, end: int) -> None:
         """Book the prompt tokens a connector fills in ``[start, end)`` as cached.
@@ -5949,6 +6118,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_connector_manager.release_prefix_reservation(request)
         # Replay obtains fresh connector metadata for its new destination pages.
         request.py_connector_allocation_reported = False
+        # An admission-time answer belongs to the allocation being released.
+        request.py_connector_admission_offer = None
         # Same allocation, same lifetime. The pages the served position vouches
         # for are gone, so a replay recomputes from its own reuse match.
         request.py_served_prefix_end = 0
