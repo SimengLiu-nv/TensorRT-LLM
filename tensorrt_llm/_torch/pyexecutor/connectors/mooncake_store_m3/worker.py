@@ -69,6 +69,10 @@ from .validation import validate_layout, validate_llm_args
 
 __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
 
+#: Set to "1" to count prefix lookups that stop at a missing block while later
+#: blocks of the same chain are still stored. Diagnostic only.
+HOLE_STATS_ENV = "TRTLLM_MOONCAKE_HOLE_STATS"
+
 #: Set by the worker's constructor so the scheduler adapter, built in the same
 #: process on every ADP owner (rank 0 for TP), can reach the store handle without
 #: a second connection or an out-of-band channel. See `py_executor_creator`, which
@@ -251,6 +255,74 @@ class _AsyncLoadStats:
         )
 
 
+class _PrefixHoleStats:
+    """Prefix lookups that stopped at a hole, summarised once per interval.
+
+    A hole is a missing block followed by stored blocks of the same chain: the
+    pool evicted a block from the middle of a chain it otherwise still holds.
+    The lookup stops at the hole, so the request recomputes every token behind
+    it, including the stored ones counted here as holed.
+    """
+
+    __slots__ = (
+        "lookups",
+        "lookup_blocks",
+        "hit_blocks",
+        "holes",
+        "hole_blocks",
+        "holed_tokens",
+        "max_holed_tokens",
+    )
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.lookups = 0
+        self.lookup_blocks = 0
+        self.hit_blocks = 0
+        self.holes = 0
+        self.hole_blocks = 0
+        self.holed_tokens = 0
+        self.max_holed_tokens = 0
+
+    def record(
+        self,
+        num_blocks: int,
+        hit_blocks: int,
+        stored_after_hole: Sequence[int],
+        tokens_per_block: int,
+    ) -> None:
+        """Account for one lookup.
+
+        Args:
+            num_blocks: Blocks looked up.
+            hit_blocks: Usable prefix length, which is also the hole's index.
+            stored_after_hole: Ascending indices of fully stored blocks after
+                the first missing one.
+            tokens_per_block: Tokens per block.
+        """
+        self.lookups += 1
+        self.lookup_blocks += num_blocks
+        self.hit_blocks += hit_blocks
+        if not stored_after_hole:
+            return
+        self.holes += 1
+        span = stored_after_hole[-1] + 1 - hit_blocks
+        self.hole_blocks += span - len(stored_after_hole)
+        holed_tokens = len(stored_after_hole) * tokens_per_block
+        self.holed_tokens += holed_tokens
+        self.max_holed_tokens = max(self.max_holed_tokens, holed_tokens)
+
+    def summary(self) -> str:
+        return (
+            f"lookups={self.lookups} lookup_blocks={self.lookup_blocks} "
+            f"hit_blocks={self.hit_blocks} holes={self.holes} "
+            f"hole_blocks={self.hole_blocks} holed_tokens={self.holed_tokens} "
+            f"max_holed_tokens={self.max_holed_tokens}"
+        )
+
+
 def _stream_handle(stream) -> int:
     """The raw CUDA stream handle behind a torch stream, or a handle as given.
 
@@ -375,6 +447,12 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._async_announced: Set[int] = set()
         self._failed_async_load_requests: Set[int] = set()
         self._load_error: Optional[BaseException] = None
+        # Prefix holes, counted only when HOLE_STATS_ENV is "1".
+        self._hole_stats: Optional[_PrefixHoleStats] = (
+            _PrefixHoleStats() if os.environ.get(HOLE_STATS_ENV, "0") == "1" else None
+        )
+        self._hole_stats_last = time.monotonic()
+        self._hole_stats_interval = 60.0
 
         global _LOCAL_WORKER
         _LOCAL_WORKER = self
@@ -602,7 +680,50 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             if not all(status == 1 for status in window):
                 break
             hit_blocks += 1
+        if self._hole_stats is not None:
+            self._record_prefix_hole(present, keys_per_block, len(block_hashes), hit_blocks)
         return hit_blocks
+
+    def _record_prefix_hole(
+        self, present: Sequence[int], keys_per_block: int, num_blocks: int, hit_blocks: int
+    ) -> None:
+        """Count stored blocks behind the first missing one. Never changes the hit."""
+        stored_after_hole = [
+            index
+            for index in range(hit_blocks + 1, num_blocks)
+            if all(
+                status == 1
+                for status in present[index * keys_per_block : (index + 1) * keys_per_block]
+            )
+        ]
+        self._hole_stats.record(
+            num_blocks, hit_blocks, stored_after_hole, self._addressing.tokens_per_block
+        )
+        self._maybe_log_hole_stats()
+
+    def _maybe_log_hole_stats(self, force: bool = False) -> Optional[str]:
+        """Emit the prefix-hole summary at most once per interval.
+
+        Returns the line when one was emitted. Nothing is emitted when hole
+        stats are off or no lookup ran since the last line.
+        """
+        # Read defensively: `shutdown` also runs from `__del__` on a worker
+        # whose constructor may not have got this far.
+        stats = getattr(self, "_hole_stats", None)
+        if stats is None:
+            return None
+        now = time.monotonic()
+        due = force or now - self._hole_stats_last >= self._hole_stats_interval
+        if not (due and stats.lookups):
+            return None
+        line = (
+            f"mooncake-store prefix-hole stats: rank {self._rank} "
+            f"window_s={now - self._hole_stats_last:.0f} {stats.summary()}"
+        )
+        stats.reset()
+        self._hole_stats_last = now
+        logger.info(line)
+        return line
 
     # ---- load path ----
 
@@ -1196,6 +1317,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
     def shutdown(self) -> None:
         """Stop the save thread and release the store handle. Idempotent."""
+        self._maybe_log_hole_stats(force=True)
         thread, self._save_thread = self._save_thread, None
         if thread is not None:
             self._save_queue.put(None)
