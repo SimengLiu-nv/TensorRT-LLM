@@ -18,8 +18,8 @@ import asyncio
 import signal
 import socket
 import traceback
-from contextlib import asynccontextmanager
-from typing import Callable, Optional
+from contextlib import aclosing, asynccontextmanager
+from typing import AsyncGenerator, Callable, Optional
 
 import aiohttp
 import uvicorn
@@ -290,12 +290,34 @@ class OpenAIDisaggServer:
                 response_or_generator = await entry_point(req, hooks)
                 self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
-                    return StreamingResponse(content=response_or_generator, media_type="text/event-stream")
+                    content = await self._start_stream(response_or_generator)
+                    return StreamingResponse(content=content, media_type="text/event-stream")
                 else:
                     return JSONResponse(content=response_or_generator.model_dump())
             except Exception as e:
                 self._handle_exception(e)
         return wrapper
+
+    @staticmethod
+    async def _start_stream(generator: AsyncGenerator) -> AsyncGenerator:
+        """Pull the first chunk before the response headers are sent.
+
+        A worker that fails before its first token (e.g. a KV-cache transfer error on the
+        generation server) then raises here and becomes an HTTP error response, instead of a
+        200 whose body is cut off.
+        """
+        try:
+            first_chunk = await anext(generator)
+        except StopAsyncIteration:
+            return generator
+
+        async def stream():
+            async with aclosing(generator):
+                yield first_chunk
+                async for chunk in generator:
+                    yield chunk
+
+        return stream()
 
     def _handle_exception(self, exception):
         if isinstance(exception, CppExecutorError):

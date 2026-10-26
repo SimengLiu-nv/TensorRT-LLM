@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import pytest
-from fastapi import Request
+from fastapi import HTTPException, Request
+from fastapi.responses import StreamingResponse
 from starlette.datastructures import Headers
 
 from tensorrt_llm.llmapi.disagg_utils import extract_disagg_cfg
@@ -174,3 +176,62 @@ def test_disagg_config_rejects_non_bool_request_chat_template_opt_in(value):
             generation_servers={"num_instances": 0},
             allow_request_chat_template=value,
         )
+
+
+def _streaming_server():
+    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    server._perf_metrics_collector = MagicMock()
+    server._allow_request_chat_template = False
+    return server
+
+
+def _streaming_raw_request():
+    return SimpleNamespace(
+        headers=Headers(headers={}), state=SimpleNamespace(server_arrival_time=0.0)
+    )
+
+
+@pytest.mark.asyncio
+async def test_stream_failing_before_first_chunk_returns_http_error():
+    """A generation server that fails its KV transfer yields no chunk; answer 500, not a cut 200."""
+
+    async def failing_generation_stream():
+        raise aiohttp.ClientPayloadError("Response payload is not completed")
+        yield b"unreachable"
+
+    async def entry_point(request, hooks):
+        return failing_generation_stream()
+
+    wrapper = _streaming_server()._wrap_entry_point(entry_point, CompletionRequest)
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await wrapper(request, _streaming_raw_request())
+
+    assert exc_info.value.status_code == 500
+    assert "Response payload is not completed" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunks", [[b"data: 1\n\n", b"data: 2\n\n", b"data: [DONE]\n\n"], []])
+async def test_stream_forwards_every_chunk(chunks):
+    closed = []
+
+    async def generation_stream():
+        try:
+            for chunk in chunks:
+                yield chunk
+        finally:
+            closed.append(True)
+
+    async def entry_point(request, hooks):
+        return generation_stream()
+
+    wrapper = _streaming_server()._wrap_entry_point(entry_point, CompletionRequest)
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+
+    response = await wrapper(request, _streaming_raw_request())
+
+    assert isinstance(response, StreamingResponse)
+    assert [chunk async for chunk in response.body_iterator] == chunks
+    assert closed == [True]
