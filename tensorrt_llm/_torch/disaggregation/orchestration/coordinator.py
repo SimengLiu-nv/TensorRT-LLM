@@ -251,6 +251,8 @@ class DisaggTransferCoordinator:
         if self.inflight_cancel_active():
             self._cancel_timed_out_gen_transfers()
             self._check_gen_transfer_errors_consensus()
+        else:
+            self._fail_timed_out_gen_transfers()
 
     @nvtx_range("check_transfer_timeouts")
     def check_transfer_timeouts(self, only_with_context_sends: bool = False) -> None:
@@ -821,6 +823,41 @@ class DisaggTransferCoordinator:
                     f"{request.py_request_id}; waiting for C++ transfer status "
                     "to report final cleanup"
                 )
+
+    @nvtx_range("fail_timed_out_gen_transfers")
+    def _fail_timed_out_gen_transfers(self) -> None:
+        """Cancel generation transfers that exceeded ``kv_transfer_timeout_ms``.
+
+        Without in-flight cancellation the response pass does this as well,
+        but only after a forward step, so a generation server with nothing
+        else to run would keep such a request (e.g. one whose KV never
+        arrives) forever. A cancellation the transceiver cannot finish yet (the
+        Python transceiver with a receive in flight) is reported as a cancelled
+        transfer by the next ``reap_gen_receives``, which fails the request
+        through the transfer-error path.
+        """
+        if self._transceiver.kv_transfer_timeout_ms is None:
+            return
+        timed_out = [
+            request
+            for request in self._registry.active_requests()
+            if request.py_kv_transfer_timed_out
+            and request.is_disagg_generation_transmission_in_progress
+        ]
+        if not timed_out:
+            return
+        user_canceled_ids = set(self._registry.canceled_request_ids())
+        timed_out = [
+            request
+            for request in timed_out
+            if self._vote_id(request) not in user_canceled_ids
+            and self.request_cancellation(request)
+        ]
+        if not timed_out:
+            return
+        for request in timed_out:
+            self._registry.remove(request)
+        self.fail_timed_out(timed_out)
 
     @nvtx_range("check_gen_transfer_errors_consensus")
     def _check_gen_transfer_errors_consensus(self) -> None:

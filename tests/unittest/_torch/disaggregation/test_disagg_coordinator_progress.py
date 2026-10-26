@@ -16,6 +16,7 @@ import pytest
 from coordinator_harness import CoordinatorHarness, TransferRequest
 from fake_dist import FakeDistGroup
 
+from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 
@@ -254,3 +255,102 @@ def test_context_gate_is_entered_once_per_rank_whatever_arrived_locally() -> Non
         ["prepare_context_requests:[1]"],
     ]
     assert [h.dist.calls for h in ranks] == [[], []]
+
+
+# -- generation transfer timeout on an idle server -----------------------------
+
+
+def _cancel_only_marks_inflight_receives(transceiver) -> None:
+    """Model the Python transceiver: cancelling a receive still in flight only marks
+    the session cancelled and returns False; the next status poll reports it."""
+    cancel_finished_transfer = transceiver.cancel_request
+
+    def cancel_request(req) -> bool:
+        if req.py_request_id not in transceiver._pending_recvs:
+            return cancel_finished_transfer(req)
+        transceiver.call_log.append(f"cancel_request:{req.py_request_id}")
+        transceiver.cancel_recv_remotely(req)
+        return False
+
+    transceiver.cancel_request = cancel_request
+
+
+def _executor_drops_failed_requests(h: CoordinatorHarness) -> None:
+    """The executor's error path removes the requests it fails from active_requests."""
+    record_failure = h.effects.fail_requests
+
+    def fail_requests(error_msg, requests, *, charge_budget) -> None:
+        record_failure(error_msg, requests, charge_budget=charge_budget)
+        for req in requests:
+            if req in h.active:
+                h.active.remove(req)
+
+    h.effects.fail_requests = fail_requests
+
+
+@pytest.mark.parametrize(
+    "cancel_finishes_at_once, error_msg",
+    [
+        (True, "Request 1 timed out"),
+        (False, "Error in kv cache transfer for generation requests"),
+    ],
+)
+def test_idle_generation_server_fails_a_receive_whose_kv_never_arrives(
+    monkeypatch, clock, cancel_finishes_at_once: bool, error_msg: str
+) -> None:
+    """Nothing is scheduled, so the response pass never runs. The loop head alone
+    must cancel the receive once kv_transfer_timeout_ms passes and fail the request,
+    whether the cancel finishes at once or is reported by the next status poll."""
+    monkeypatch.setattr(coordinator_module, "is_disagg_inflight_cancel_enabled", lambda: False)
+    h = CoordinatorHarness(kv_transfer_timeout_ms=1000)
+    if not cancel_finishes_at_once:
+        _cancel_only_marks_inflight_receives(h.transceiver)
+    _executor_drops_failed_requests(h)
+    req = _receiving(h, 1, started_at=clock["t"])
+    clock["t"] += 2.0
+
+    for _ in range(3):  # idle loop heads: transfer status, then the timeout check
+        h.coordinator.poll_gen_transfers()
+        h.coordinator.check_transfer_timeouts()
+
+    assert h.transceiver.call_log.count("cancel_request:1") == 1
+    assert h.effects.failed == [(error_msg, [req], False)]
+    assert h.active == []
+
+
+def test_idle_generation_timeout_under_adp_waits_for_the_synced_drain(monkeypatch, clock) -> None:
+    monkeypatch.setattr(coordinator_module, "is_disagg_inflight_cancel_enabled", lambda: False)
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = _ranks(group, kv_transfer_timeout_ms=1000, enable_attention_dp=True)
+    req = _receiving(ranks[0], 1, started_at=clock["t"])
+    clock["t"] += 2.0
+    ranks[0].coordinator.check_transfer_timeouts()
+
+    group.run(lambda rank: ranks[rank].coordinator.poll_gen_transfers())
+
+    assert ranks[0].active == []
+    assert [h.effects.failed for h in ranks] == [[], []]
+
+    group.run(lambda rank: ranks[rank].coordinator.handle_timeouts_synced())
+
+    assert ranks[0].effects.failed == [("Request timed out (KV transfer)", [req], False)]
+    assert ranks[1].effects.failed == [("Request timed out (KV transfer)", [], False)]
+
+
+def test_idle_generation_timeout_leaves_fresh_and_user_canceled_receives(
+    monkeypatch, clock
+) -> None:
+    monkeypatch.setattr(coordinator_module, "is_disagg_inflight_cancel_enabled", lambda: False)
+    h = CoordinatorHarness(kv_transfer_timeout_ms=1000)
+    fresh = _receiving(h, 1, started_at=clock["t"])
+    user_canceled = _receiving(h, 2, started_at=clock["t"] - 2.0)
+    h.registry.canceled.append(2)
+    h.coordinator.check_transfer_timeouts()
+
+    h.coordinator.poll_gen_transfers()
+
+    assert not fresh.py_kv_transfer_timed_out and user_canceled.py_kv_transfer_timed_out
+    assert "cancel_request:1" not in h.transceiver.call_log
+    assert "cancel_request:2" not in h.transceiver.call_log
+    assert h.active == [fresh, user_canceled]
+    assert h.effects.failed == []
