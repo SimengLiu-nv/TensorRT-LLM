@@ -49,6 +49,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store_m3.addressing impo
     merge_intervals,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store_m3.config import (
+    GROUP_BLOCKS_ENV,
     LOCAL_REUSE_BACKOFF_ENV,
     SOFT_PIN_TTL_ENV,
     MooncakeStoreConnectorConfig,
@@ -177,6 +178,7 @@ def store_config(tmp_path, monkeypatch):
     monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_PREFIX", raising=False)
     monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_MODEL_KEY", raising=False)
     monkeypatch.delenv(SOFT_PIN_TTL_ENV, raising=False)
+    monkeypatch.delenv(GROUP_BLOCKS_ENV, raising=False)
     return path
 
 
@@ -927,28 +929,34 @@ def _save_two_pages(worker):
     )
 
 
-def test_worker_save_passes_no_config_by_default(store_config, fake_store, monkeypatch):
-    monkeypatch.delenv(SOFT_PIN_TTL_ENV, raising=False)
-    monkeypatch.setattr(
-        worker_module,
-        "_soft_pin_put_config",
-        lambda _ttl_ms: pytest.fail("soft pin is off, so no config may be built"),
-    )
+def test_worker_save_passes_no_config_by_default(store_config, fake_store):
     with make_worker(fake_store, layout=make_layout()) as worker:
+        assert worker._put_config is None
         _save_two_pages(worker)
     assert fake_store.put_options == [((), {})]
 
 
-def test_worker_save_soft_pins_every_page_when_configured(store_config, fake_store, monkeypatch):
-    """The one config is built once and handed to every put of every batch."""
+def _record_put_configs(monkeypatch):
+    """Replace the config factory; each call returns a namespace of its arguments."""
     built = []
 
-    def fake_config(ttl_ms):
-        config = SimpleNamespace(soft_pin_ttl_ms=ttl_ms)
+    def fake_config(soft_pin_ttl_ms, group_ids=None):
+        if soft_pin_ttl_ms is None and group_ids is None:
+            return None
+        config = SimpleNamespace(
+            soft_pin_ttl_ms=soft_pin_ttl_ms,
+            group_ids=None if group_ids is None else list(group_ids),
+        )
         built.append(config)
         return config
 
-    monkeypatch.setattr(worker_module, "_soft_pin_put_config", fake_config)
+    monkeypatch.setattr(worker_module, "_put_config", fake_config)
+    return built
+
+
+def test_worker_save_soft_pins_every_page_when_configured(store_config, fake_store, monkeypatch):
+    """The one config is built once and handed to every put of every batch."""
+    built = _record_put_configs(monkeypatch)
     monkeypatch.setenv(SOFT_PIN_TTL_ENV, "86400000")
     raw = json.loads(store_config.read_text())
     raw["transfer_batch_size"] = 1
@@ -957,20 +965,83 @@ def test_worker_save_soft_pins_every_page_when_configured(store_config, fake_sto
         _save_two_pages(worker)
     assert len(built) == 1
     assert built[0].soft_pin_ttl_ms == 86400000
+    assert built[0].group_ids is None
     assert len(fake_store.put_calls) == 2
     assert fake_store.put_options == [((built[0],), {}), ((built[0],), {})]
 
 
 def test_worker_builds_no_put_config_for_a_consumer(store_config, fake_store, monkeypatch):
+    built = _record_put_configs(monkeypatch)
     monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_ROLE", "consumer")
     monkeypatch.setenv(SOFT_PIN_TTL_ENV, "86400000")
-    monkeypatch.setattr(
-        worker_module,
-        "_soft_pin_put_config",
-        lambda _ttl_ms: pytest.fail("a consumer never writes, so it needs no put config"),
-    )
+    monkeypatch.setenv(GROUP_BLOCKS_ENV, "1")
     with make_worker(fake_store, layout=make_layout()) as worker:
         assert worker._put_config is None
+    assert built == []
+
+
+def test_worker_groups_every_page_of_a_block(store_config, fake_store, monkeypatch):
+    """Each put names one group per key: shared across a block's layer groups,
+    distinct across blocks, and aligned with the pages left after the exist filter."""
+    built = _record_put_configs(monkeypatch)
+    monkeypatch.setenv(SOFT_PIN_TTL_ENV, "5000")
+    monkeypatch.setenv(GROUP_BLOCKS_ENV, "1")
+    with make_worker(fake_store, layout=make_layout(num_groups=2)) as worker:
+        hashes = [bytes([index]) * 16 for index in range(2)]
+        # Block 0's layer-group-1 page is already stored, so only three are put.
+        fake_store.objects.add(worker._namespaces[1].key(hashes[0]))
+        worker._put(
+            [
+                RequestTransfers(
+                    1,
+                    [
+                        PageTransfer(hashes[0], 0, 0),
+                        PageTransfer(hashes[0], 1, 0),
+                        PageTransfer(hashes[1], 0, 1),
+                        PageTransfer(hashes[1], 1, 1),
+                    ],
+                )
+            ]
+        )
+        group0 = worker._namespaces[0].group(hashes[0])
+        group1 = worker._namespaces[0].group(hashes[1])
+        assert worker._namespaces[1].group(hashes[0]) == group0
+        assert group0 != group1
+        expected_keys = [
+            worker._namespaces[0].key(hashes[0]),
+            worker._namespaces[0].key(hashes[1]),
+            worker._namespaces[1].key(hashes[1]),
+        ]
+    ((keys, _, _),) = fake_store.put_calls
+    assert keys == expected_keys
+    ((args, kwargs),) = fake_store.put_options
+    assert kwargs == {}
+    (config,) = args
+    assert config.group_ids == [group0, group1, group1]
+    assert config.soft_pin_ttl_ms == 5000
+    # The construction-time probe plus the one put.
+    assert [entry.group_ids for entry in built] == [["probe"], [group0, group1, group1]]
+
+
+def test_key_namespace_group_ignores_rank_and_layer_group():
+    def namespace(**overrides):
+        fields = dict(
+            cache_prefix="p",
+            model_key="m",
+            rank=0,
+            world_size=2,
+            layer_group_id=0,
+            tokens_per_block=4,
+            bytes_per_page=64,
+        )
+        fields.update(overrides)
+        return KeyNamespace(**fields)
+
+    block = b"\x01" * 16
+    assert namespace().group(block) == namespace(rank=1, layer_group_id=3).group(block)
+    assert namespace().key(block) != namespace(rank=1).key(block)
+    assert namespace().group(block) != namespace(world_size=4).group(block)
+    assert namespace().group(block) != namespace().group(b"\x02" * 16)
 
 
 def _fake_mooncake_store(monkeypatch, **attributes):
@@ -983,28 +1054,71 @@ def _fake_mooncake_store(monkeypatch, **attributes):
     monkeypatch.setitem(sys.modules, "mooncake.store", store)
 
 
-def test_soft_pin_put_config_enables_soft_pin_with_the_ttl(monkeypatch):
-    class SoftPinAction(Enum):
-        PRESERVE = 0
-        ENABLE = 1
-        DISABLE = 2
+class _SoftPinAction(Enum):
+    PRESERVE = 0
+    ENABLE = 1
+    DISABLE = 2
 
-    class ReplicateConfig:
-        def __init__(self):
-            self.soft_pin_action = SoftPinAction.PRESERVE
-            self.soft_pin_ttl_ms = None
 
-    _fake_mooncake_store(monkeypatch, ReplicateConfig=ReplicateConfig, SoftPinAction=SoftPinAction)
-    config = worker_module._soft_pin_put_config(86400000)
-    assert isinstance(config, ReplicateConfig)
-    assert config.soft_pin_action is SoftPinAction.ENABLE
+class _ReplicateConfig:
+    def __init__(self):
+        self.soft_pin_action = _SoftPinAction.PRESERVE
+        self.soft_pin_ttl_ms = None
+        self.group_ids = None
+
+
+def test_put_config_is_none_without_options():
+    assert worker_module._put_config(None) is None
+    assert worker_module._put_config(None, None) is None
+
+
+def test_put_config_sets_soft_pin_and_groups(monkeypatch):
+    _fake_mooncake_store(
+        monkeypatch, ReplicateConfig=_ReplicateConfig, SoftPinAction=_SoftPinAction
+    )
+    config = worker_module._put_config(86400000)
+    assert isinstance(config, _ReplicateConfig)
+    assert config.soft_pin_action is _SoftPinAction.ENABLE
     assert config.soft_pin_ttl_ms == 86400000
+    assert config.group_ids is None
+
+    config = worker_module._put_config(None, ("a", "b"))
+    assert config.soft_pin_action is _SoftPinAction.PRESERVE
+    assert config.group_ids == ["a", "b"]
 
 
-def test_soft_pin_put_config_names_the_binding_it_needs(monkeypatch):
-    _fake_mooncake_store(monkeypatch, ReplicateConfig=object)
+def test_put_config_names_the_binding_it_needs(monkeypatch):
+    _fake_mooncake_store(monkeypatch, ReplicateConfig=_ReplicateConfig)
     with pytest.raises(ImportError, match="SoftPinAction"):
-        worker_module._soft_pin_put_config(1000)
+        worker_module._put_config(1000)
+
+    class OldReplicateConfig:
+        __slots__ = ("soft_pin_action", "soft_pin_ttl_ms")
+
+    _fake_mooncake_store(
+        monkeypatch, ReplicateConfig=OldReplicateConfig, SoftPinAction=_SoftPinAction
+    )
+    with pytest.raises(ImportError, match="group_ids"):
+        worker_module._put_config(None, ["a"])
+
+
+@pytest.mark.parametrize("value,expected", [("1", True), ("on", True), ("0", False)])
+def test_config_group_blocks_env_override(store_config, monkeypatch, value, expected):
+    assert MooncakeStoreConnectorConfig.from_env().group_blocks is False
+    monkeypatch.setenv(GROUP_BLOCKS_ENV, value)
+    assert MooncakeStoreConnectorConfig.from_env().group_blocks is expected
+
+
+def test_config_group_blocks_reads_the_json_and_rejects_a_non_boolean_env(
+    store_config, monkeypatch
+):
+    raw = json.loads(store_config.read_text())
+    raw["group_blocks"] = True
+    store_config.write_text(json.dumps(raw))
+    assert MooncakeStoreConnectorConfig.from_env().group_blocks is True
+    monkeypatch.setenv(GROUP_BLOCKS_ENV, "sometimes")
+    with pytest.raises(ValueError, match=GROUP_BLOCKS_ENV):
+        MooncakeStoreConnectorConfig.from_env()
 
 
 def test_worker_reports_a_request_finished_once_its_saves_drain(store_config, fake_store):
