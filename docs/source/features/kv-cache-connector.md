@@ -312,6 +312,25 @@ Destroying an allocation clears its connector state, so replay queries again. Sp
 
 **Deployment note.** Under a connector, a workload that was token-bound becomes KV-bound: the connector removes forward-pass tokens but its prefix still occupies GPU pages. Lowering `max_num_tokens` to hand memory back to the KV pool is usually the right adjustment, the opposite of the guidance for a connector-free deployment.
 
+##### Completion headroom on disaggregated servers
+
+For full-attention models using V2 without an eviction tier, a disaggregated server reserves
+logical GPU-page headroom for each admitted request to finish; it does not allocate those pages
+early. Windowed and recurrent caches keep their existing admission policy.
+
+- **Decode.** Disaggregated generation admission reserves pages through each request's output
+  limit, including speculative padding. Incoming transfers may overlap decoding, but cannot
+  consume the pages reserved for admitted requests to finish.
+- **Connector prefill.** For connectors without source reservations, the scheduler reserves
+  headroom through the end of each admitted prompt before allocating its first chunk; chunk
+  allocation stays incremental. A new request waits for headroom instead of preempting an
+  admitted one, so other requests' small chunks cannot consume the pages needed to restore its
+  matching prefix after the final-batch query.
+
+A reservation is released when the request finishes or is cancelled, and when an unconsumed first
+chunk returns to the queue. This GPU admission budget is separate from any store capacity behind
+the connector.
+
 #### 2. Worker Interface (`KvCacheConnectorWorker`)
 
 These methods run on all workers (GPU processes) and interact with the actual GPU data.
