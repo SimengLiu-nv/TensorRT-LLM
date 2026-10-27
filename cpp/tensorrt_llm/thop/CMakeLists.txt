@@ -86,6 +86,7 @@ target_sources(
           minimaxM31/minimaxM31DsparkGlueOp.cpp
           minimaxM31/minimaxM31F3ArOp.cpp
           minimaxM31/minimaxM31FcShardGemmOp.cpp
+          minimaxM31/minimaxM31GlobaltimerStampOp.cpp
           minimaxM31/minimaxM31MarkovEpilogueOp.cpp
           minimaxM31/minimaxM31MoeFinalizeOp.cpp
           minimaxM31/minimaxM31Mxfp8CublasLtOp.cpp
@@ -173,6 +174,7 @@ target_sources(
 add_th_common_family(
   th_common_gemm_quant
   cutlassScaledMM.cpp
+  m31RouterHalfPinOp.cpp
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp
