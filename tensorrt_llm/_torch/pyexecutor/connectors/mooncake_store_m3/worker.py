@@ -36,6 +36,7 @@ scheduler reports such a request as saving asynchronously, which keeps its pages
 pinned until `get_finished` says the writes landed.
 """
 
+import os
 import threading
 import time
 import traceback
