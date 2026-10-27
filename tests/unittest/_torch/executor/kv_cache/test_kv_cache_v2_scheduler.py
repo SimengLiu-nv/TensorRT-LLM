@@ -390,6 +390,8 @@ def make_ctx_request(
     req.encoder_output_len = encoder_output_len
     req.py_encoder_output_ready_event = None
     req.py_skip_cross_kv_projection = False
+    req.py_connector_offer_deferrals = 0
+    req.py_preempted_for_pages = False
     return req
 
 
@@ -5239,6 +5241,7 @@ class TestUnchargedAsyncParks:
             "TLLM_CTX_APPEND_RESERVE_ADAPTIVE",
             "TLLM_CTX_APPEND_RESERVE_SJF",
             "TLLM_CTX_UNCHARGED_ASYNC_PARKS",
+            "TLLM_CTX_PARK_OFFER_DEFERRALS",
         ):
             monkeypatch.delenv(name, raising=False)
 
@@ -5320,17 +5323,17 @@ class TestUnchargedAsyncParks:
         sched = self._scheduler(self._parking_manager({0, 1, 2}, calls))
         reqs = [make_ctx_request(i, context_remaining_length=20000) for i in range(3)]
         sched.schedule_request(reqs, set())
-        assert calls == [(0, True), (1, False), (2, False)]
+        # Every first chunk is asked at admission, so a pool hit past the cap also gets its pages there.
+        assert calls == [(0, True), (1, True), (2, True)]
         assert sched.uncharged_park_ids == frozenset({0})
         # Past the cap a request is charged as before: 6144 for the next head-of-reserve chunk, 2048 after it.
         assert [r.context_chunk_size for r in reqs] == [6144, 6144, 2048]
-        # The cap is per pass.
-        calls.clear()
+        # The cap is per pass: the head is admitted uncharged again.
         sched.schedule_request(reqs, set())
-        assert calls[0][1] is True
+        assert sched.uncharged_park_ids == frozenset({0})
 
     def test_a_miss_does_not_use_up_the_cap(self, monkeypatch):
-        """The cap counts parks, not questions: a request the connector cannot serve leaves the next one askable."""
+        """The cap counts parks, not questions: a request the connector cannot serve leaves the slot to the next."""
         monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "1")
         calls = []
         sched = self._scheduler(self._parking_manager({1}, calls))
@@ -5368,13 +5371,13 @@ class TestUnchargedAsyncParks:
         mgr.query_connector_at_admission.assert_not_called()
 
     def test_a_small_chunk_keeps_its_charge(self, monkeypatch):
-        """Under two blocks a park frees too little budget to spend a query slot on."""
+        """Under two blocks a park frees too little budget to use up an uncharged slot."""
         monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "2")
         calls = []
         sched = self._scheduler(self._parking_manager({0}, calls))
         out = sched.schedule_request([make_ctx_request(0, context_remaining_length=100)], set())
         assert ids(out.context_requests) == [0]
-        assert calls == [(0, False)]
+        assert calls == [(0, True)]
         assert sched.uncharged_park_ids == frozenset()
 
     def test_uncharged_ids_are_per_pass(self, monkeypatch):
@@ -5390,6 +5393,84 @@ class TestUnchargedAsyncParks:
         sched.schedule_request([head], set())
         assert sched.uncharged_park_ids == frozenset()
         assert mgr.begin_connector_admission_pass.call_count == 2
+
+    def test_an_offer_without_pages_gives_its_chunk_back(self, monkeypatch):
+        """Waiting a pass beats loading only the blocks the chunk's pages hold and recomputing the rest."""
+        monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "2")
+        mgr = self._parking_manager({0})
+        mgr.cover_admission_offer.side_effect = lambda req: req.py_request_id != 0
+        sched = self._scheduler(mgr)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        other = make_ctx_request(1, context_remaining_length=6000)
+        out = sched.schedule_request([head, other], set())
+        assert ids(out.context_requests) == [1]
+        assert other.context_chunk_size == 6000
+        assert head.py_connector_offer_deferrals == 1
+        assert head.py_connector_admission_offer is None
+        mgr.revert_allocate_context.assert_called_once_with(head)
+        assert head in [call.args[0] for call in mgr.suspend_request.call_args_list]
+        assert sched.uncharged_park_ids == frozenset()
+
+    def test_a_charged_pool_hit_past_the_cap_also_waits_for_pages(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "1")
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE_SJF", "0")
+        mgr = self._parking_manager({0, 1})
+        mgr.cover_admission_offer.side_effect = lambda req: req.py_request_id != 1
+        sched = self._scheduler(mgr)
+        reqs = [make_ctx_request(i, context_remaining_length=3000) for i in range(3)]
+        out = sched.schedule_request(reqs, set())
+        assert sorted(ids(out.context_requests)) == [0, 2]
+        assert sched.uncharged_park_ids == frozenset({0})
+        assert reqs[1].py_connector_offer_deferrals == 1
+
+    def test_the_wait_is_bounded(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "2")
+        monkeypatch.setenv("TLLM_CTX_PARK_OFFER_DEFERRALS", "2")
+        mgr = self._parking_manager({0})
+        mgr.cover_admission_offer.return_value = False
+        mgr.cover_admission_offer.side_effect = None
+        sched = self._scheduler(mgr)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        scheduled = [ids(sched.schedule_request([head], set()).context_requests) for _ in range(4)]
+        # Two passes waiting, then admitted (uncharged, since it parks) to take the capped prefix.
+        assert scheduled == [[], [], [0], [0]]
+        assert sched.uncharged_park_ids == frozenset({0})
+        assert mgr.revert_allocate_context.call_count == 2
+
+    def test_a_wait_for_offer_pages_is_not_a_stall(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "2")
+        mgr = self._parking_manager({0})
+        mgr.cover_admission_offer.return_value = False
+        mgr.cover_admission_offer.side_effect = None
+        sched = self._scheduler(mgr)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        for _ in range(5):
+            assert ids(sched.schedule_request([head], set()).context_requests) == []
+        assert sched._stalled_schedules == 0
+        assert head.py_connector_offer_deferrals == 5
+
+    def test_a_request_that_preempted_for_pages_keeps_them(self, monkeypatch):
+        """Waiting would hand the pages a re-prefill paid for to the requests behind it."""
+        monkeypatch.setenv("TLLM_CTX_UNCHARGED_ASYNC_PARKS", "2")
+        mgr = self._parking_manager({0})
+        mgr.cover_admission_offer.return_value = False
+        sched = self._scheduler(mgr)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        head.py_preempted_for_pages = True
+        assert ids(sched.schedule_request([head], set()).context_requests) == [0]
+        assert head.py_connector_offer_deferrals == 0
+        assert head.py_preempted_for_pages is False
+        mgr.revert_allocate_context.assert_not_called()
+        # The flag is spent: the next admission waits for pages again.
+        assert ids(sched.schedule_request([head], set()).context_requests) == []
+
+    def test_no_wait_without_the_knob(self):
+        mgr = self._parking_manager({0})
+        mgr.cover_admission_offer.return_value = False
+        sched = self._scheduler(mgr)
+        out = sched.schedule_request([make_ctx_request(0, context_remaining_length=20000)], set())
+        assert ids(out.context_requests) == [0]
+        mgr.cover_admission_offer.assert_not_called()
 
     def test_budget_skips_are_reported(self):
         sched = self._scheduler(make_kv_cache_manager(tokens_per_block=64))

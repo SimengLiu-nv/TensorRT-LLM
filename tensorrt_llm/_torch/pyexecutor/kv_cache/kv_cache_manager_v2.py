@@ -4807,6 +4807,52 @@ class KVCacheManagerV2(BaseResourceManager):
         req.py_connector_admission_offer = offer
         return offer.parks
 
+    def cover_admission_offer(self, req: LlmRequest) -> bool:
+        """Grow the allocation now to the window this pass's admission answer moves the chunk to.
+
+        An offer that reaches past the scheduled chunk shifts the window and
+        grows the allocation by the offer. Left to ``prepare_resources``, that
+        grow competes with every admission after this one in the pass; when it
+        fails, ``_reserve_connector_prefix`` takes only the whole blocks the
+        pages already hold and the rest of the offer is recomputed. Growing
+        here books the pages before the requests behind it allocate.
+
+        Returns False when the pool cannot cover the window; the scheduler then
+        gives the chunk back and asks again on a later pass. True when there is
+        nothing to grow (no current answer, a miss, an offer inside the chunk,
+        or a shift ``_reserve_connector_prefix`` would refuse anyway) or the
+        grow succeeded. Only the capacity moves: the history stays at the local
+        match until ``_reserve_connector_prefix`` places the served prefix, so
+        a sliding-window layer group holds the offer's pages until then.
+        """
+        offer = req.py_connector_admission_offer
+        if offer is None or offer.epoch != self._connector_admission_epoch:
+            return True
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return True
+        local_end = offer.local_end
+        offered_end = min(local_end + offer.num_tokens, req.prompt_len - 1)
+        chunk_end = min(local_end + req.context_chunk_size, req.prompt_len)
+        if offered_end <= local_end or offered_end < chunk_end:
+            return True
+        end = self._shifted_chunk_end(req, offered_end)
+        if end <= offered_end:
+            return True
+        target = self._served_prefix_capacity(req, end)
+        pre_cap = kv_cache.capacity
+        if target <= pre_cap:
+            return True
+        grown = kv_cache.resize(target)
+        if self._connector_offer_stats_enabled:
+            self._connector_offer_stats["pregrown" if grown else "pregrow_failed"] += 1
+        if not grown:
+            return False
+        if req.py_ctx_pre_resize_cap is None:
+            # As in `_resize_for_served_prefix`: a revert must undo this growth.
+            req.py_ctx_pre_resize_cap = pre_cap
+        return True
+
     @staticmethod
     def _new_connector_offer_stats() -> Dict[str, int]:
         return {
@@ -4820,6 +4866,9 @@ class KVCacheManagerV2(BaseResourceManager):
             "shifted": 0,
             "capped": 0,
             "not_honoured": 0,
+            # Admission-time grows for a shifting offer (`cover_admission_offer`).
+            "pregrown": 0,
+            "pregrow_failed": 0,
             # Host time (ms) in the leader query and its broadcast, in fitting the
             # served prefix into the allocation, and in reporting the pages.
             "query_ms": 0.0,
@@ -4978,9 +5027,7 @@ class KVCacheManagerV2(BaseResourceManager):
         allocation, which is why that arm needs a fallback.
         """
         tokens_per_block = self.tokens_per_block
-        prompt_len = req.prompt_len
-        scheduler_chunk = req.context_chunk_size
-        chunk_end = min(local_end + scheduler_chunk, prompt_len)
+        chunk_end = min(local_end + req.context_chunk_size, req.prompt_len)
 
         candidates = []
         if offered_end < chunk_end:
@@ -4988,13 +5035,9 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             # `==` belongs here, not above: an offer that reaches the chunk end
             # exactly leaves the forward pass nothing to compute unless the
-            # window moves.
-            shifted_end = min(offered_end + scheduler_chunk, prompt_len)
-            if shifted_end < prompt_len:
-                # A non-final chunk must end on a block boundary or the next
-                # chunk fragments the cache.
-                shifted_end = (shifted_end // tokens_per_block) * tokens_per_block
-            candidates.append((offered_end, shifted_end))
+            # window moves. With an admission-time answer,
+            # `cover_admission_offer` has normally grown the pages already.
+            candidates.append((offered_end, self._shifted_chunk_end(req, offered_end)))
             # Fall back to the largest whole-block prefix the pages that already
             # exist can hold while still leaving a chunk to compute. Whole
             # blocks because that is the granularity a connector transfers in.
@@ -5007,6 +5050,23 @@ class KVCacheManagerV2(BaseResourceManager):
             if self._resize_for_served_prefix(req, kv_cache, position, end):
                 return position, end - position
         return None
+
+    def _shifted_chunk_end(self, req: LlmRequest, offered_end: int) -> int:
+        """End of the scheduled chunk once a served prefix moves its start to ``offered_end``."""
+        prompt_len = req.prompt_len
+        shifted_end = min(offered_end + req.context_chunk_size, prompt_len)
+        if shifted_end < prompt_len:
+            # A non-final chunk must end on a block boundary or the next chunk
+            # fragments the cache.
+            shifted_end = (shifted_end // self.tokens_per_block) * self.tokens_per_block
+        return shifted_end
+
+    def _served_prefix_capacity(self, req: LlmRequest, end: int) -> int:
+        """The capacity covering ``[0, end)`` for a context chunk ending at ``end``."""
+        target = end + self.num_extra_kv_tokens
+        if end >= req.prompt_len:
+            target += get_draft_token_length(req)
+        return target
 
     def _resize_for_served_prefix(self, req: LlmRequest, kv_cache, position: int, end: int) -> bool:
         """Cover ``[0, end)`` and set the history to ``position``, marking
@@ -5021,9 +5081,7 @@ class KVCacheManagerV2(BaseResourceManager):
         sliding-window layer group. When the capacity is unchanged the call
         cannot fail, since no new slot is requested.
         """
-        target = end + self.num_extra_kv_tokens
-        if end >= req.prompt_len:
-            target += get_draft_token_length(req)
+        target = self._served_prefix_capacity(req, end)
         pre_cap = kv_cache.capacity
         capacity = max(pre_cap, target)
         if not kv_cache.resize(capacity, position):

@@ -1216,6 +1216,90 @@ class TestAdmissionQuery:
         assert manager.take_connector_offer_stats() is None
 
 
+class TestAdmissionGrow:
+    """``cover_admission_offer``: an admission-time offer past the chunk gets its pages before later admissions."""
+
+    @staticmethod
+    def _asked(num_matched=128, grow_ok=True, capacity=64, chunk=64):
+        connector = FakeConnectorManager(num_matched=num_matched, load_async=True)
+        connector.admission_query_capable = True
+        manager = make_manager(connector)
+        manager._connector_offer_stats_enabled = True
+        manager._connector_offer_stats = manager._new_connector_offer_stats()
+        req = FakeRequest()
+        req.context_chunk_size = chunk
+        kv_cache = FakeKvCache(committed=0, capacity=capacity, grow_ok=grow_ok)
+        manager.kv_cache_map[req.py_request_id] = kv_cache
+        manager.begin_connector_admission_pass()
+        assert manager.query_connector_at_admission(req, allow_query=True) == (num_matched > 0)
+        return connector, manager, req, kv_cache
+
+    def test_a_shifting_offer_is_covered_at_admission_and_served_in_full(self):
+        connector, manager, req, kv_cache = self._asked()
+
+        assert manager.cover_admission_offer(req)
+        # The shifted window [128, 192): capacity only, the history stays at the local match.
+        assert kv_cache.resize_calls == [(192, None)]
+        assert kv_cache.history_length == 0
+        assert req.py_ctx_pre_resize_cap == 64
+
+        manager._run_kv_connector_hooks(scheduled(req))
+        stats = manager.take_connector_offer_stats()
+
+        assert req.context_current_position == 128 and req.context_chunk_size == 64
+        assert kv_cache.capacity == 192
+        assert connector.commits == [(0, 128, True)]
+        assert stats["pregrown"] == 1 and stats["shifted"] == 1 and stats["capped"] == 0
+
+    def test_without_pages_the_cover_fails_and_leaves_the_allocation(self):
+        _, manager, req, kv_cache = self._asked(grow_ok=False)
+
+        assert not manager.cover_admission_offer(req)
+
+        assert kv_cache.capacity == 64 and kv_cache.history_length == 0
+        assert req.py_ctx_pre_resize_cap is None
+        assert manager.take_connector_offer_stats()["pregrow_failed"] == 1
+
+    @pytest.mark.parametrize("num_matched", [0, 32])
+    def test_a_miss_or_an_offer_inside_the_chunk_needs_no_pages(self, num_matched):
+        _, manager, req, kv_cache = self._asked(num_matched=num_matched, grow_ok=False)
+        assert manager.cover_admission_offer(req)
+        assert kv_cache.resize_calls == []
+
+    def test_an_answer_from_an_earlier_pass_is_not_covered(self):
+        _, manager, req, kv_cache = self._asked(grow_ok=False)
+        manager.begin_connector_admission_pass()
+        assert manager.cover_admission_offer(req)
+        assert kv_cache.resize_calls == []
+
+    def test_the_target_matches_the_prepare_time_grow(self):
+        """Extra KV tokens and, on a final chunk, draft tokens: the prepare-time resize must not grow again."""
+        connector = FakeConnectorManager(num_matched=192, load_async=True)
+        connector.admission_query_capable = True
+        manager = make_manager(connector, num_extra_kv_tokens=3)
+        req = FakeRequest()
+        req.py_draft_tokens = [0, 0]
+        req.context_chunk_size = 64
+        kv_cache = FakeKvCache(committed=0, capacity=67)
+        manager.kv_cache_map[req.py_request_id] = kv_cache
+        manager.begin_connector_admission_pass()
+        assert manager.query_connector_at_admission(req, allow_query=True)
+
+        assert manager.cover_admission_offer(req)
+        # Offer 192 shifts the 64-token chunk to the prompt end: 256 + 3 extra + 2 draft.
+        assert kv_cache.capacity == PROMPT_LEN + 5
+
+        manager._run_kv_connector_hooks(scheduled(req))
+        assert [capacity for capacity, _ in kv_cache.resize_calls] == [PROMPT_LEN + 5] * 2
+        assert req.context_current_position == 192 and req.context_chunk_size == 64
+
+    def test_a_revert_undoes_the_admission_grow(self):
+        _, manager, req, kv_cache = self._asked()
+        assert manager.cover_admission_offer(req)
+        assert manager.revert_allocate_context(req)
+        assert kv_cache.capacity == 64
+
+
 def test_disagg_metadata_build_keeps_pending_context_reservation() -> None:
     manager, connector, req, cache = TestPrefixReservations.prepare()
     assert manager.resize_context(req, 32)

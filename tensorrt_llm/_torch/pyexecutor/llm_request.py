@@ -1014,6 +1014,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # allocation is released.
         self.py_connector_admission_offer = None
 
+        # Passes this request gave its first chunk back because the pool could
+        # not cover the window its admission-time connector offer moves it to.
+        self.py_connector_offer_deferrals = 0
+        # Set when the scheduler gave up a started request to free pages for
+        # this one; its next admission keeps them rather than defer.
+        self.py_preempted_for_pages = False
+
         # End of the prefix served from outside the manager (a KV cache
         # connector's load, or a staging fetch the request resumes from) retained
         # by this allocation, or 0. This depth survives async parking; local reuse
