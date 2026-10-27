@@ -309,6 +309,35 @@ def test_hash_chain_requires_lookahead_and_matches_incremental_extension(lookahe
     )
 
 
+@pytest.mark.parametrize("lookahead, salt", [(0, None), (0, "tenant-a"), (3, None)])
+def test_hash_chain_keeps_the_stored_key_encoding(lookahead: int, salt) -> None:
+    """Pages already in a pool stay addressable: each block is blake2b-128 over its parent and its
+    tokens (plus lookahead) as signed 8-byte little-endian ids, however the chain encodes them."""
+    import hashlib
+
+    def digest(*parts: bytes) -> bytes:
+        hasher = hashlib.blake2b(digest_size=16)
+        for part in parts:
+            hasher.update(part)
+        return hasher.digest()
+
+    tokens = [7, -1, 2**63 - 1, -(2**63), 0, 151_000] * 5 + list(range(23))
+    parent = digest(b"mooncake-kv-v2", b"salt", b"" if salt is None else salt.encode())
+    if lookahead:
+        parent = digest(parent, b"prompt-lookahead", lookahead.to_bytes(8, "little"))
+    expected = []
+    for start in range(0, len(tokens) - lookahead - TOKENS_PER_BLOCK + 1, TOKENS_PER_BLOCK):
+        block = tokens[start : start + TOKENS_PER_BLOCK + lookahead]
+        parent = digest(parent, b"".join(t.to_bytes(8, "little", signed=True) for t in block))
+        expected.append(parent)
+
+    chain = BlockHashChain(TOKENS_PER_BLOCK, cache_salt=salt, prompt_lookahead=lookahead)
+    for end in (5, 6, 17, len(tokens)):
+        chain.extend(tokens[:end])
+    assert list(chain.hashes) == expected
+    assert list(chain.extend(tuple(tokens))) == expected
+
+
 def test_hash_chain_rejects_negative_lookahead() -> None:
     with pytest.raises(ValueError, match="prompt_lookahead"):
         BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=-1)

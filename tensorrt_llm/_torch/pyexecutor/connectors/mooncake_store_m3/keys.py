@@ -30,6 +30,8 @@ import hashlib
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
+import numpy as np
+
 __all__ = [
     "BlockHashChain",
     "KeyNamespace",
@@ -100,20 +102,29 @@ class BlockHashChain:
         Returns:
             The full chain, indexed by block ordinal.
         """
-        num_full_blocks = max(0, len(tokens) - self._prompt_lookahead) // self._tokens_per_block
-        if num_full_blocks < len(self._hashes):
+        tokens_per_block = self._tokens_per_block
+        num_full_blocks = max(0, len(tokens) - self._prompt_lookahead) // tokens_per_block
+        first_new = len(self._hashes)
+        if num_full_blocks < first_new:
             raise ValueError(
-                f"token list shrank from {len(self._hashes)} to {num_full_blocks} "
+                f"token list shrank from {first_new} to {num_full_blocks} "
                 "full blocks; a hash chain belongs to exactly one request"
             )
-        for ordinal in range(len(self._hashes), num_full_blocks):
-            start = ordinal * self._tokens_per_block
-            block = tokens[start : start + self._tokens_per_block + self._prompt_lookahead]
-            parent = self._hashes[-1] if self._hashes else self._seed
-            # Fixed-width little-endian token ids: a delimiter-free encoding
-            # would let two different token sequences serialize identically.
-            payload = b"".join(int(token).to_bytes(8, "little", signed=True) for token in block)
-            self._hashes.append(_digest(parent, payload))
+        if num_full_blocks == first_new:
+            return self._hashes
+        # Fixed-width little-endian token ids: a delimiter-free encoding would
+        # let two different token sequences serialize identically. Encoded in
+        # one pass for every new block: per-token `int.to_bytes` dominated the
+        # admission query of a long prompt.
+        start = first_new * tokens_per_block
+        end = num_full_blocks * tokens_per_block + self._prompt_lookahead
+        payload = memoryview(np.asarray(tokens[start:end], dtype="<i8").tobytes())
+        block_bytes = 8 * tokens_per_block
+        window_bytes = block_bytes + 8 * self._prompt_lookahead
+        parent = self._hashes[-1] if self._hashes else self._seed
+        for offset in range(0, (num_full_blocks - first_new) * block_bytes, block_bytes):
+            parent = _digest(parent, payload[offset : offset + window_bytes])
+            self._hashes.append(parent)
         return self._hashes
 
 
