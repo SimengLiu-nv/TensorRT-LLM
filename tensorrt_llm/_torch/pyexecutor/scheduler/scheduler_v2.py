@@ -938,6 +938,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         # V2 resizes KV cache directly in the scheduler (no separate
         # prepareResources for main cache), so include draft tokens.
         req.context_chunk_size = context_tokens
+        if not self.kv_cache_manager.reserve_context_completion(req):
+            # Admitted requests own the completion headroom. Defer this prompt
+            # instead of preempting one of them to make room for it.
+            return ScheduleAction.SKIP, 0, False
         if not self._try_allocate_context(req, context_tokens + draft_len):
             # Out of pages. Give up one started request so this one can
             # proceed, and retry next iteration: a failed resize leaves a
@@ -1076,6 +1080,10 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # V2 resizes KV cache directly in the scheduler, so include
         # draft tokens for last chunk.
+        if not self.kv_cache_manager.reserve_context_completion(req):
+            # Admitted requests own the completion headroom. Defer this prompt
+            # instead of preempting one of them to make room for it.
+            return ScheduleAction.SKIP, 0, False
         if not self._try_allocate_context(req, resize_tokens):
             # Out of pages, as in _try_schedule_context_full.
             if preempt_for_pages(req):
