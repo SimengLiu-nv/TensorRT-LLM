@@ -988,8 +988,4 @@ counts toward `kv_connector_config.transfer_timeout_sec` (see
 [Attention data parallelism](#attention-data-parallelism)). Asynchronous loads are validated with
 `disable_overlap_scheduler: true`.
 
-The scheduler adapter declares
-[admission-time queries](#admission-time-queries): `kv_connector_config.admission_query: {}` books
-the pages a hit reaching past the first chunk needs while the request is admitted, with or without
-`async_load`. Admitting a chunk without charging its tokens (`max_uncharged_parks`) needs
-`async_load`, since only an asynchronous offer parks the request.
+
