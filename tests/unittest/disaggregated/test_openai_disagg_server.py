@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 import json
+from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -21,6 +22,7 @@ import pytest
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 from starlette.datastructures import Headers
+from starlette.types import Message
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole, extract_disagg_cfg
 from tensorrt_llm.serve import anthropic_adapter, openai_disagg_server
@@ -342,10 +344,82 @@ def _streaming_server():
     return server
 
 
-def _streaming_raw_request():
-    return SimpleNamespace(
-        headers=Headers(headers={}), state=SimpleNamespace(server_arrival_time=0.0)
+def _streaming_raw_request() -> Request:
+    async def receive() -> Message:
+        await asyncio.Future()
+        return {"type": "http.disconnect"}
+
+    request = Request({"type": "http", "headers": []}, receive=receive)
+    request.state.server_arrival_time = 0.0
+    return request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_task", [False, True])
+async def test_first_chunk_wait_cancels_and_closes_upstream(cancel_task: bool) -> None:
+    started = asyncio.Event()
+    closed = asyncio.Event()
+    disconnected = asyncio.Event()
+    listener_closed = asyncio.Event()
+
+    async def receive() -> Message:
+        try:
+            await disconnected.wait()
+            return {"type": "http.disconnect"}
+        finally:
+            listener_closed.set()
+
+    async def generation_stream() -> AsyncGenerator[bytes, None]:
+        try:
+            started.set()
+            await asyncio.Future()
+            yield b"unreachable"
+        finally:
+            closed.set()
+
+    request = Request({"type": "http", "headers": []}, receive=receive)
+    task = asyncio.create_task(OpenAIDisaggServer._start_stream(generation_stream(), request))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    if cancel_task:
+        task.cancel()
+    else:
+        disconnected.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+    assert closed.is_set()
+    assert listener_closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_first_chunk_wait_releases_receive_listener_before_streaming() -> None:
+    listener_started = asyncio.Event()
+    listener_closed = asyncio.Event()
+    upstream_closed = asyncio.Event()
+
+    async def receive() -> Message:
+        try:
+            listener_started.set()
+            await asyncio.Future()
+            return {"type": "http.disconnect"}
+        finally:
+            listener_closed.set()
+
+    async def generation_stream() -> AsyncGenerator[bytes, None]:
+        try:
+            await listener_started.wait()
+            yield b"data: first\n\n"
+        finally:
+            upstream_closed.set()
+
+    request = Request({"type": "http", "headers": []}, receive=receive)
+    stream = await asyncio.wait_for(
+        OpenAIDisaggServer._start_stream(generation_stream(), request), timeout=1
     )
+    assert listener_closed.is_set()
+    assert not upstream_closed.is_set()
+    assert await stream.__anext__() == b"data: first\n\n"
+    await stream.aclose()
+    assert upstream_closed.is_set()
 
 
 def _stream_request(kind):

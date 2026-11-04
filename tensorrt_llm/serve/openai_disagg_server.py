@@ -21,7 +21,7 @@ import socket
 import traceback
 import uuid
 from contextlib import aclosing, asynccontextmanager
-from typing import Any, AsyncGenerator, Callable, Optional
+from typing import AsyncGenerator, Callable, Optional
 
 import aiohttp
 import uvicorn
@@ -457,7 +457,7 @@ class OpenAIDisaggServer:
                     # server's KV-cache transfer error) becomes an HTTP error,
                     # not a 200 whose body is cut off.
                     if hold_headers_until_first_chunk:
-                        stream = await self._start_stream(stream)
+                        stream = await self._start_stream(stream, raw_req)
                     self._perf_metrics_collector.total_responses.inc()
                     return StreamingResponse(
                         content=stream,
@@ -474,7 +474,8 @@ class OpenAIDisaggServer:
 
     @staticmethod
     async def _start_stream(
-            stream: AsyncGenerator[Any, None]) -> AsyncGenerator[Any, None]:
+            stream: AsyncGenerator[str | bytes, None],
+            raw_request: Request) -> AsyncGenerator[str | bytes, None]:
         """Pull a relayed stream's first chunk before the response headers go out.
 
         A worker that fails before its first chunk then raises here and becomes an
@@ -484,26 +485,57 @@ class OpenAIDisaggServer:
 
         Args:
             stream: The relayed response stream from the disaggregated service.
+            raw_request: The client request whose disconnect cancels the wait.
 
         Returns:
             ``stream`` itself when it is already exhausted; otherwise a started
             relay that yields the first chunk and then the rest of ``stream``.
         """
+        async def wait_for_disconnect() -> None:
+            while True:
+                message = await raw_request.receive()
+                if message["type"] == "http.disconnect":
+                    return
+
+        first_chunk_task = asyncio.ensure_future(anext(stream))
+        disconnect_task = asyncio.create_task(wait_for_disconnect())
+        handed_off = False
         try:
-            first_chunk = await anext(stream)
-        except StopAsyncIteration:
-            return stream
+            done, _ = await asyncio.wait(
+                (first_chunk_task, disconnect_task),
+                return_when=asyncio.FIRST_COMPLETED)
+            if disconnect_task in done:
+                disconnect_task.result()
+                raise asyncio.CancelledError
+            try:
+                first_chunk = first_chunk_task.result()
+            except StopAsyncIteration:
+                return stream
 
-        async def relay() -> AsyncGenerator[Any, None]:
-            async with aclosing(stream):
-                yield None  # Consumed below.
-                yield first_chunk
-                async for chunk in stream:
-                    yield chunk
+            disconnect_task.cancel()
+            await asyncio.gather(disconnect_task, return_exceptions=True)
 
-        relayed = relay()
-        await anext(relayed)
-        return relayed
+            async def relay() -> AsyncGenerator[str | bytes, None]:
+                async with aclosing(stream):
+                    yield b""  # Consumed below to enter the cleanup scope.
+                    yield first_chunk
+                    async for chunk in stream:
+                        yield chunk
+
+            relayed = relay()
+            await anext(relayed)
+            handed_off = True
+            return relayed
+        finally:
+            if not handed_off:
+                for task in (first_chunk_task, disconnect_task):
+                    if not task.done():
+                        task.cancel()
+                # A generator cannot be closed while its first anext is running.
+                await asyncio.gather(first_chunk_task,
+                                     disconnect_task,
+                                     return_exceptions=True)
+                await stream.aclose()
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
