@@ -380,8 +380,8 @@ connector that transfers KV leaves no such tier, because the host tier is droppe
 the others are refused at bring-up (see
 [KV cache tiers](#kv-cache-tiers-are-gpu-only-under-a-connector)), so its declaration is enough. A
 server with neither keeps its existing admission, `host_cache_size=0` included, whether it has no
-connector, a capacity-only one, or one that does not declare it. The reservation covers
-full-attention models only, without beam search or pipeline
+connector, a capacity-only one, or one that does not declare it. The Mooncake store connector
+declares it. The reservation covers full-attention models only, without beam search or pipeline
 parallelism. Windowed, recurrent and mixed-precision caches keep their existing admission policy.
 
 A disaggregated generation server without a connector opts in through the configuration. Without a
