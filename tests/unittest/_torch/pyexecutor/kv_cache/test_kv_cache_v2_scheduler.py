@@ -1039,6 +1039,29 @@ class TestInflightPrefixWait:
         assert ids(out.context_requests) == [1, 2]
         assert sched._stalled_schedules == 0
 
+    def test_warm_pool_query_waits_for_local_prefix_owner(self) -> None:
+        """A pool hit remains unqueried until the local owner's bounded wait expires."""
+        mgr = self.make_manager()
+        mgr.connector_admission_query_enabled.return_value = True
+        mgr.query_connector_at_admission.return_value = True
+        mgr.cover_admission_offer.return_value = True
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=100000,
+            ctx_chunk_config=(None, 64),
+            connector_admission_query=True,
+        )
+        owner = self._owner_in_flight(sched)
+        waiter = self.make_request(1)
+        mgr.query_connector_at_admission.reset_mock()
+        for _ in range(MAX_WAIT_PASSES):
+            out = sched.schedule_request([owner, waiter], {owner.request_id})
+            assert ids(out.context_requests) == []
+            mgr.query_connector_at_admission.assert_not_called()
+        out = sched.schedule_request([owner, waiter], {owner.request_id})
+        assert ids(out.context_requests) == [1]
+        mgr.query_connector_at_admission.assert_called_once_with(waiter)
+
     def test_prefix_wait_does_not_hide_a_stall(self):
         """A pass that only waits is reported like any other stall."""
         mgr = self.make_manager()

@@ -533,7 +533,7 @@ def test_mooncake_e2e_prefix_reuse_on_attention_dp_consumers(
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.skip_less_device(2)
-def test_mooncake_e2e_work_aware_routing_under_attention_dp(mooncake_pool):
+def test_mooncake_e2e_work_aware_routing_under_attention_dp(mooncake_pool: SimpleNamespace) -> None:
     """Serve attention-DP requests through the work-aware router.
 
     PyExecutor hands every attention-DP fetch to the router together with the
@@ -543,6 +543,8 @@ def test_mooncake_e2e_work_aware_routing_under_attention_dp(mooncake_pool):
     to an engine with one request slot per owner: every copy must finish with the
     tokens of the first, and rank 0 must have prefilled one, so the router placed
     requests on both owners rather than stalling or crashing the fetch.
+    The pool starts empty and the consumer role prevents unsupported aggregated
+    ADP writes; this exercises routing and prefill, not a pool-hit speedup.
     """
     sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
     llm = LLM(
@@ -550,6 +552,10 @@ def test_mooncake_e2e_work_aware_routing_under_attention_dp(mooncake_pool):
             mooncake_pool,
             tensor_parallel_size=2,
             enable_attention_dp=True,
+            kv_connector_config=KvCacheConnectorConfig(
+                connector="mooncake-store",
+                mooncake_store=mooncake_pool.config.model_copy(update={"role": "consumer"}),
+            ),
             attention_dp_config=AttentionDpConfig(enable_work_aware_routing=True),
             max_batch_size=1,
             enable_iter_perf_stats=True,

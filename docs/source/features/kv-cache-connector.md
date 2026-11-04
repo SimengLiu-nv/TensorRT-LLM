@@ -434,6 +434,13 @@ not booked at admission; `prepare_resources` grows them as on the final-batch pa
 configuration rather than environment variables because they change admission behavior and can
 differ between the context and generation servers of one disaggregated deployment.
 
+Local in-progress prefix sharing retains priority: `PrefixWaitPlanner` runs before the
+admission-time connector query. A request waiting for a local contributor therefore does not
+query a warm pool until the wait ends. The wait remains bounded by the existing planner; this
+policy does not promise immediate remote reuse for such a request. The scheduler regression
+covers this ordering with an asynchronous pool hit available. Its latency impact still needs a
+warm-pool benchmark with a local contributor.
+
 ##### Completion headroom on disaggregated servers
 
 A disaggregated server with KV cache manager V2 can reserve logical GPU-page headroom for each
