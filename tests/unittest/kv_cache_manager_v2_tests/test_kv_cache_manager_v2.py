@@ -8730,6 +8730,31 @@ class TestSSMSupport(unittest.TestCase):
             self.manager.shutdown()
             del self.manager
 
+    def test_reuse_alignment_retries_after_unaligned_snapshot(self) -> None:
+        """An aligned attention match pruned to an SSM snapshot must be aligned again."""
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
+        cfg.reuse_match_alignment = 16
+        self.manager = KVCacheManager(cfg)
+        prompt = [self.next_token() for _ in range(64)]
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        seed = self.manager.create_kv_cache()
+        self.assertTrue(seed.resume(stream))
+        for start, end in ((0, 32), (32, 40), (40, 64)):
+            seed.capacity = end
+            seed.commit(prompt[start:end])
+        seed.close()
+
+        # Attention reaches 48, but the last eligible SSM snapshot is at 40.
+        # Realigning that endpoint must select the preceding snapshot at 32.
+        kv = self.manager.create_kv_cache(input_tokens=prompt[:48])
+        self.assertEqual(kv.num_committed_tokens, 32)
+        self.assertEqual(kv._get_num_reusable_tokens_before_hybrid_pruning(), 32)
+        self.assertTrue(kv.resume(stream))
+        kv.close()
+        stream_holder.synchronize()
+
     def test_reuse_match_reports_content_divergence_depth(self) -> None:
         """The raw walk depth locates the fork, even where pruning shortens reuse."""
         cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
