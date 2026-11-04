@@ -894,12 +894,16 @@ an attention-DP owner only the affected request restarts, without the offered pr
 of its batch runs. Under tensor parallelism every rank holds a shard of the same page and cannot
 restart the request alone, so a missing page fails the executor there.
 
-Aggregated serving under attention data parallelism is not supported yet, although startup does
-not refuse it. When the attention-DP gate skips a forward pass after the batch was prepared, the
+Aggregated serving under attention data parallelism rejects saving roles (`producer`, `both`)
+at startup. When the attention-DP gate skips a forward pass after the batch was prepared, the
 executor shrinks each generation request's KV capacity again, and a page the connector was already
 told about can go to another request without the connector hearing of it; a later save could then
 publish that request's bytes under this one's key. A disaggregated context server never runs
 generation requests and is unaffected, as is a role that saves nothing (`consumer`, `capacity`).
+
+When upgrading from a version that could publish uncomputed pages, stop or drain the old writers
+and reset the affected Mooncake pool before reusing its entries. Stored keys retain their format,
+so the new publication checks cannot distinguish invalid pages already written by an older server.
 
 ### GPUDirect RDMA
 
@@ -987,5 +991,3 @@ load thread always fails the server, at the next executor call. Under attention 
 counts toward `kv_connector_config.transfer_timeout_sec` (see
 [Attention data parallelism](#attention-data-parallelism)). Asynchronous loads are validated with
 `disable_overlap_scheduler: true`.
-
-

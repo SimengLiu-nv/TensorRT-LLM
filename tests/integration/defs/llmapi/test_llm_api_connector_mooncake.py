@@ -54,7 +54,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
     MooncakeStoreConnectorScheduler,
 )
-from tensorrt_llm.llmapi import RequestError, SchedulingParams
+from tensorrt_llm.llmapi import RequestError
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
     Eagle3DecodingConfig,
@@ -476,90 +476,51 @@ def _connector_cached_tokens(stats) -> int:
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
 @pytest.mark.skip_less_device(2)
-def test_mooncake_e2e_prefix_reuse_across_attention_dp_owners(
-    mooncake_pool, disable_overlap_scheduler
-):
-    """Save and reuse at TP 2 with attention DP, where each owner holds every head.
+def test_mooncake_e2e_prefix_reuse_on_attention_dp_consumers(
+    mooncake_pool: SimpleNamespace, disable_overlap_scheduler: bool
+) -> None:
+    """Attention-DP consumers reuse full-head pages from a single-rank producer.
 
-    Every owner keys its pages as attention shard 0 of 1, so a prefix one owner
-    saved is a hit for the other. Under the per-rank keys tensor parallelism
-    uses, an owner would ask for both ranks' shards of a page only one of them
-    could have written, and nothing would ever be reused.
-
-    The cold engine serves one request pinned to owner 1, so rank 0 saves
-    nothing and every page of the prompt in the pool is one owner 1 saved. The
-    warm engine starts with empty GPU caches and serves four copies with one
-    request per owner at a time, so both owners serve the prompt and each one's
-    first copy finds nothing in its own GPU cache. The assertions read rank 0's
-    rows of the iteration statistics. Rank 0 serves at least one of the copies
-    and saved none of the prompt's pages before its first copy looked them up,
-    so a hit there is a page owner 1 saved: a read across owners, not a
-    same-owner hit.
-
-    This runs aggregated serving, which the connector documents as not
-    supported yet under attention DP because of a skipped-pass hazard on
-    generation pages; one request per owner and short generations do not
-    provoke it, and the key space under test is the same on a disaggregated
-    context server.
+    Both layouts key pages as attention shard 0 of 1. The warm engine starts
+    with empty GPU caches and serves four copies with one request per owner
+    at a time. Rank 0 must load pages from the pool and preserve generation.
+    The consumer role avoids unsupported aggregated attention-DP publication.
+    Cross-owner publication is separately covered by the real-pool unit tests.
     """
     sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
-    kwargs = llm_kwargs(
-        mooncake_pool,
-        tensor_parallel_size=2,
-        enable_attention_dp=True,
-        max_batch_size=1,
-        disable_overlap_scheduler=disable_overlap_scheduler,
-        enable_iter_perf_stats=True,
-        # Keep every iteration rather than the most recent 1000, so the sums
-        # below cover the whole run.
-        iter_stats_max_iterations=-1,
-    )
-    records_before = _segment_record_stamps(mooncake_pool.run_dir)
-
-    cold = LLM(**kwargs)
+    cold = LLM(**llm_kwargs(mooncake_pool))
     try:
-        # Strict, so the router cannot move it to rank 0 for balance.
-        cold_output = cold.generate(
-            [PROMPT],
-            sampling_params,
-            scheduling_params=SchedulingParams(attention_dp_rank=1, attention_dp_relax=False),
-        )
-        cold_stats = cold.get_stats(timeout=30)
+        cold_output = cold.generate([PROMPT], sampling_params)
     finally:
         cold.shutdown()
     cold_token_ids = list(cold_output[0].outputs[0].token_ids)
 
-    joined = _ranks_recorded_since(mooncake_pool.run_dir, records_before)
-    assert joined == {0, 1}, (
-        "Both attention-DP owners should have joined the pool, but this run recorded "
-        f"ranks {sorted(joined)}. An owner that never opened a store handle saves "
-        "nothing and reads every prefix as a miss."
+    records_before = _segment_record_stamps(mooncake_pool.run_dir)
+    warm = LLM(
+        **llm_kwargs(
+            mooncake_pool,
+            tensor_parallel_size=2,
+            enable_attention_dp=True,
+            max_batch_size=1,
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            enable_iter_perf_stats=True,
+            iter_stats_max_iterations=-1,
+            kv_connector_config=KvCacheConnectorConfig(
+                connector="mooncake-store",
+                mooncake_store=mooncake_pool.config.model_copy(update={"role": "consumer"}),
+            ),
+        )
     )
-    # The test's own key namespace keeps the pool cold. Rank 0's rows cannot
-    # see owner 1's load, but they do show where the request ran: attention-DP
-    # padding requests are left out of them.
-    cold_context_tokens = sum(
-        entry.get("inflightBatchingStats", {}).get("numCtxTokens", 0)
-        for entry in _rank0_rows(cold_stats)
-    )
-    assert cold_context_tokens == 0, (
-        f"Rank 0 prefilled {cold_context_tokens} tokens in the cold engine, so the cold "
-        "request did not stay on owner 1 and a hit on rank 0 below could be a page rank 0 "
-        "saved itself."
-    )
-
-    warm = LLM(**kwargs)
     try:
         warm_outputs = warm.generate([PROMPT] * 4, sampling_params)
         warm_stats = warm.get_stats(timeout=30)
     finally:
         warm.shutdown()
-
+    joined = _ranks_recorded_since(mooncake_pool.run_dir, records_before)
+    assert joined == {0, 1}, f"Expected both attention-DP consumers, got {sorted(joined)}."
     assert warm_stats, "The warm engine returned no iteration statistics to assert on."
     assert _connector_cached_tokens(warm_stats) > 0, (
-        f"Rank 0 served no prompt tokens from the pool across {len(warm_stats)} "
-        "iterations, so it recomputed a prefix owner 1 stored and no owner read "
-        "another owner's pages."
+        "Rank 0 recomputed the prefix instead of reading the producer's full-head pages."
     )
     for index, output in enumerate(warm_outputs):
         assert_tokens_agree(

@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from .config import MooncakeStoreConnectorConfig
 
 __all__ = [
+    "validate_attention_dp_config",
     "validate_layout",
     "validate_llm_args",
     "validate_node_budget",
@@ -79,6 +80,21 @@ def validate_llm_args(llm_args: TorchLlmArgs) -> None:
             "so it is neither described to the connector nor transferred; a "
             "replayed prefix would carry index-K from the store alongside stale "
             "index-V. This is the same restriction disaggregated serving applies."
+        )
+
+
+def validate_attention_dp_config(
+    llm_args: TorchLlmArgs, config: "MooncakeStoreConnectorConfig"
+) -> None:
+    """Reject aggregated ADP writers whose page indices can outlive a rollback."""
+    transceiver = getattr(llm_args, "cache_transceiver_config", None)
+    is_disagg = transceiver is not None and transceiver.backend is not None
+    if llm_args.enable_attention_dp is True and config.role.saves and not is_disagg:
+        raise NotImplementedError(
+            "The mooncake-store connector does not support aggregated attention-DP "
+            "serving with role 'producer' or 'both': a skipped generation pass can "
+            "release pages without resetting the connector's page indices. Use a "
+            "disaggregated context server, or a role that does not save KV."
         )
 
 

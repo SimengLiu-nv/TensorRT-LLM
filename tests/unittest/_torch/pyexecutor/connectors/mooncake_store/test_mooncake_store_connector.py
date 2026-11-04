@@ -32,6 +32,7 @@ import threading
 import time
 from collections.abc import Iterator
 from enum import Enum
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -56,6 +57,9 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.addressing import 
     allocation_spans,
     split_at_cuts,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
+    MooncakeStoreConnectorConfig,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.gpudirect import (
     RangeFacts,
     allocation_range,
@@ -71,6 +75,9 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
     MooncakeStoreConnectorScheduler,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.validation import (
+    validate_attention_dp_config,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import (
     MooncakeStoreConnectorWorker,
 )
@@ -79,6 +86,7 @@ from tensorrt_llm.llmapi.llm_args import (
     MTPDecodingConfig,
     NGramDecodingConfig,
     SADecodingConfig,
+    SpeculativeConfig,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
@@ -304,13 +312,14 @@ def make_llm_args(
     run_dir: str | None = None,
     enable_attention_dp: bool = False,
     local_reuse_backoff: str = "off",
-    speculative_config=None,
+    speculative_config: SpeculativeConfig | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         model="/models/test-model",
         kv_cache_config=SimpleNamespace(tokens_per_block=TOKENS_PER_BLOCK),
         tensor_parallel_size=1,
         enable_attention_dp=enable_attention_dp,
+        cache_transceiver_config=SimpleNamespace(backend="NIXL"),
         pipeline_parallel_size=1,
         context_parallel_size=1,
         sparse_attention_config=None,
@@ -1750,6 +1759,41 @@ def test_attention_dp_owner_restarts_a_failed_load_where_tensor_parallel_raises(
         tp_rank.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
         with pytest.raises(RuntimeError, match="already"):
             tp_rank.start_load_kv(None)
+
+
+@pytest.mark.parametrize("role", ["producer", "both", "consumer", "capacity"])
+@pytest.mark.parametrize("attention_dp", [False, True])
+@pytest.mark.parametrize("backend", [None, "NIXL", "absent"])
+def test_attention_dp_saving_role_gate(
+    store_config: Path, role: str, attention_dp: bool, backend: str | None
+) -> None:
+    set_pool_setting(store_config, role=role)
+    args = make_llm_args(enable_attention_dp=attention_dp)
+    args.cache_transceiver_config = (
+        None if backend == "absent" else SimpleNamespace(backend=backend)
+    )
+    config = MooncakeStoreConnectorConfig.resolve(args)
+    if attention_dp and role in ("producer", "both") and backend != "NIXL":
+        with pytest.raises(NotImplementedError, match="aggregated attention-DP"):
+            validate_attention_dp_config(args, config)
+    else:
+        validate_attention_dp_config(args, config)
+
+
+@pytest.mark.parametrize("role", ["producer", "both"])
+@pytest.mark.parametrize(
+    "connector_cls", [MooncakeStoreConnectorWorker, MooncakeStoreConnectorScheduler]
+)
+def test_aggregated_attention_dp_writer_rejected_at_construction(
+    store_config: Path,
+    role: str,
+    connector_cls: type[MooncakeStoreConnectorWorker] | type[MooncakeStoreConnectorScheduler],
+) -> None:
+    set_pool_setting(store_config, role=role)
+    args = make_llm_args(enable_attention_dp=True)
+    args.cache_transceiver_config = None
+    with pytest.raises(NotImplementedError, match="aggregated attention-DP"):
+        connector_cls(args)
 
 
 def test_capacity_only_worker_builds_under_attention_dp(store_config, fake_store, monkeypatch):

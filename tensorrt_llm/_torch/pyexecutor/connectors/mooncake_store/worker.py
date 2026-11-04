@@ -104,6 +104,7 @@ from .staging import (
 )
 from .staging import sync_stream as _sync_stream
 from .validation import (
+    validate_attention_dp_config,
     validate_layout,
     validate_llm_args,
     validate_node_budget,
@@ -511,6 +512,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         validate_llm_args(llm_args)
         self._config = MooncakeStoreConnectorConfig.resolve(llm_args)
+        validate_attention_dp_config(llm_args, self._config)
         # Before the store is opened, so a drafter this connector cannot key
         # fails before a segment is mounted.
         validate_speculative_config(llm_args, self._config)

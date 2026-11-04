@@ -51,7 +51,7 @@ from ..kv_cache_connector import KvCacheConnectorScheduler, RequestData, Schedul
 from .config import MooncakeStoreConnectorConfig
 from .keys import BlockHashChain, ReuseScope
 from .metadata import MooncakeStoreMetadata, PageTransfer, RequestTransfers
-from .validation import validate_llm_args
+from .validation import validate_attention_dp_config, validate_llm_args
 from .worker import MooncakeStoreConnectorWorker, resolve_local_worker
 
 __all__ = ["MooncakeStoreConnectorScheduler"]
@@ -159,12 +159,12 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     #: blocks a pass computed.
     supports_speculative_prefill = True
 
-
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
 
         validate_llm_args(llm_args)
         self._config = MooncakeStoreConnectorConfig.resolve(llm_args)
+        validate_attention_dp_config(llm_args, self._config)
         self._tokens_per_block = int(llm_args.kv_cache_config.tokens_per_block)
         # Imported here, as `KVCacheManagerV2` does: the speculative package
         # pulls in every drafter, and processes that import this package without

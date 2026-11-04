@@ -187,6 +187,7 @@ def _llm_args(
         kv_cache_config=SimpleNamespace(tokens_per_block=TOKENS_PER_BLOCK),
         tensor_parallel_size=1,
         enable_attention_dp=enable_attention_dp,
+        cache_transceiver_config=SimpleNamespace(backend="NIXL"),
         pipeline_parallel_size=1,
         context_parallel_size=1,
         sparse_attention_config=None,
