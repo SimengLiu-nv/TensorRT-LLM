@@ -392,6 +392,7 @@ A connector that starts a transfer inside `get_num_new_matched_tokens` must not 
 request asked at admission can still be dropped before `prepare_resources`: by the disaggregated
 benchmark gate, by batch waiting for generation requests, by the total-KV cap, by the multimodal
 scheduler wrapper, or when the batch cannot be queued. It is asked again on a later iteration.
+The [`mooncake-store`](#asynchronous-loads) connector declares it.
 
 Enable it per server with `kv_connector_config.admission_query`:
 
@@ -1067,3 +1068,9 @@ load thread always fails the server, at the next executor call. Under attention 
 counts toward `kv_connector_config.transfer_timeout_sec` (see
 [Attention data parallelism](#attention-data-parallelism)). Asynchronous loads are validated with
 `disable_overlap_scheduler: true`.
+
+The scheduler adapter declares
+[admission-time queries](#admission-time-queries): `kv_connector_config.admission_query: {}` books
+the pages a hit reaching past the first chunk needs while the request is admitted, with or without
+`async_load`. Admitting a chunk without charging its tokens (`max_uncharged_parks`) needs
+`async_load`, since only an asynchronous offer parks the request.
