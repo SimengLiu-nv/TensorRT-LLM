@@ -6632,6 +6632,23 @@
           },
           "title": "Device Name"
         },
+        "hbm_lend_size_per_gpu": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "default": 0,
+          "description": "GPU memory each rank lends to the pool, as a binary size ('64GiB') or a byte count. It is allocated after warmup and CUDA graph capture, from memory the KV cache left free, and needs a Mooncake release with MooncakeDistributedStore.mount_buffer; with an older release nothing is lent. Needs the rdma protocol, or the NVLink store under TLLM_MOONCAKE_STORE_EGM=1.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Hbm Lend Size Per Gpu"
+        },
         "late_auto": {
           "anyOf": [
             {
